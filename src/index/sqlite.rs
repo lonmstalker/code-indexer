@@ -1,0 +1,2141 @@
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
+use std::sync::Mutex;
+
+use crate::dependencies::{Dependency, Ecosystem, ProjectInfo, SymbolSource};
+use crate::error::Result;
+use crate::index::{
+    CallGraph, CallGraphEdge, CallGraphNode, CodeIndex, DeadCodeReport, FileImport,
+    FunctionMetrics, ImportType, IndexStats, ReferenceKind, SearchOptions, SearchResult, Symbol,
+    SymbolKind, SymbolReference, Visibility,
+};
+use crate::indexer::ExtractionResult;
+
+pub struct SqliteIndex {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteIndex {
+    pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(db_path)?;
+        let index = Self {
+            conn: Mutex::new(conn),
+        };
+        index.init_schema()?;
+        Ok(index)
+    }
+
+    #[allow(dead_code)]
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let index = Self {
+            conn: Mutex::new(conn),
+        };
+        index.init_schema()?;
+        Ok(index)
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbols (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                start_column INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                end_column INTEGER NOT NULL,
+                language TEXT NOT NULL,
+                visibility TEXT,
+                signature TEXT,
+                doc_comment TEXT,
+                parent TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+            CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
+            CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
+            CREATE INDEX IF NOT EXISTS idx_symbols_language ON symbols(language);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+                name,
+                signature,
+                doc_comment,
+                content='symbols',
+                content_rowid='rowid'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
+                INSERT INTO symbols_fts(rowid, name, signature, doc_comment)
+                VALUES (new.rowid, new.name, new.signature, new.doc_comment);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, doc_comment)
+                VALUES ('delete', old.rowid, old.name, old.signature, old.doc_comment);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+                INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, doc_comment)
+                VALUES ('delete', old.rowid, old.name, old.signature, old.doc_comment);
+                INSERT INTO symbols_fts(rowid, name, signature, doc_comment)
+                VALUES (new.rowid, new.name, new.signature, new.doc_comment);
+            END;
+
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                language TEXT NOT NULL,
+                last_modified INTEGER NOT NULL,
+                symbol_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Projects table for tracking indexed projects
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                version TEXT,
+                ecosystem TEXT NOT NULL,
+                manifest_path TEXT NOT NULL UNIQUE
+            );
+
+            -- Dependencies table
+            CREATE TABLE IF NOT EXISTS dependencies (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                source_path TEXT,
+                is_dev INTEGER DEFAULT 0,
+                is_indexed INTEGER DEFAULT 0,
+                UNIQUE(project_id, name, version)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dependencies_project ON dependencies(project_id);
+            CREATE INDEX IF NOT EXISTS idx_dependencies_name ON dependencies(name);
+
+            -- Symbol references table for tracking usages
+            CREATE TABLE IF NOT EXISTS symbol_references (
+                id INTEGER PRIMARY KEY,
+                symbol_id TEXT REFERENCES symbols(id),
+                symbol_name TEXT NOT NULL,
+                referenced_in_file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                column_num INTEGER NOT NULL,
+                reference_kind TEXT NOT NULL,
+                UNIQUE(symbol_name, referenced_in_file, line, column_num)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_refs_symbol_id ON symbol_references(symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_refs_symbol_name ON symbol_references(symbol_name);
+            CREATE INDEX IF NOT EXISTS idx_refs_file ON symbol_references(referenced_in_file);
+            CREATE INDEX IF NOT EXISTS idx_refs_kind ON symbol_references(reference_kind);
+
+            -- File imports table
+            CREATE TABLE IF NOT EXISTS file_imports (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                imported_path TEXT,
+                imported_symbol TEXT,
+                import_type TEXT NOT NULL,
+                UNIQUE(file_path, imported_path, imported_symbol)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_imports_file ON file_imports(file_path);
+            CREATE INDEX IF NOT EXISTS idx_imports_path ON file_imports(imported_path);
+            CREATE INDEX IF NOT EXISTS idx_imports_symbol ON file_imports(imported_symbol);
+            "#,
+        )?;
+
+        // Add source_type and dependency_id columns if they don't exist
+        // Using a migration-style approach (inline to avoid deadlock)
+        let has_source_type: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('symbols') WHERE name = 'source_type'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_source_type {
+            conn.execute(
+                "ALTER TABLE symbols ADD COLUMN source_type TEXT DEFAULT 'project'",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE symbols ADD COLUMN dependency_id INTEGER REFERENCES dependencies(id)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_source_type ON symbols(source_type)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_dependency ON symbols(dependency_id)",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    // === Project and Dependency Methods ===
+
+    /// Adds or updates a project in the database.
+    pub fn add_project(&self, project: &ProjectInfo) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO projects (name, version, ecosystem, manifest_path)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                project.name,
+                project.version,
+                project.ecosystem.as_str(),
+                project.manifest_path,
+            ],
+        )?;
+
+        let project_id = conn.last_insert_rowid();
+        Ok(project_id)
+    }
+
+    /// Gets a project by its manifest path.
+    pub fn get_project(&self, manifest_path: &str) -> Result<Option<ProjectInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, version, ecosystem, manifest_path
+            FROM projects WHERE manifest_path = ?1
+            "#,
+        )?;
+
+        let project = stmt
+            .query_row(params![manifest_path], |row| {
+                let ecosystem_str: String = row.get(3)?;
+                Ok(ProjectInfo {
+                    name: row.get(1)?,
+                    version: row.get(2)?,
+                    ecosystem: Ecosystem::from_str(&ecosystem_str).unwrap_or(Ecosystem::Cargo),
+                    manifest_path: row.get(4)?,
+                    dependencies: Vec::new(),
+                })
+            })
+            .optional()?;
+
+        Ok(project)
+    }
+
+    /// Gets the project ID by manifest path.
+    pub fn get_project_id(&self, manifest_path: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM projects WHERE manifest_path = ?1",
+                params![manifest_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Adds dependencies for a project.
+    pub fn add_dependencies(&self, project_id: i64, dependencies: &[Dependency]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for dep in dependencies {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO dependencies
+                (project_id, name, version, ecosystem, source_path, is_dev, is_indexed)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    project_id,
+                    dep.name,
+                    dep.version,
+                    dep.ecosystem.as_str(),
+                    dep.source_path,
+                    dep.is_dev as i32,
+                    dep.is_indexed as i32,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gets all dependencies for a project.
+    pub fn get_dependencies(&self, project_id: i64, include_dev: bool) -> Result<Vec<Dependency>> {
+        let conn = self.conn.lock().unwrap();
+
+        let sql = if include_dev {
+            "SELECT name, version, ecosystem, source_path, is_dev, is_indexed FROM dependencies WHERE project_id = ?1"
+        } else {
+            "SELECT name, version, ecosystem, source_path, is_dev, is_indexed FROM dependencies WHERE project_id = ?1 AND is_dev = 0"
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let deps = stmt
+            .query_map(params![project_id], |row| {
+                let ecosystem_str: String = row.get(2)?;
+                let is_dev: i32 = row.get(4)?;
+                let is_indexed: i32 = row.get(5)?;
+
+                Ok(Dependency {
+                    name: row.get(0)?,
+                    version: row.get(1)?,
+                    ecosystem: Ecosystem::from_str(&ecosystem_str).unwrap_or(Ecosystem::Cargo),
+                    source_path: row.get(3)?,
+                    is_dev: is_dev != 0,
+                    is_indexed: is_indexed != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(deps)
+    }
+
+    /// Gets a dependency by name for a project.
+    pub fn get_dependency(&self, project_id: i64, name: &str) -> Result<Option<Dependency>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT name, version, ecosystem, source_path, is_dev, is_indexed
+            FROM dependencies WHERE project_id = ?1 AND name = ?2
+            "#,
+        )?;
+
+        let dep = stmt
+            .query_row(params![project_id, name], |row| {
+                let ecosystem_str: String = row.get(2)?;
+                let is_dev: i32 = row.get(4)?;
+                let is_indexed: i32 = row.get(5)?;
+
+                Ok(Dependency {
+                    name: row.get(0)?,
+                    version: row.get(1)?,
+                    ecosystem: Ecosystem::from_str(&ecosystem_str).unwrap_or(Ecosystem::Cargo),
+                    source_path: row.get(3)?,
+                    is_dev: is_dev != 0,
+                    is_indexed: is_indexed != 0,
+                })
+            })
+            .optional()?;
+
+        Ok(dep)
+    }
+
+    /// Gets the dependency ID by project and name.
+    pub fn get_dependency_id(&self, project_id: i64, name: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM dependencies WHERE project_id = ?1 AND name = ?2",
+                params![project_id, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Marks a dependency as indexed.
+    pub fn mark_dependency_indexed(&self, dep_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE dependencies SET is_indexed = 1 WHERE id = ?1",
+            params![dep_id],
+        )?;
+        Ok(())
+    }
+
+    /// Adds symbols from a dependency.
+    pub fn add_dependency_symbols(&self, dep_id: i64, symbols: Vec<Symbol>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for symbol in symbols {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO symbols
+                (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                 language, visibility, signature, doc_comment, parent, source_type, dependency_id)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'dependency', ?14)
+                "#,
+                params![
+                    symbol.id,
+                    symbol.name,
+                    symbol.kind.as_str(),
+                    symbol.location.file_path,
+                    symbol.location.start_line,
+                    symbol.location.start_column,
+                    symbol.location.end_line,
+                    symbol.location.end_column,
+                    symbol.language,
+                    symbol.visibility.as_ref().map(|v| v.as_str()),
+                    symbol.signature,
+                    symbol.doc_comment,
+                    symbol.parent,
+                    dep_id,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Searches symbols in dependencies only.
+    pub fn search_in_dependencies(
+        &self,
+        query: &str,
+        dep_name: Option<&str>,
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = options.limit.unwrap_or(100);
+
+        let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
+
+        let mut sql = String::from(
+            r#"
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent, bm25(symbols_fts) as score
+            FROM symbols s
+            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
+            WHERE symbols_fts MATCH ?1 AND s.source_type = 'dependency'
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+
+        if let Some(name) = dep_name {
+            sql.push_str(
+                " AND s.dependency_id IN (SELECT id FROM dependencies WHERE name = ?)",
+            );
+            params_vec.push(Box::new(name.to_string()));
+        }
+
+        if let Some(ref kinds) = options.kind_filter {
+            let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(",")));
+            for kind in kinds {
+                params_vec.push(Box::new(kind.as_str().to_string()));
+            }
+        }
+
+        if let Some(ref langs) = options.language_filter {
+            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.language IN ({})", placeholders.join(",")));
+            for lang in langs {
+                params_vec.push(Box::new(lang.clone()));
+            }
+        }
+
+        sql.push_str(&format!(" ORDER BY score LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let results = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let symbol = Self::symbol_from_row(row)?;
+                let score: f64 = row.get(13)?;
+                Ok(SearchResult {
+                    symbol,
+                    score: -score,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    /// Finds a symbol definition in dependencies.
+    pub fn find_definition_in_dependencies(
+        &self,
+        name: &str,
+        dep_name: Option<&str>,
+    ) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols
+            WHERE name = ?1 AND kind NOT IN ('import', 'variable') AND source_type = 'dependency'
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
+
+        if let Some(dep) = dep_name {
+            sql.push_str(
+                " AND dependency_id IN (SELECT id FROM dependencies WHERE name = ?)",
+            );
+            params_vec.push(Box::new(dep.to_string()));
+        }
+
+        sql.push_str(" ORDER BY file_path, start_line");
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let symbols = stmt
+            .query_map(params_refs.as_slice(), Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    /// Gets the symbol source information.
+    pub fn get_symbol_source(&self, symbol_id: &str) -> Result<Option<SymbolSource>> {
+        let conn = self.conn.lock().unwrap();
+
+        let result: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT source_type, dependency_id FROM symbols WHERE id = ?1",
+                params![symbol_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if let Some((source_type, dep_id)) = result {
+            if source_type == "dependency" {
+                if let Some(id) = dep_id {
+                    let dep_info: Option<(String, String, String)> = conn
+                        .query_row(
+                            "SELECT name, version, ecosystem FROM dependencies WHERE id = ?1",
+                            params![id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
+
+                    if let Some((name, version, ecosystem_str)) = dep_info {
+                        return Ok(Some(SymbolSource::Dependency {
+                            name,
+                            version,
+                            ecosystem: Ecosystem::from_str(&ecosystem_str)
+                                .unwrap_or(Ecosystem::Cargo),
+                        }));
+                    }
+                }
+            }
+            return Ok(Some(SymbolSource::Project));
+        }
+
+        Ok(None)
+    }
+
+    /// Removes all symbols from a dependency.
+    pub fn remove_dependency_symbols(&self, dep_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM symbols WHERE dependency_id = ?1",
+            params![dep_id],
+        )?;
+        conn.execute(
+            "UPDATE dependencies SET is_indexed = 0 WHERE id = ?1",
+            params![dep_id],
+        )?;
+        Ok(())
+    }
+
+    /// Batch insert all extraction results (symbols, references, imports) in a single transaction.
+    /// Returns the total number of symbols inserted.
+    pub fn add_extraction_results_batch(&self, results: Vec<ExtractionResult>) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let mut total_symbols = 0;
+
+        for result in results {
+            // Insert symbols
+            for symbol in result.symbols {
+                tx.execute(
+                    r#"
+                    INSERT OR REPLACE INTO symbols
+                    (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                     language, visibility, signature, doc_comment, parent)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    "#,
+                    params![
+                        symbol.id,
+                        symbol.name,
+                        symbol.kind.as_str(),
+                        symbol.location.file_path,
+                        symbol.location.start_line,
+                        symbol.location.start_column,
+                        symbol.location.end_line,
+                        symbol.location.end_column,
+                        symbol.language,
+                        symbol.visibility.as_ref().map(|v| v.as_str()),
+                        symbol.signature,
+                        symbol.doc_comment,
+                        symbol.parent,
+                    ],
+                )?;
+                total_symbols += 1;
+            }
+
+            // Insert references
+            for reference in result.references {
+                tx.execute(
+                    r#"
+                    INSERT OR REPLACE INTO symbol_references
+                    (symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        reference.symbol_id,
+                        reference.symbol_name,
+                        reference.file_path,
+                        reference.line,
+                        reference.column,
+                        reference.kind.as_str(),
+                    ],
+                )?;
+            }
+
+            // Insert imports
+            for import in result.imports {
+                tx.execute(
+                    r#"
+                    INSERT OR REPLACE INTO file_imports
+                    (file_path, imported_path, imported_symbol, import_type)
+                    VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        import.file_path,
+                        import.imported_path,
+                        import.imported_symbol,
+                        import.import_type.as_str(),
+                    ],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(total_symbols)
+    }
+
+    fn symbol_from_row(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
+        let kind_str: String = row.get(2)?;
+        let visibility_str: Option<String> = row.get(9)?;
+
+        Ok(Symbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function),
+            location: crate::index::Location {
+                file_path: row.get(3)?,
+                start_line: row.get(4)?,
+                start_column: row.get(5)?,
+                end_line: row.get(6)?,
+                end_column: row.get(7)?,
+            },
+            language: row.get(8)?,
+            visibility: visibility_str.and_then(|s| Visibility::from_str(&s)),
+            signature: row.get(10)?,
+            doc_comment: row.get(11)?,
+            parent: row.get(12)?,
+        })
+    }
+}
+
+impl CodeIndex for SqliteIndex {
+    fn add_symbol(&self, symbol: Symbol) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO symbols
+            (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+             language, visibility, signature, doc_comment, parent)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "#,
+            params![
+                symbol.id,
+                symbol.name,
+                symbol.kind.as_str(),
+                symbol.location.file_path,
+                symbol.location.start_line,
+                symbol.location.start_column,
+                symbol.location.end_line,
+                symbol.location.end_column,
+                symbol.language,
+                symbol.visibility.as_ref().map(|v| v.as_str()),
+                symbol.signature,
+                symbol.doc_comment,
+                symbol.parent,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn add_symbols(&self, symbols: Vec<Symbol>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for symbol in symbols {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO symbols
+                (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                 language, visibility, signature, doc_comment, parent)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    symbol.id,
+                    symbol.name,
+                    symbol.kind.as_str(),
+                    symbol.location.file_path,
+                    symbol.location.start_line,
+                    symbol.location.start_column,
+                    symbol.location.end_line,
+                    symbol.location.end_column,
+                    symbol.language,
+                    symbol.visibility.as_ref().map(|v| v.as_str()),
+                    symbol.signature,
+                    symbol.doc_comment,
+                    symbol.parent,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn remove_file(&self, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM symbols WHERE file_path = ?1", params![file_path])?;
+        conn.execute("DELETE FROM files WHERE path = ?1", params![file_path])?;
+        Ok(())
+    }
+
+    fn get_symbol(&self, id: &str) -> Result<Option<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols WHERE id = ?1
+            "#,
+        )?;
+
+        let symbol = stmt
+            .query_row(params![id], Self::symbol_from_row)
+            .optional()?;
+
+        Ok(symbol)
+    }
+
+    fn search(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = options.limit.unwrap_or(100);
+
+        let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
+
+        let mut sql = String::from(
+            r#"
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent,
+                   bm25(symbols_fts) as score
+            FROM symbols s
+            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
+            WHERE symbols_fts MATCH ?1
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+
+        if let Some(ref kinds) = options.kind_filter {
+            let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(",")));
+            for kind in kinds {
+                params_vec.push(Box::new(kind.as_str().to_string()));
+            }
+        }
+
+        if let Some(ref langs) = options.language_filter {
+            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.language IN ({})", placeholders.join(",")));
+            for lang in langs {
+                params_vec.push(Box::new(lang.clone()));
+            }
+        }
+
+        if let Some(ref file) = options.file_filter {
+            sql.push_str(" AND s.file_path LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", file)));
+        }
+
+        sql.push_str(&format!(" ORDER BY score LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let results = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let symbol = Self::symbol_from_row(row)?;
+                let score: f64 = row.get(13)?;
+                Ok(SearchResult {
+                    symbol,
+                    score: -score,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    fn find_definition(&self, name: &str) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols
+            WHERE name = ?1 AND kind NOT IN ('import', 'variable')
+            ORDER BY file_path, start_line
+            "#,
+        )?;
+
+        let symbols = stmt
+            .query_map(params![name], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    fn list_functions(&self, options: &SearchOptions) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = options.limit.unwrap_or(1000);
+
+        let mut sql = String::from(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols
+            WHERE kind IN ('function', 'method')
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(ref langs) = options.language_filter {
+            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND language IN ({})", placeholders.join(",")));
+            for lang in langs {
+                params_vec.push(Box::new(lang.clone()));
+            }
+        }
+
+        if let Some(ref file) = options.file_filter {
+            sql.push_str(" AND file_path LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", file)));
+        }
+
+        if let Some(ref pattern) = options.name_filter {
+            // Convert glob pattern to SQL LIKE: * → %, ? → _
+            let sql_pattern = pattern.replace('*', "%").replace('?', "_");
+            sql.push_str(" AND name LIKE ?");
+            params_vec.push(Box::new(sql_pattern));
+        }
+
+        sql.push_str(&format!(" ORDER BY file_path, start_line LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let symbols = stmt
+            .query_map(params_refs.as_slice(), Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    fn list_types(&self, options: &SearchOptions) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = options.limit.unwrap_or(1000);
+
+        let mut sql = String::from(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols
+            WHERE kind IN ('struct', 'class', 'interface', 'trait', 'enum', 'type_alias')
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(ref langs) = options.language_filter {
+            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND language IN ({})", placeholders.join(",")));
+            for lang in langs {
+                params_vec.push(Box::new(lang.clone()));
+            }
+        }
+
+        if let Some(ref file) = options.file_filter {
+            sql.push_str(" AND file_path LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", file)));
+        }
+
+        if let Some(ref pattern) = options.name_filter {
+            // Convert glob pattern to SQL LIKE: * → %, ? → _
+            let sql_pattern = pattern.replace('*', "%").replace('?', "_");
+            sql.push_str(" AND name LIKE ?");
+            params_vec.push(Box::new(sql_pattern));
+        }
+
+        sql.push_str(&format!(" ORDER BY file_path, start_line LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let symbols = stmt
+            .query_map(params_refs.as_slice(), Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    fn get_file_symbols(&self, file_path: &str) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols
+            WHERE file_path = ?1
+            ORDER BY start_line, start_column
+            "#,
+        )?;
+
+        let symbols = stmt
+            .query_map(params![file_path], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    fn get_stats(&self) -> Result<IndexStats> {
+        let conn = self.conn.lock().unwrap();
+
+        let total_files: i64 =
+            conn.query_row("SELECT COUNT(DISTINCT file_path) FROM symbols", [], |row| {
+                row.get(0)
+            })?;
+
+        let total_symbols: i64 =
+            conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+
+        let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM symbols GROUP BY kind")?;
+        let symbols_by_kind: Vec<(String, usize)> = stmt
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok((row.get(0)?, count as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stmt = conn.prepare("SELECT language, COUNT(*) FROM symbols GROUP BY language")?;
+        let symbols_by_language: Vec<(String, usize)> = stmt
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok((row.get(0)?, count as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT language, COUNT(DISTINCT file_path) FROM symbols GROUP BY language",
+        )?;
+        let files_by_language: Vec<(String, usize)> = stmt
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok((row.get(0)?, count as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(IndexStats {
+            total_files: total_files as usize,
+            total_symbols: total_symbols as usize,
+            symbols_by_kind,
+            symbols_by_language,
+            files_by_language,
+        })
+    }
+
+    fn clear(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM symbols", [])?;
+        conn.execute("DELETE FROM files", [])?;
+        conn.execute("DELETE FROM symbols_fts", [])?;
+        conn.execute("DELETE FROM symbol_references", [])?;
+        conn.execute("DELETE FROM file_imports", [])?;
+        Ok(())
+    }
+
+    fn add_references(&self, references: Vec<SymbolReference>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for reference in references {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO symbol_references
+                (symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    reference.symbol_id,
+                    reference.symbol_name,
+                    reference.file_path,
+                    reference.line,
+                    reference.column,
+                    reference.kind.as_str(),
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn find_references(
+        &self,
+        symbol_name: &str,
+        options: &SearchOptions,
+    ) -> Result<Vec<SymbolReference>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = options.limit.unwrap_or(100);
+
+        let mut sql = String::from(
+            r#"
+            SELECT symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind
+            FROM symbol_references
+            WHERE symbol_name = ?1
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(symbol_name.to_string())];
+
+        if let Some(ref file) = options.file_filter {
+            sql.push_str(" AND referenced_in_file LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", file)));
+        }
+
+        sql.push_str(&format!(" ORDER BY referenced_in_file, line LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let refs = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let kind_str: String = row.get(5)?;
+                Ok(SymbolReference {
+                    symbol_id: row.get(0)?,
+                    symbol_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                    line: row.get(3)?,
+                    column: row.get(4)?,
+                    kind: ReferenceKind::from_str(&kind_str).unwrap_or(ReferenceKind::Call),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(refs)
+    }
+
+    fn find_callers(&self, function_name: &str, depth: Option<u32>) -> Result<Vec<SymbolReference>> {
+        let conn = self.conn.lock().unwrap();
+        let max_depth = depth.unwrap_or(1);
+
+        // For depth > 1, we would need recursive queries
+        // For now, implement single-level caller search
+        let sql = r#"
+            SELECT symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind
+            FROM symbol_references
+            WHERE symbol_name = ?1 AND reference_kind = 'call'
+            ORDER BY referenced_in_file, line
+            LIMIT 100
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let refs = stmt
+            .query_map(params![function_name], |row| {
+                let kind_str: String = row.get(5)?;
+                Ok(SymbolReference {
+                    symbol_id: row.get(0)?,
+                    symbol_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                    line: row.get(3)?,
+                    column: row.get(4)?,
+                    kind: ReferenceKind::from_str(&kind_str).unwrap_or(ReferenceKind::Call),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // If depth > 1, recursively find callers of the functions that call this one
+        if max_depth > 1 && !refs.is_empty() {
+            // TODO: Implement recursive caller search
+            // For now, just return direct callers
+        }
+
+        Ok(refs)
+    }
+
+    fn find_implementations(&self, trait_name: &str) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find symbols that extend/implement the given trait/interface
+        let sql = r#"
+            SELECT DISTINCT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent
+            FROM symbols s
+            JOIN symbol_references r ON s.name = (
+                SELECT DISTINCT
+                    CASE
+                        WHEN instr(referenced_in_file, '/') > 0
+                        THEN substr(referenced_in_file, instr(referenced_in_file, '/') + 1)
+                        ELSE referenced_in_file
+                    END
+                FROM symbol_references
+                WHERE symbol_name = ?1 AND reference_kind = 'extend'
+            )
+            WHERE s.kind IN ('struct', 'class', 'enum')
+
+            UNION
+
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent
+            FROM symbols s
+            WHERE s.id IN (
+                SELECT DISTINCT symbol_id FROM symbol_references
+                WHERE symbol_name = ?1 AND reference_kind = 'extend' AND symbol_id IS NOT NULL
+            )
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let symbols = stmt
+            .query_map(params![trait_name], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    fn get_symbol_members(&self, type_name: &str) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find all methods and fields that have this type as parent
+        let sql = r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols
+            WHERE parent = ?1 OR (
+                file_path IN (SELECT file_path FROM symbols WHERE name = ?1)
+                AND kind IN ('method', 'field')
+                AND start_line > (SELECT start_line FROM symbols WHERE name = ?1 LIMIT 1)
+                AND start_line < (SELECT end_line FROM symbols WHERE name = ?1 LIMIT 1)
+            )
+            ORDER BY start_line
+        "#;
+
+        let mut stmt = conn.prepare(sql)?;
+        let symbols = stmt
+            .query_map(params![type_name], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    fn add_imports(&self, imports: Vec<FileImport>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for import in imports {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO file_imports
+                (file_path, imported_path, imported_symbol, import_type)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![
+                    import.file_path,
+                    import.imported_path,
+                    import.imported_symbol,
+                    import.import_type.as_str(),
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn get_file_imports(&self, file_path: &str) -> Result<Vec<FileImport>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT file_path, imported_path, imported_symbol, import_type
+            FROM file_imports
+            WHERE file_path = ?1
+            ORDER BY imported_path, imported_symbol
+            "#,
+        )?;
+
+        let imports = stmt
+            .query_map(params![file_path], |row| {
+                let import_type_str: String = row.get(3)?;
+                Ok(FileImport {
+                    file_path: row.get(0)?,
+                    imported_path: row.get(1)?,
+                    imported_symbol: row.get(2)?,
+                    import_type: ImportType::from_str(&import_type_str).unwrap_or(ImportType::Symbol),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(imports)
+    }
+
+    fn get_file_importers(&self, file_path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT file_path
+            FROM file_imports
+            WHERE imported_path LIKE ?1
+            ORDER BY file_path
+            "#,
+        )?;
+
+        let importers = stmt
+            .query_map(params![format!("%{}", file_path)], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+
+        Ok(importers)
+    }
+
+    fn find_callees(&self, function_name: &str) -> Result<Vec<SymbolReference>> {
+        let conn = self.conn.lock().unwrap();
+
+        // First find the function's file and line range
+        let function_info: Option<(String, u32, u32)> = conn
+            .query_row(
+                r#"
+                SELECT file_path, start_line, end_line
+                FROM symbols
+                WHERE name = ?1 AND kind IN ('function', 'method')
+                LIMIT 1
+                "#,
+                params![function_name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        if function_info.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let (file_path, start_line, end_line) = function_info.unwrap();
+
+        // Find all call references within the function's line range
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind
+            FROM symbol_references
+            WHERE referenced_in_file = ?1
+              AND line >= ?2
+              AND line <= ?3
+              AND reference_kind = 'call'
+            ORDER BY line, column_num
+            "#,
+        )?;
+
+        let refs = stmt
+            .query_map(params![file_path, start_line, end_line], |row| {
+                let kind_str: String = row.get(5)?;
+                Ok(SymbolReference {
+                    symbol_id: row.get(0)?,
+                    symbol_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                    line: row.get(3)?,
+                    column: row.get(4)?,
+                    kind: ReferenceKind::from_str(&kind_str).unwrap_or(ReferenceKind::Call),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(refs)
+    }
+
+    fn get_call_graph(&self, entry_point: &str, max_depth: u32) -> Result<CallGraph> {
+        use std::collections::{HashSet, VecDeque};
+
+        let conn = self.conn.lock().unwrap();
+        let mut graph = CallGraph::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+
+        // Find the entry point function
+        let entry_info: Option<(String, String, u32)> = conn
+            .query_row(
+                r#"
+                SELECT id, file_path, start_line
+                FROM symbols
+                WHERE name = ?1 AND kind IN ('function', 'method')
+                LIMIT 1
+                "#,
+                params![entry_point],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        if entry_info.is_none() {
+            return Ok(graph);
+        }
+
+        let (entry_id, entry_file, entry_line) = entry_info.unwrap();
+
+        // Add entry point node
+        graph.nodes.push(CallGraphNode {
+            id: entry_id.clone(),
+            name: entry_point.to_string(),
+            file_path: entry_file.clone(),
+            line: entry_line,
+            depth: 0,
+        });
+
+        visited.insert(entry_point.to_string());
+        queue.push_back((entry_point.to_string(), 0));
+
+        // BFS traversal
+        while let Some((func_name, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            // Find function's location
+            let func_info: Option<(String, String, u32, u32)> = conn
+                .query_row(
+                    r#"
+                    SELECT id, file_path, start_line, end_line
+                    FROM symbols
+                    WHERE name = ?1 AND kind IN ('function', 'method')
+                    LIMIT 1
+                    "#,
+                    params![&func_name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+
+            if func_info.is_none() {
+                continue;
+            }
+
+            let (from_id, file_path, start_line, end_line) = func_info.unwrap();
+
+            // Find all calls within this function
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT DISTINCT sr.symbol_name, sr.line
+                FROM symbol_references sr
+                WHERE sr.referenced_in_file = ?1
+                  AND sr.line >= ?2
+                  AND sr.line <= ?3
+                  AND sr.reference_kind = 'call'
+                "#,
+            )?;
+
+            let callees: Vec<(String, u32)> = stmt
+                .query_map(params![&file_path, start_line, end_line], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (callee_name, call_line) in callees {
+                // Find the callee function
+                let callee_info: Option<(String, String, u32)> = conn
+                    .query_row(
+                        r#"
+                        SELECT id, file_path, start_line
+                        FROM symbols
+                        WHERE name = ?1 AND kind IN ('function', 'method')
+                        LIMIT 1
+                        "#,
+                        params![&callee_name],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+
+                if let Some((to_id, callee_file, callee_line)) = callee_info {
+                    // Add edge
+                    graph.edges.push(CallGraphEdge {
+                        from: from_id.clone(),
+                        to: to_id.clone(),
+                        call_site_line: call_line,
+                        call_site_file: file_path.clone(),
+                    });
+
+                    // Add node if not visited
+                    if !visited.contains(&callee_name) {
+                        visited.insert(callee_name.clone());
+                        graph.nodes.push(CallGraphNode {
+                            id: to_id,
+                            name: callee_name.clone(),
+                            file_path: callee_file,
+                            line: callee_line,
+                            depth: depth + 1,
+                        });
+                        queue.push_back((callee_name, depth + 1));
+                    }
+                }
+            }
+        }
+
+        Ok(graph)
+    }
+
+    fn find_dead_code(&self) -> Result<DeadCodeReport> {
+        let conn = self.conn.lock().unwrap();
+
+        // Find unused functions (private functions without incoming call references)
+        // Exclude: main, test_*, __init__, new, and other common entry points
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent
+            FROM symbols s
+            LEFT JOIN symbol_references sr ON s.name = sr.symbol_name AND sr.reference_kind = 'call'
+            WHERE s.kind IN ('function', 'method')
+              AND (s.visibility IS NULL OR s.visibility IN ('private', 'internal'))
+              AND sr.symbol_name IS NULL
+              AND s.name NOT LIKE 'test_%'
+              AND s.name NOT IN ('main', '__init__', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into')
+            ORDER BY s.file_path, s.start_line
+            "#,
+        )?;
+
+        let unused_functions = stmt
+            .query_map([], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Find unused types (private types without type_use references)
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent
+            FROM symbols s
+            LEFT JOIN symbol_references sr ON s.name = sr.symbol_name AND sr.reference_kind = 'type_use'
+            WHERE s.kind IN ('struct', 'class', 'interface', 'trait', 'enum', 'type_alias')
+              AND (s.visibility IS NULL OR s.visibility IN ('private', 'internal'))
+              AND sr.symbol_name IS NULL
+            ORDER BY s.file_path, s.start_line
+            "#,
+        )?;
+
+        let unused_types = stmt
+            .query_map([], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(DeadCodeReport::new(unused_functions, unused_types))
+    }
+
+    fn get_function_metrics(&self, function_name: &str) -> Result<Vec<FunctionMetrics>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT name, file_path, start_line, end_line, language, signature
+            FROM symbols
+            WHERE name = ?1 AND kind IN ('function', 'method')
+            "#,
+        )?;
+
+        let metrics = stmt
+            .query_map(params![function_name], |row| {
+                let name: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let start_line: u32 = row.get(2)?;
+                let end_line: u32 = row.get(3)?;
+                let language: String = row.get(4)?;
+                let signature: Option<String> = row.get(5)?;
+
+                // Count parameters from signature
+                let param_count = signature
+                    .as_ref()
+                    .map(|s| Self::count_parameters(s))
+                    .unwrap_or(0);
+
+                Ok(FunctionMetrics {
+                    name,
+                    file_path,
+                    loc: end_line.saturating_sub(start_line) + 1,
+                    parameters: param_count,
+                    start_line,
+                    end_line,
+                    language,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(metrics)
+    }
+
+    fn get_file_metrics(&self, file_path: &str) -> Result<Vec<FunctionMetrics>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT name, file_path, start_line, end_line, language, signature
+            FROM symbols
+            WHERE file_path = ?1 AND kind IN ('function', 'method')
+            ORDER BY start_line
+            "#,
+        )?;
+
+        let metrics = stmt
+            .query_map(params![file_path], |row| {
+                let name: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let start_line: u32 = row.get(2)?;
+                let end_line: u32 = row.get(3)?;
+                let language: String = row.get(4)?;
+                let signature: Option<String> = row.get(5)?;
+
+                let param_count = signature
+                    .as_ref()
+                    .map(|s| Self::count_parameters(s))
+                    .unwrap_or(0);
+
+                Ok(FunctionMetrics {
+                    name,
+                    file_path,
+                    loc: end_line.saturating_sub(start_line) + 1,
+                    parameters: param_count,
+                    start_line,
+                    end_line,
+                    language,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(metrics)
+    }
+}
+
+impl SqliteIndex {
+    /// Count parameters in a function signature
+    fn count_parameters(signature: &str) -> u32 {
+        // Find the parameters section (between first ( and matching ))
+        if let Some(start) = signature.find('(') {
+            if let Some(end) = signature.rfind(')') {
+                let params_str = &signature[start + 1..end];
+                if params_str.trim().is_empty() {
+                    return 0;
+                }
+                // Count commas + 1 for parameters
+                // This is a simple heuristic, handles most cases
+                let mut count = 1u32;
+                let mut depth: i32 = 0;
+                for c in params_str.chars() {
+                    match c {
+                        '(' | '<' | '[' | '{' => depth += 1,
+                        ')' | '>' | ']' | '}' => depth = (depth - 1).max(0),
+                        ',' if depth == 0 => count += 1,
+                        _ => {}
+                    }
+                }
+                return count;
+            }
+        }
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::Location;
+
+    fn create_test_symbol(name: &str, kind: SymbolKind, file: &str, language: &str) -> Symbol {
+        Symbol::new(name, kind, Location::new(file, 1, 0, 5, 1), language)
+    }
+
+    #[test]
+    fn test_add_and_get_symbol() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbol = Symbol::new(
+            "test_function",
+            SymbolKind::Function,
+            Location::new("test.rs", 1, 0, 5, 1),
+            "rust",
+        )
+        .with_visibility(Visibility::Public)
+        .with_signature("fn test_function() -> i32");
+
+        let id = symbol.id.clone();
+        index.add_symbol(symbol).unwrap();
+
+        let retrieved = index.get_symbol(&id).unwrap().unwrap();
+        assert_eq!(retrieved.name, "test_function");
+        assert_eq!(retrieved.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_get_symbol_not_found() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let result = index.get_symbol("non-existent-id").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_search() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbol1 = Symbol::new(
+            "calculate_sum",
+            SymbolKind::Function,
+            Location::new("math.rs", 1, 0, 5, 1),
+            "rust",
+        );
+
+        let symbol2 = Symbol::new(
+            "calculate_product",
+            SymbolKind::Function,
+            Location::new("math.rs", 10, 0, 15, 1),
+            "rust",
+        );
+
+        index.add_symbols(vec![symbol1, symbol2]).unwrap();
+
+        let results = index.search("calculate", &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_add_symbols_batch() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("func3", SymbolKind::Function, "test.rs", "rust"),
+        ];
+
+        index.add_symbols(symbols).unwrap();
+
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 3);
+    }
+
+    #[test]
+    fn test_add_symbols_empty() {
+        let index = SqliteIndex::in_memory().unwrap();
+        index.add_symbols(vec![]).unwrap();
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 0);
+    }
+
+    #[test]
+    fn test_remove_file() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "file1.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "file1.rs", "rust"),
+            create_test_symbol("func3", SymbolKind::Function, "file2.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        index.remove_file("file1.rs").unwrap();
+
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 1);
+    }
+
+    #[test]
+    fn test_remove_file_not_exists() {
+        let index = SqliteIndex::in_memory().unwrap();
+        index.remove_file("non-existent.rs").unwrap();
+    }
+
+    #[test]
+    fn test_find_definition() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "MyStruct",
+                SymbolKind::Struct,
+                Location::new("lib.rs", 1, 0, 10, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "MyStruct",
+                SymbolKind::Import,
+                Location::new("main.rs", 1, 0, 1, 20),
+                "rust",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let defs = index.find_definition("MyStruct").unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].kind, SymbolKind::Struct);
+    }
+
+    #[test]
+    fn test_find_definition_excludes_variables() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "config",
+                SymbolKind::Constant,
+                Location::new("lib.rs", 1, 0, 1, 20),
+                "rust",
+            ),
+            Symbol::new(
+                "config",
+                SymbolKind::Variable,
+                Location::new("main.rs", 5, 0, 5, 15),
+                "rust",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let defs = index.find_definition("config").unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].kind, SymbolKind::Constant);
+    }
+
+    #[test]
+    fn test_find_definition_not_found() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let defs = index.find_definition("NonExistent").unwrap();
+        assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn test_list_functions() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("method1", SymbolKind::Method, "test.rs", "rust"),
+            create_test_symbol("MyStruct", SymbolKind::Struct, "test.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let funcs = index.list_functions(&SearchOptions::default()).unwrap();
+        assert_eq!(funcs.len(), 2);
+    }
+
+    #[test]
+    fn test_list_functions_with_limit() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("func3", SymbolKind::Function, "test.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let funcs = index.list_functions(&options).unwrap();
+        assert_eq!(funcs.len(), 2);
+    }
+
+    #[test]
+    fn test_list_functions_with_language_filter() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("rust_func", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("java_func", SymbolKind::Function, "Test.java", "java"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            language_filter: Some(vec!["rust".to_string()]),
+            ..Default::default()
+        };
+        let funcs = index.list_functions(&options).unwrap();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "rust_func");
+    }
+
+    #[test]
+    fn test_list_functions_with_file_filter() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "src/lib.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "src/main.rs", "rust"),
+            create_test_symbol("func3", SymbolKind::Function, "tests/test.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            file_filter: Some("src".to_string()),
+            ..Default::default()
+        };
+        let funcs = index.list_functions(&options).unwrap();
+        assert_eq!(funcs.len(), 2);
+    }
+
+    #[test]
+    fn test_list_types() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("MyStruct", SymbolKind::Struct, "test.rs", "rust"),
+            create_test_symbol("MyClass", SymbolKind::Class, "Test.java", "java"),
+            create_test_symbol("MyInterface", SymbolKind::Interface, "test.ts", "typescript"),
+            create_test_symbol("MyTrait", SymbolKind::Trait, "test.rs", "rust"),
+            create_test_symbol("MyEnum", SymbolKind::Enum, "test.rs", "rust"),
+            create_test_symbol("MyAlias", SymbolKind::TypeAlias, "test.rs", "rust"),
+            create_test_symbol("my_func", SymbolKind::Function, "test.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let types = index.list_types(&SearchOptions::default()).unwrap();
+        assert_eq!(types.len(), 6);
+    }
+
+    #[test]
+    fn test_list_types_with_language_filter() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("RustStruct", SymbolKind::Struct, "test.rs", "rust"),
+            create_test_symbol("JavaClass", SymbolKind::Class, "Test.java", "java"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            language_filter: Some(vec!["java".to_string()]),
+            ..Default::default()
+        };
+        let types = index.list_types(&options).unwrap();
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].name, "JavaClass");
+    }
+
+    #[test]
+    fn test_get_file_symbols() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "func1",
+                SymbolKind::Function,
+                Location::new("test.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "func2",
+                SymbolKind::Function,
+                Location::new("test.rs", 10, 0, 15, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "other",
+                SymbolKind::Function,
+                Location::new("other.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let file_symbols = index.get_file_symbols("test.rs").unwrap();
+        assert_eq!(file_symbols.len(), 2);
+        assert!(file_symbols[0].location.start_line < file_symbols[1].location.start_line);
+    }
+
+    #[test]
+    fn test_get_file_symbols_not_found() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let symbols = index.get_file_symbols("non-existent.rs").unwrap();
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_get_stats() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("MyStruct", SymbolKind::Struct, "test.rs", "rust"),
+            create_test_symbol("JavaClass", SymbolKind::Class, "Test.java", "java"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 4);
+        assert_eq!(stats.total_files, 2);
+        assert!(stats.symbols_by_kind.iter().any(|(k, c)| k == "function" && *c == 2));
+        assert!(stats.symbols_by_language.iter().any(|(l, c)| l == "rust" && *c == 3));
+        assert!(stats.files_by_language.iter().any(|(l, c)| l == "rust" && *c == 1));
+    }
+
+    #[test]
+    fn test_get_stats_empty() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 0);
+        assert_eq!(stats.total_files, 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "test.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        index.clear().unwrap();
+
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 0);
+    }
+
+    #[test]
+    fn test_search_with_kind_filter() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "my_function",
+                SymbolKind::Function,
+                Location::new("test.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "my_struct",
+                SymbolKind::Struct,
+                Location::new("test.rs", 10, 0, 20, 1),
+                "rust",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            kind_filter: Some(vec![SymbolKind::Function]),
+            ..Default::default()
+        };
+        let results = index.search("my", &options).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_search_with_language_filter() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "rust_func",
+                SymbolKind::Function,
+                Location::new("test.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "java_func",
+                SymbolKind::Function,
+                Location::new("Test.java", 1, 0, 5, 1),
+                "java",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            language_filter: Some(vec!["rust".to_string()]),
+            ..Default::default()
+        };
+        let results = index.search("func", &options).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol.language, "rust");
+    }
+
+    #[test]
+    fn test_search_with_file_filter() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "func1",
+                SymbolKind::Function,
+                Location::new("src/lib.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "func2",
+                SymbolKind::Function,
+                Location::new("tests/test.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            file_filter: Some("src".to_string()),
+            ..Default::default()
+        };
+        let results = index.search("func", &options).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].symbol.location.file_path.contains("src"));
+    }
+
+    #[test]
+    fn test_search_with_limit() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbols = vec![
+            Symbol::new(
+                "func_a",
+                SymbolKind::Function,
+                Location::new("test.rs", 1, 0, 5, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "func_b",
+                SymbolKind::Function,
+                Location::new("test.rs", 10, 0, 15, 1),
+                "rust",
+            ),
+            Symbol::new(
+                "func_c",
+                SymbolKind::Function,
+                Location::new("test.rs", 20, 0, 25, 1),
+                "rust",
+            ),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        let options = SearchOptions {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let results = index.search("func", &options).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_no_results() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbol = create_test_symbol("my_function", SymbolKind::Function, "test.rs", "rust");
+        index.add_symbol(symbol).unwrap();
+
+        let results = index.search("nonexistent", &SearchOptions::default()).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_score_positive() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbol = Symbol::new(
+            "calculate",
+            SymbolKind::Function,
+            Location::new("test.rs", 1, 0, 5, 1),
+            "rust",
+        );
+        index.add_symbol(symbol).unwrap();
+
+        let results = index.search("calculate", &SearchOptions::default()).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_symbol_with_all_fields() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let symbol = Symbol::new(
+            "complex_method",
+            SymbolKind::Method,
+            Location::new("test.rs", 10, 4, 25, 5),
+            "rust",
+        )
+        .with_visibility(Visibility::Public)
+        .with_signature("fn complex_method(&self, x: i32) -> Result<String, Error>")
+        .with_doc_comment("/// A complex method with many features")
+        .with_parent("MyStruct");
+
+        let id = symbol.id.clone();
+        index.add_symbol(symbol).unwrap();
+
+        let retrieved = index.get_symbol(&id).unwrap().unwrap();
+        assert_eq!(retrieved.name, "complex_method");
+        assert_eq!(retrieved.kind, SymbolKind::Method);
+        assert_eq!(retrieved.visibility, Some(Visibility::Public));
+        assert_eq!(
+            retrieved.signature,
+            Some("fn complex_method(&self, x: i32) -> Result<String, Error>".to_string())
+        );
+        assert_eq!(
+            retrieved.doc_comment,
+            Some("/// A complex method with many features".to_string())
+        );
+        assert_eq!(retrieved.parent, Some("MyStruct".to_string()));
+        assert_eq!(retrieved.location.start_line, 10);
+        assert_eq!(retrieved.location.end_line, 25);
+    }
+
+    #[test]
+    fn test_symbol_replace_on_duplicate_id() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let mut symbol1 = Symbol::new(
+            "original",
+            SymbolKind::Function,
+            Location::new("test.rs", 1, 0, 5, 1),
+            "rust",
+        );
+        symbol1.id = "fixed-id".to_string();
+        index.add_symbol(symbol1).unwrap();
+
+        let mut symbol2 = Symbol::new(
+            "replaced",
+            SymbolKind::Function,
+            Location::new("test.rs", 1, 0, 5, 1),
+            "rust",
+        );
+        symbol2.id = "fixed-id".to_string();
+        index.add_symbol(symbol2).unwrap();
+
+        let retrieved = index.get_symbol("fixed-id").unwrap().unwrap();
+        assert_eq!(retrieved.name, "replaced");
+    }
+}
