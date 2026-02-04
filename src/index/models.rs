@@ -483,14 +483,20 @@ impl Location {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
+    /// Internal UUID - skipped in JSON output to save tokens (use stable_id for references)
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub id: String,
     pub name: String,
     pub kind: SymbolKind,
     pub location: Location,
     pub language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     /// Scope ID where this symbol is defined
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1296,6 +1302,38 @@ mod tests {
         assert_eq!(symbol.kind, parsed.kind);
         assert_eq!(symbol.location, parsed.location);
         assert_eq!(symbol.visibility, parsed.visibility);
+    }
+
+    #[test]
+    fn test_symbol_serialization_skips_none_fields() {
+        // Symbol without optional fields should have smaller JSON
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+        let minimal = Symbol::new("func", SymbolKind::Function, loc.clone(), "rust");
+        let with_all = Symbol::new("func", SymbolKind::Function, loc, "rust")
+            .with_visibility(Visibility::Public)
+            .with_signature("fn func()")
+            .with_doc_comment("doc")
+            .with_parent("parent");
+
+        let json_minimal = serde_json::to_string(&minimal).unwrap();
+        let json_full = serde_json::to_string(&with_all).unwrap();
+
+        // Verify optional fields are skipped when None
+        assert!(!json_minimal.contains("visibility"));
+        assert!(!json_minimal.contains("signature"));
+        assert!(!json_minimal.contains("doc_comment"));
+        assert!(!json_minimal.contains("parent"));
+        assert!(!json_minimal.contains("scope_id"));
+        assert!(!json_minimal.contains("fqdn"));
+
+        // Full version contains all fields
+        assert!(json_full.contains("visibility"));
+        assert!(json_full.contains("signature"));
+        assert!(json_full.contains("doc_comment"));
+        assert!(json_full.contains("parent"));
+
+        // Minimal JSON should be significantly smaller
+        assert!(json_minimal.len() < json_full.len());
     }
 
     // === ResponseEnvelope tests ===

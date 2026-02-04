@@ -19,6 +19,7 @@ pub struct SqliteIndex {
 impl SqliteIndex {
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(db_path)?;
+        Self::configure_pragmas(&conn)?;
         let index = Self {
             conn: Mutex::new(conn),
         };
@@ -29,11 +30,29 @@ impl SqliteIndex {
     #[allow(dead_code)]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        Self::configure_pragmas(&conn)?;
         let index = Self {
             conn: Mutex::new(conn),
         };
         index.init_schema()?;
         Ok(index)
+    }
+
+    /// Configure SQLite PRAGMA settings for optimal performance.
+    /// - WAL mode: allows concurrent reads during writes
+    /// - NORMAL synchronous: good durability with better performance
+    /// - 64MB cache: reduces disk I/O for large indexes
+    /// - MEMORY temp_store: speeds up temporary tables and sorts
+    fn configure_pragmas(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -64000;
+            PRAGMA temp_store = MEMORY;
+            "#,
+        )?;
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -60,6 +79,10 @@ impl SqliteIndex {
             CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
             CREATE INDEX IF NOT EXISTS idx_symbols_language ON symbols(language);
+            -- Index for parent lookups (get children of a type/module)
+            CREATE INDEX IF NOT EXISTS idx_symbols_parent ON symbols(parent);
+            -- Composite index for location-based queries (go-to-definition, file outline)
+            CREATE INDEX IF NOT EXISTS idx_symbols_file_line ON symbols(file_path, start_line);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
                 name,
@@ -134,6 +157,8 @@ impl SqliteIndex {
             CREATE INDEX IF NOT EXISTS idx_refs_symbol_name ON symbol_references(symbol_name);
             CREATE INDEX IF NOT EXISTS idx_refs_file ON symbol_references(referenced_in_file);
             CREATE INDEX IF NOT EXISTS idx_refs_kind ON symbol_references(reference_kind);
+            -- Composite index for efficient symbol+kind queries (call graph, references by type)
+            CREATE INDEX IF NOT EXISTS idx_refs_symbol_kind ON symbol_references(symbol_name, reference_kind);
 
             -- File imports table
             CREATE TABLE IF NOT EXISTS file_imports (
