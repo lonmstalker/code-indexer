@@ -179,6 +179,20 @@ impl DocumentOverlay {
         docs.get(path).map(|d| d.dirty).unwrap_or(false)
     }
 
+    /// Gets the overlay revision info for the Summary-First Contract
+    ///
+    /// Returns the count of dirty files and the maximum version number
+    /// across all overlay documents.
+    pub fn get_overlay_revision(&self) -> crate::index::OverlayRevision {
+        let docs = self.documents.read().unwrap();
+        let dirty_files = docs.values().filter(|d| d.dirty).count();
+        let max_version = docs.values().map(|d| d.version).max().unwrap_or(0);
+        crate::index::OverlayRevision {
+            dirty_files,
+            max_version,
+        }
+    }
+
     // === Summary-First Contract: Overlay-Priority Methods ===
 
     /// Search symbols with overlay priority
@@ -317,6 +331,20 @@ impl DocumentOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{Location, Scope, ScopeKind, Symbol, SymbolKind};
+
+    // === Helper functions ===
+
+    fn create_test_symbol(name: &str, file: &str, start_line: u32, end_line: u32) -> Symbol {
+        Symbol::new(
+            name,
+            SymbolKind::Function,
+            Location::new(file, start_line, 0, end_line, 0),
+            "rust",
+        )
+    }
+
+    // === Basic overlay tests ===
 
     #[test]
     fn test_overlay_update() {
@@ -370,5 +398,283 @@ mod tests {
         overlay.mark_committed("test.rs");
         assert!(!overlay.is_dirty("test.rs"));
         assert!(overlay.dirty_paths().is_empty());
+    }
+
+    // === get_overlay_revision tests ===
+
+    #[test]
+    fn test_get_overlay_revision_empty() {
+        let overlay = DocumentOverlay::new();
+        let rev = overlay.get_overlay_revision();
+        assert_eq!(rev.dirty_files, 0);
+        assert_eq!(rev.max_version, 0);
+    }
+
+    #[test]
+    fn test_get_overlay_revision_single_dirty() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "content", 5);
+
+        let rev = overlay.get_overlay_revision();
+        assert_eq!(rev.dirty_files, 1);
+        assert_eq!(rev.max_version, 5);
+    }
+
+    #[test]
+    fn test_get_overlay_revision_multiple_dirty() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("a.rs", "content a", 3);
+        overlay.update("b.rs", "content b", 7);
+        overlay.update("c.rs", "content c", 2);
+
+        let rev = overlay.get_overlay_revision();
+        assert_eq!(rev.dirty_files, 3);
+        assert_eq!(rev.max_version, 7);
+    }
+
+    #[test]
+    fn test_get_overlay_revision_mixed_dirty_clean() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("dirty1.rs", "content", 3);
+        overlay.update("dirty2.rs", "content", 5);
+        overlay.update("clean.rs", "content", 4);
+        overlay.mark_committed("clean.rs");
+
+        let rev = overlay.get_overlay_revision();
+        assert_eq!(rev.dirty_files, 2);
+        assert_eq!(rev.max_version, 5); // max_version includes clean documents
+    }
+
+    #[test]
+    fn test_get_overlay_revision_max_version_tracking() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("a.rs", "v1", 1);
+        overlay.update("a.rs", "v10", 10);
+        overlay.update("b.rs", "v5", 5);
+
+        let rev = overlay.get_overlay_revision();
+        assert_eq!(rev.max_version, 10);
+    }
+
+    // === get_symbol_at_position tests ===
+
+    #[test]
+    fn test_get_symbol_at_position_exact_match() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "fn foo() {}", 1);
+
+        let symbol = create_test_symbol("foo", "test.rs", 1, 3);
+        overlay.set_symbols("test.rs", vec![symbol]);
+
+        let found = overlay.get_symbol_at_position("test.rs", 2, 5);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "foo");
+    }
+
+    #[test]
+    fn test_get_symbol_at_position_inside_symbol() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "fn foo() { let x = 1; }", 1);
+
+        let symbol = create_test_symbol("foo", "test.rs", 1, 10);
+        overlay.set_symbols("test.rs", vec![symbol]);
+
+        // Position inside the symbol
+        let found = overlay.get_symbol_at_position("test.rs", 5, 0);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "foo");
+    }
+
+    #[test]
+    fn test_get_symbol_at_position_no_match() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "fn foo() {}", 1);
+
+        let symbol = create_test_symbol("foo", "test.rs", 1, 3);
+        overlay.set_symbols("test.rs", vec![symbol]);
+
+        // Position outside the symbol
+        let found = overlay.get_symbol_at_position("test.rs", 50, 0);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_get_symbol_at_position_file_not_in_overlay() {
+        let overlay = DocumentOverlay::new();
+        let found = overlay.get_symbol_at_position("nonexistent.rs", 1, 0);
+        assert!(found.is_none());
+    }
+
+    // === find_symbols_by_name tests ===
+
+    #[test]
+    fn test_find_symbols_by_name_single_match() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "fn foo() {}", 1);
+
+        let symbol = create_test_symbol("foo", "test.rs", 1, 3);
+        overlay.set_symbols("test.rs", vec![symbol]);
+
+        let found = overlay.find_symbols_by_name("foo");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "foo");
+    }
+
+    #[test]
+    fn test_find_symbols_by_name_multiple_files() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("a.rs", "fn foo() {}", 1);
+        overlay.update("b.rs", "fn foo() {}", 1);
+
+        overlay.set_symbols("a.rs", vec![create_test_symbol("foo", "a.rs", 1, 3)]);
+        overlay.set_symbols("b.rs", vec![create_test_symbol("foo", "b.rs", 1, 3)]);
+
+        let found = overlay.find_symbols_by_name("foo");
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn test_find_symbols_by_name_case_insensitive() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "fn Foo() {}", 1);
+
+        let symbol = create_test_symbol("Foo", "test.rs", 1, 3);
+        overlay.set_symbols("test.rs", vec![symbol]);
+
+        let found = overlay.find_symbols_by_name("foo");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Foo");
+    }
+
+    #[test]
+    fn test_find_symbols_by_name_no_match() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "fn bar() {}", 1);
+
+        let symbol = create_test_symbol("bar", "test.rs", 1, 3);
+        overlay.set_symbols("test.rs", vec![symbol]);
+
+        let found = overlay.find_symbols_by_name("foo");
+        assert!(found.is_empty());
+    }
+
+    // === VirtualDocument tests ===
+
+    #[test]
+    fn test_virtual_document_update_clears_symbols() {
+        let mut doc = VirtualDocument::new("initial".to_string(), 1);
+        doc.symbols = vec![create_test_symbol("foo", "test.rs", 1, 3)];
+        doc.scopes = vec![Scope {
+            id: 1,
+            file_path: "test.rs".to_string(),
+            parent_id: None,
+            kind: ScopeKind::File,
+            name: None,
+            start_offset: 0,
+            end_offset: 100,
+            start_line: 1,
+            end_line: 10,
+        }];
+
+        doc.update("new content".to_string());
+
+        assert!(doc.symbols.is_empty());
+        assert!(doc.scopes.is_empty());
+        assert_eq!(doc.version, 2);
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn test_virtual_document_mark_clean() {
+        let mut doc = VirtualDocument::new("content".to_string(), 1);
+        assert!(doc.dirty);
+
+        doc.mark_clean();
+        assert!(!doc.dirty);
+    }
+
+    // === Overlay symbols and scopes management ===
+
+    #[test]
+    fn test_overlay_set_and_get_symbols() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "content", 1);
+
+        let symbols = vec![
+            create_test_symbol("foo", "test.rs", 1, 5),
+            create_test_symbol("bar", "test.rs", 10, 15),
+        ];
+        overlay.set_symbols("test.rs", symbols);
+
+        let retrieved = overlay.get_symbols("test.rs");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_overlay_set_symbols_nonexistent_file() {
+        let overlay = DocumentOverlay::new();
+        // Setting symbols for a file not in overlay should do nothing
+        overlay.set_symbols("nonexistent.rs", vec![create_test_symbol("foo", "nonexistent.rs", 1, 3)]);
+
+        let retrieved = overlay.get_symbols("nonexistent.rs");
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_overlay_set_and_get_scopes() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "content", 1);
+
+        let scopes = vec![Scope {
+            id: 1,
+            file_path: "test.rs".to_string(),
+            parent_id: None,
+            kind: ScopeKind::File,
+            name: None,
+            start_offset: 0,
+            end_offset: 100,
+            start_line: 1,
+            end_line: 10,
+        }];
+        overlay.set_scopes("test.rs", scopes);
+
+        let retrieved = overlay.get_scopes("test.rs");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_overlay_clear() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("a.rs", "content a", 1);
+        overlay.update("b.rs", "content b", 2);
+
+        overlay.clear();
+
+        assert!(!overlay.contains("a.rs"));
+        assert!(!overlay.contains("b.rs"));
+        assert!(overlay.all_paths().is_empty());
+    }
+
+    #[test]
+    fn test_overlay_all_paths() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("a.rs", "content a", 1);
+        overlay.update("b.rs", "content b", 2);
+
+        let paths = overlay.all_paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"a.rs".to_string()));
+        assert!(paths.contains(&"b.rs".to_string()));
+    }
+
+    #[test]
+    fn test_overlay_get_version() {
+        let overlay = DocumentOverlay::new();
+        overlay.update("test.rs", "content", 42);
+
+        assert_eq!(overlay.get_version("test.rs"), Some(42));
+        assert_eq!(overlay.get_version("nonexistent.rs"), None);
     }
 }

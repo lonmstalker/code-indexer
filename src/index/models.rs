@@ -35,6 +35,8 @@ impl<T> ResponseEnvelope<T> {
                 counts: None,
                 next_cursor: None,
                 warnings: Vec::new(),
+                db_rev: None,
+                overlay_rev: None,
             },
             items: Some(items),
             sample: None,
@@ -52,11 +54,25 @@ impl<T> ResponseEnvelope<T> {
                 counts: Some(counts),
                 next_cursor,
                 warnings: Vec::new(),
+                db_rev: None,
+                overlay_rev: None,
             },
             items: None,
             sample: Some(sample),
             next: Vec::new(),
         }
+    }
+
+    /// Sets the database revision
+    pub fn with_db_rev(mut self, rev: u64) -> Self {
+        self.meta.db_rev = Some(rev);
+        self
+    }
+
+    /// Sets the overlay revision
+    pub fn with_overlay_rev(mut self, rev: OverlayRevision) -> Self {
+        self.meta.overlay_rev = Some(rev);
+        self
     }
 
     /// Sets the format
@@ -115,6 +131,21 @@ pub struct ResponseMeta {
     /// Warnings to display
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Database revision (monotonic counter incremented on each write transaction)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_rev: Option<u64>,
+    /// Overlay revision info (dirty file count and max version)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_rev: Option<OverlayRevision>,
+}
+
+/// Overlay revision information for tracking dirty documents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayRevision {
+    /// Number of dirty (uncommitted) files in overlay
+    pub dirty_files: usize,
+    /// Maximum version number across all overlay documents
+    pub max_version: u64,
 }
 
 /// Budget information for response

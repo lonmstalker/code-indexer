@@ -113,7 +113,8 @@ impl SqliteIndex {
                 path TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
                 last_modified INTEGER NOT NULL,
-                symbol_count INTEGER NOT NULL DEFAULT 0
+                symbol_count INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT
             );
 
             -- Projects table for tracking indexed projects
@@ -213,6 +214,15 @@ impl SqliteIndex {
                 outgoing_refs INTEGER DEFAULT 0,
                 git_recency REAL DEFAULT 0.0
             );
+
+            -- Meta table for tracking database revision and other global state
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- Initialize db_revision if it doesn't exist
+            INSERT OR IGNORE INTO meta (key, value) VALUES ('db_revision', '0');
             "#,
         )?;
 
@@ -296,7 +306,100 @@ impl SqliteIndex {
             )?;
         }
 
+        // Add content_hash column if it doesn't exist (for incremental indexing)
+        let has_content_hash: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'content_hash'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_content_hash {
+            conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT", [])?;
+        }
+
         Ok(())
+    }
+
+    // === Database Revision Methods (Summary-First Contract) ===
+
+    /// Gets the current database revision number.
+    /// This is a monotonic counter incremented after each write transaction.
+    pub fn get_db_revision(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let rev: String = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'db_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(rev.parse().unwrap_or(0))
+    }
+
+    /// Increments and returns the new database revision number.
+    /// Should be called after each write transaction.
+    pub fn increment_db_revision(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
+            [],
+        )?;
+        let rev: String = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'db_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(rev.parse().unwrap_or(0))
+    }
+
+    // === Incremental Indexing Methods ===
+
+    /// Gets the stored content hash for a file.
+    /// Returns None if the file is not in the index.
+    pub fn get_file_content_hash(&self, file_path: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT content_hash FROM files WHERE path = ?1",
+                params![file_path],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(hash)
+    }
+
+    /// Updates the content hash for a file.
+    pub fn set_file_content_hash(&self, file_path: &str, content_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE files SET content_hash = ?1 WHERE path = ?2",
+            params![content_hash, file_path],
+        )?;
+        Ok(())
+    }
+
+    /// Checks if a file needs reindexing based on content hash.
+    /// Returns true if:
+    /// - File is not in the index
+    /// - Content hash is different
+    /// - Content hash is not stored (null)
+    pub fn file_needs_reindex(&self, file_path: &str, new_content_hash: &str) -> Result<bool> {
+        match self.get_file_content_hash(file_path)? {
+            Some(stored_hash) => Ok(stored_hash != new_content_hash),
+            None => Ok(true), // File not indexed or hash not stored
+        }
+    }
+
+    /// Computes SHA256 hash of file content.
+    pub fn compute_content_hash(content: &str) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 
     // === Project and Dependency Methods ===
@@ -1106,6 +1209,12 @@ impl SqliteIndex {
             }
         }
 
+        // Increment db revision in same transaction
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
+            [],
+        )?;
+
         tx.commit()?;
         Ok(total_symbols)
     }
@@ -1738,9 +1847,67 @@ impl CodeIndex for SqliteIndex {
     }
 
     fn remove_file(&self, file_path: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM symbols WHERE file_path = ?1", params![file_path])?;
-        conn.execute("DELETE FROM files WHERE path = ?1", params![file_path])?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // 1. Get symbol IDs for this file (needed for cascading deletes)
+        let symbol_ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM symbols WHERE file_path = ?1")?;
+            let ids = stmt
+                .query_map(params![file_path], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+
+        // 2. Delete data referencing these symbols
+        for symbol_id in &symbol_ids {
+            tx.execute(
+                "DELETE FROM symbol_references WHERE symbol_id = ?1",
+                params![symbol_id],
+            )?;
+            tx.execute(
+                "DELETE FROM call_edges WHERE caller_symbol_id = ?1 OR callee_symbol_id = ?1",
+                params![symbol_id],
+            )?;
+            tx.execute(
+                "DELETE FROM symbol_metrics WHERE symbol_id = ?1",
+                params![symbol_id],
+            )?;
+        }
+
+        // 3. Delete data referencing this file path
+        tx.execute(
+            "DELETE FROM symbol_references WHERE referenced_in_file = ?1",
+            params![file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM file_imports WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM scopes WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM call_edges WHERE file_path = ?1",
+            params![file_path],
+        )?;
+
+        // 4. Delete symbols and file entry
+        tx.execute(
+            "DELETE FROM symbols WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        tx.execute("DELETE FROM files WHERE path = ?1", params![file_path])?;
+
+        // 5. Increment db revision
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
+            [],
+        )?;
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -3494,5 +3661,232 @@ mod tests {
         // Empty input should return empty map
         let metrics_map = index.get_symbol_metrics_batch(&[]).unwrap();
         assert!(metrics_map.is_empty());
+    }
+
+    // === Database Revision Tests ===
+
+    #[test]
+    fn test_get_db_revision_initial() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let rev = index.get_db_revision().unwrap();
+        assert_eq!(rev, 0);
+    }
+
+    #[test]
+    fn test_increment_db_revision() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let rev1 = index.increment_db_revision().unwrap();
+        assert_eq!(rev1, 1);
+
+        let rev2 = index.increment_db_revision().unwrap();
+        assert_eq!(rev2, 2);
+
+        let rev3 = index.get_db_revision().unwrap();
+        assert_eq!(rev3, 2);
+    }
+
+    #[test]
+    fn test_db_revision_monotonic() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let mut prev = index.get_db_revision().unwrap();
+        for _ in 0..10 {
+            let current = index.increment_db_revision().unwrap();
+            assert!(current > prev);
+            prev = current;
+        }
+    }
+
+    #[test]
+    fn test_db_revision_persists_between_reads() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        index.increment_db_revision().unwrap();
+        index.increment_db_revision().unwrap();
+        index.increment_db_revision().unwrap();
+
+        // Multiple reads should return the same value
+        let rev1 = index.get_db_revision().unwrap();
+        let rev2 = index.get_db_revision().unwrap();
+        let rev3 = index.get_db_revision().unwrap();
+
+        assert_eq!(rev1, rev2);
+        assert_eq!(rev2, rev3);
+        assert_eq!(rev1, 3);
+    }
+
+    #[test]
+    fn test_db_revision_large_numbers() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Increment many times
+        for _ in 0..100 {
+            index.increment_db_revision().unwrap();
+        }
+
+        let rev = index.get_db_revision().unwrap();
+        assert_eq!(rev, 100);
+    }
+
+    // === Content Hash Tests ===
+
+    #[test]
+    fn test_compute_content_hash_deterministic() {
+        let content = "fn main() {}";
+        let hash1 = SqliteIndex::compute_content_hash(content);
+        let hash2 = SqliteIndex::compute_content_hash(content);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_content_hash_different_content() {
+        let hash1 = SqliteIndex::compute_content_hash("fn main() {}");
+        let hash2 = SqliteIndex::compute_content_hash("fn main() { println!(); }");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_content_hash_empty_string() {
+        let hash = SqliteIndex::compute_content_hash("");
+        assert!(!hash.is_empty());
+        assert_eq!(hash.len(), 16); // 16 hex chars for u64
+    }
+
+    #[test]
+    fn test_compute_content_hash_unicode() {
+        let hash1 = SqliteIndex::compute_content_hash("// Привет мир");
+        let hash2 = SqliteIndex::compute_content_hash("// Hello world");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_content_hash_whitespace_sensitive() {
+        let hash1 = SqliteIndex::compute_content_hash("fn main() {}");
+        let hash2 = SqliteIndex::compute_content_hash("fn main(){}");
+        let hash3 = SqliteIndex::compute_content_hash("fn main() {}\n");
+
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_get_file_content_hash_not_found() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let hash = index.get_file_content_hash("nonexistent.rs").unwrap();
+        assert!(hash.is_none());
+    }
+
+    // Helper to add a file entry to the files table
+    fn add_test_file(index: &SqliteIndex, path: &str, language: &str) {
+        let conn = index.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO files (path, language, last_modified, symbol_count) VALUES (?1, ?2, ?3, ?4)",
+            params![path, language, 0i64, 0i64],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_set_and_get_file_content_hash() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // First add a file entry
+        add_test_file(&index, "test.rs", "rust");
+
+        // Set content hash
+        let hash = "abc123def456";
+        index.set_file_content_hash("test.rs", hash).unwrap();
+
+        // Retrieve it
+        let retrieved = index.get_file_content_hash("test.rs").unwrap();
+        assert_eq!(retrieved, Some(hash.to_string()));
+    }
+
+    #[test]
+    fn test_file_needs_reindex_new_file() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // File not in index should need reindexing
+        let needs = index.file_needs_reindex("new_file.rs", "somehash").unwrap();
+        assert!(needs);
+    }
+
+    #[test]
+    fn test_file_needs_reindex_same_hash() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Add file entry and hash
+        add_test_file(&index, "test.rs", "rust");
+        index.set_file_content_hash("test.rs", "abc123").unwrap();
+
+        // Same hash - no reindex needed
+        let needs = index.file_needs_reindex("test.rs", "abc123").unwrap();
+        assert!(!needs);
+    }
+
+    #[test]
+    fn test_file_needs_reindex_different_hash() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Add file entry and hash
+        add_test_file(&index, "test.rs", "rust");
+        index.set_file_content_hash("test.rs", "abc123").unwrap();
+
+        // Different hash - needs reindex
+        let needs = index.file_needs_reindex("test.rs", "xyz789").unwrap();
+        assert!(needs);
+    }
+
+    #[test]
+    fn test_file_needs_reindex_null_hash() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Add file entry without setting hash
+        add_test_file(&index, "test.rs", "rust");
+
+        // Null hash in DB means needs reindex
+        let needs = index.file_needs_reindex("test.rs", "anyhash").unwrap();
+        assert!(needs);
+    }
+
+    #[test]
+    fn test_content_hash_update() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Add file entry
+        add_test_file(&index, "test.rs", "rust");
+
+        // Set initial hash
+        index.set_file_content_hash("test.rs", "hash_v1").unwrap();
+        assert_eq!(index.get_file_content_hash("test.rs").unwrap(), Some("hash_v1".to_string()));
+
+        // Update hash
+        index.set_file_content_hash("test.rs", "hash_v2").unwrap();
+        assert_eq!(index.get_file_content_hash("test.rs").unwrap(), Some("hash_v2".to_string()));
+    }
+
+    #[test]
+    fn test_content_hash_integration_workflow() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let content_v1 = "fn hello() {}";
+        let content_v2 = "fn hello() { println!(\"hello\"); }";
+
+        let hash_v1 = SqliteIndex::compute_content_hash(content_v1);
+        let hash_v2 = SqliteIndex::compute_content_hash(content_v2);
+
+        // Initial indexing - add file entry and set hash
+        add_test_file(&index, "lib.rs", "rust");
+        index.set_file_content_hash("lib.rs", &hash_v1).unwrap();
+
+        // Check if reindex needed with same content
+        assert!(!index.file_needs_reindex("lib.rs", &hash_v1).unwrap());
+
+        // Check if reindex needed with changed content
+        assert!(index.file_needs_reindex("lib.rs", &hash_v2).unwrap());
+
+        // After reindexing, update hash
+        index.set_file_content_hash("lib.rs", &hash_v2).unwrap();
+        assert!(!index.file_needs_reindex("lib.rs", &hash_v2).unwrap());
     }
 }

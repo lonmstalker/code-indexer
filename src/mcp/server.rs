@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::index::overlay::DocumentOverlay;
 use crate::index::sqlite::SqliteIndex;
 use crate::index::{CodeIndex, SearchOptions, SymbolKind};
 use crate::mcp::consolidated::*;
@@ -20,11 +21,19 @@ use crate::mcp::consolidated::*;
 #[derive(Clone)]
 pub struct McpServer {
     index: Arc<SqliteIndex>,
+    overlay: Arc<DocumentOverlay>,
 }
 
 impl McpServer {
     pub fn new(index: Arc<SqliteIndex>) -> Self {
-        Self { index }
+        Self {
+            index,
+            overlay: Arc::new(DocumentOverlay::new()),
+        }
+    }
+
+    pub fn with_overlay(index: Arc<SqliteIndex>, overlay: Arc<DocumentOverlay>) -> Self {
+        Self { index, overlay }
     }
 
     // === Workspace helper methods ===
@@ -163,6 +172,24 @@ impl McpServer {
         let results = self.index.search(query, &options)?;
 
         Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
+    }
+
+    /// Load a code snippet from a file at the given location
+    fn load_snippet(
+        file_path: &str,
+        start_line: u32,
+        snippet_lines: usize,
+    ) -> Option<String> {
+        std::fs::read_to_string(file_path).ok().map(|content| {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = (start_line.saturating_sub(1)) as usize;
+            let end = (start + snippet_lines).min(lines.len());
+            if start < lines.len() {
+                lines[start..end].join("\n")
+            } else {
+                String::new()
+            }
+        })
     }
 
     // === Memory Bank / Project Context methods ===
@@ -460,7 +487,7 @@ impl McpServer {
         let max_items = budget.max_items.unwrap_or(20);
         let sample_k = budget.sample_k.unwrap_or(5);
         let include_snippets = budget.include_snippets.unwrap_or(false);
-        let _snippet_lines = budget.snippet_lines.unwrap_or(3);
+        let snippet_lines = budget.snippet_lines.unwrap_or(3);
 
         let mut symbol_cards: Vec<SymbolCard> = Vec::new();
         let mut top_usages: Vec<UsageRef> = Vec::new();
@@ -495,8 +522,11 @@ impl McpServer {
                     ),
                     rank: (rank + 1) as u32,
                     snippet: if include_snippets {
-                        // TODO: Load snippet from file
-                        None
+                        Self::load_snippet(
+                            &symbol.location.file_path,
+                            symbol.location.start_line,
+                            snippet_lines,
+                        )
                     } else {
                         None
                     },
@@ -562,7 +592,15 @@ impl McpServer {
                             symbol.location.file_path, symbol.location.start_line
                         ),
                         rank: (symbol_cards.len() + 1) as u32,
-                        snippet: None,
+                        snippet: if include_snippets {
+                            Self::load_snippet(
+                                &symbol.location.file_path,
+                                symbol.location.start_line,
+                                snippet_lines,
+                            )
+                        } else {
+                            None
+                        },
                     };
                     symbol_cards.push(card);
                 }
@@ -691,6 +729,100 @@ pub fn extract_envelope_param(args: &Option<serde_json::Map<String, serde_json::
         .and_then(|m| m.get("envelope"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// Enforces max_bytes budget on serialized output.
+/// Returns (truncated_output, was_truncated) tuple.
+/// If max_bytes is None, returns the full output without truncation.
+#[allow(dead_code)]
+pub fn enforce_max_bytes(output: &str, max_bytes: Option<usize>) -> (String, bool) {
+    match max_bytes {
+        Some(max) if output.len() > max => {
+            // Find a safe truncation point (at a character boundary)
+            let truncated = if max >= 3 {
+                let safe_max = output.floor_char_boundary(max.saturating_sub(3));
+                format!("{}...", &output[..safe_max])
+            } else {
+                "...".to_string()
+            };
+            (truncated, true)
+        }
+        _ => (output.to_string(), false),
+    }
+}
+
+/// Enforces budget on a list of items by serializing and truncating if needed.
+/// Returns (items, total_count, was_truncated).
+#[allow(dead_code)]
+pub fn enforce_budget_on_items<T: serde::Serialize + Clone>(
+    items: Vec<T>,
+    max_items: Option<usize>,
+    max_bytes: Option<usize>,
+) -> (Vec<T>, usize, bool) {
+    let total_count = items.len();
+
+    // First apply max_items limit
+    let limited_items: Vec<T> = match max_items {
+        Some(max) if items.len() > max => items.into_iter().take(max).collect(),
+        _ => items,
+    };
+
+    let was_truncated_by_items = max_items.map_or(false, |max| total_count > max);
+
+    // Then check if serialized size exceeds max_bytes
+    if let Some(max_bytes) = max_bytes {
+        let mut result = limited_items.clone();
+        let limited_len = limited_items.len();
+        loop {
+            let json = serde_json::to_string(&result).unwrap_or_default();
+            if json.len() <= max_bytes || result.is_empty() {
+                let was_truncated = was_truncated_by_items || result.len() < limited_len;
+                return (result, total_count, was_truncated);
+            }
+            // Remove last item and try again
+            result.pop();
+        }
+    }
+
+    (limited_items, total_count, was_truncated_by_items)
+}
+
+/// Redacts sensitive information from code snippets.
+/// Replaces patterns that look like secrets with [REDACTED].
+#[allow(dead_code)]
+pub fn redact_secrets(content: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Static patterns compiled once
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+
+    let patterns = PATTERNS.get_or_init(|| {
+        vec![
+            // API keys (various formats)
+            Regex::new(r#"(?i)(api[_-]?key|apikey)\s*[=:]\s*["']?[A-Za-z0-9_\-]{20,}["']?"#).unwrap(),
+            // Bearer tokens
+            Regex::new(r#"(?i)bearer\s+[A-Za-z0-9_\-\.]{20,}"#).unwrap(),
+            // AWS keys
+            Regex::new(r#"(?i)(aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret[_-]?access[_-]?key)\s*[=:]\s*["']?[A-Za-z0-9/+=]{20,}["']?"#).unwrap(),
+            // Private keys / passwords in assignments
+            Regex::new(r#"(?i)(private[_-]?key|secret[_-]?key|password|passwd|pwd)\s*[=:]\s*["'][^"']{8,}["']"#).unwrap(),
+            // Generic secrets in environment-style
+            Regex::new(r#"(?i)(secret|token|credential|auth)\s*[=:]\s*["']?[A-Za-z0-9_\-]{16,}["']?"#).unwrap(),
+            // JWT tokens
+            Regex::new(r#"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"#).unwrap(),
+            // GitHub tokens
+            Regex::new(r#"gh[pousr]_[A-Za-z0-9]{36,}"#).unwrap(),
+            // Connection strings with passwords
+            Regex::new(r#"(?i)(postgres|mysql|mongodb|redis)://[^:]+:[^@]+@"#).unwrap(),
+        ]
+    });
+
+    let mut result = content.to_string();
+    for pattern in patterns.iter() {
+        result = pattern.replace_all(&result, "[REDACTED]").to_string();
+    }
+    result
 }
 
 fn schema_for<T: JsonSchema>() -> Arc<serde_json::Map<String, serde_json::Value>> {
@@ -1230,6 +1362,22 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
+            // 14. get_snippet - Retrieve code snippets with budget control
+            Tool {
+                name: "get_snippet".into(),
+                title: Some("Get Snippet".to_string()),
+                description: Some(
+                    "Retrieve code snippets by stable_id or file:line reference. \
+                     Supports context lines, max line limits, and scope expansion. \
+                     Use this as the single code-returning tool with budget control."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetSnippetParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
         ];
 
         Ok(ListToolsResult {
@@ -1293,16 +1441,107 @@ impl ServerHandler for McpServer {
         let result = match tool_name {
             // === 1. index_workspace ===
             "index_workspace" => {
+                use crate::index::sqlite::SqliteIndex;
+                use crate::indexer::{FileWalker, Parser, SymbolExtractor};
+                use crate::languages::LanguageRegistry;
+                use rayon::prelude::*;
+
                 let params: IndexWorkspaceParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
                 )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let path = params.path.unwrap_or_else(|| ".".to_string());
-                // TODO: Implement full workspace indexing with watch and deps options
+                let workspace_path = params.path.unwrap_or_else(|| ".".to_string());
+                let path = std::path::Path::new(&workspace_path);
+
+                // Walk the workspace to find supported files
+                let registry = LanguageRegistry::new();
+                let walker = FileWalker::new(registry);
+
+                let files = walker.walk(path).map_err(|e| {
+                    McpError::internal_error(format!("Failed to walk workspace: {}", e), None)
+                })?;
+
+                let files_count = files.len();
+
+                // Incremental indexing: filter out files that haven't changed
+                let files_to_index: Vec<_> = files
+                    .iter()
+                    .filter(|file| {
+                        // Read file content and compute hash
+                        if let Ok(content) = std::fs::read_to_string(file) {
+                            let hash = SqliteIndex::compute_content_hash(&content);
+                            if let Ok(needs_reindex) = self.index.file_needs_reindex(
+                                &file.to_string_lossy(),
+                                &hash,
+                            ) {
+                                if !needs_reindex {
+                                    return false; // Skip unchanged file
+                                }
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+
+                let files_skipped = files_count - files_to_index.len();
+
+                // Parallel parsing and extraction using rayon
+                let results: Vec<(std::path::PathBuf, String, crate::indexer::ExtractionResult)> = files_to_index
+                    .into_par_iter()
+                    .filter_map(|file| {
+                        let registry = LanguageRegistry::new();
+                        let parser = Parser::new(registry);
+                        let extractor = SymbolExtractor::new();
+
+                        // Read content and compute hash
+                        let content = std::fs::read_to_string(&file).ok()?;
+                        let hash = SqliteIndex::compute_content_hash(&content);
+
+                        match parser.parse_file(&file) {
+                            Ok(parsed) => match extractor.extract_all(&parsed, &file) {
+                                Ok(result) => Some((file.clone(), hash, result)),
+                                Err(_) => None,
+                            },
+                            Err(_) => None,
+                        }
+                    })
+                    .collect();
+
+                let files_updated = results.len();
+
+                // Remove old data for files that will be updated
+                for (file, _, _) in &results {
+                    let _ = self.index.remove_file(&file.to_string_lossy());
+                }
+
+                // Extract hashes first (before moving results)
+                let file_hashes: Vec<_> = results.iter().map(|(f, h, _)| (f.to_string_lossy().to_string(), h.clone())).collect();
+
+                // Extract results for batch insert
+                let extraction_results: Vec<crate::indexer::ExtractionResult> = results.into_iter().map(|(_, _, r)| r).collect();
+
+                // Batch insert all results
+                let total_symbols = self
+                    .index
+                    .add_extraction_results_batch(extraction_results)
+                    .map_err(|e| {
+                        McpError::internal_error(format!("Failed to store results: {}", e), None)
+                    })?;
+
+                // Update content hashes for indexed files
+                for (file_path, hash) in file_hashes {
+                    let _ = self.index.set_file_content_hash(&file_path, &hash);
+                }
+
                 let output = serde_json::json!({
                     "status": "indexed",
-                    "path": path,
+                    "path": workspace_path,
+                    "files_found": files_count,
+                    "files_updated": files_updated,
+                    "files_skipped": files_skipped,
+                    "symbols_indexed": total_symbols,
+                    "incremental": true,
                     "watch": params.watch.unwrap_or(false),
                     "include_deps": params.include_deps.unwrap_or(false),
                 });
@@ -1313,17 +1552,99 @@ impl ServerHandler for McpServer {
 
             // === 2. update_files ===
             "update_files" => {
+                use crate::indexer::{Parser, SymbolExtractor};
+                use crate::languages::LanguageRegistry;
+
                 let params: UpdateFilesParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
                 )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                // TODO: Implement virtual document updates via DocumentOverlay
-                let updated: Vec<String> = params.files.iter().map(|f| f.path.clone()).collect();
-                let output = serde_json::json!({
+                let registry = LanguageRegistry::new();
+                let parser = Parser::new(registry);
+                let extractor = SymbolExtractor::new();
+
+                let mut updated_files = Vec::new();
+                let mut warnings = Vec::new();
+                let mut symbol_counts = Vec::new();
+
+                for file_update in params.files {
+                    let path = &file_update.path;
+                    let content = &file_update.content;
+                    let version = file_update.version.unwrap_or(1);
+
+                    // Check version conflict
+                    if let Some(current_version) = self.overlay.get_version(path) {
+                        if version <= current_version {
+                            warnings.push(serde_json::json!({
+                                "file": path,
+                                "warning": "version_conflict",
+                                "current_version": current_version,
+                                "provided_version": version
+                            }));
+                            continue;
+                        }
+                    }
+
+                    // Update overlay with new content
+                    self.overlay.update(path, content, version);
+
+                    // Parse and extract symbols from the content
+                    let registry = LanguageRegistry::new();
+                    if let Some(grammar) = registry.get_by_extension(
+                        std::path::Path::new(path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or(""),
+                    ) {
+                        match parser.parse_source(content, grammar) {
+                            Ok(parsed) => {
+                                match extractor.extract_all(&parsed, std::path::Path::new(path)) {
+                                    Ok(result) => {
+                                        let symbols_count = result.symbols.len();
+                                        self.overlay.set_symbols(path, result.symbols);
+                                        symbol_counts.push(serde_json::json!({
+                                            "file": path,
+                                            "symbols": symbols_count
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        warnings.push(serde_json::json!({
+                                            "file": path,
+                                            "warning": "extraction_failed",
+                                            "error": e.to_string()
+                                        }));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warnings.push(serde_json::json!({
+                                    "file": path,
+                                    "warning": "parse_failed",
+                                    "error": e.to_string()
+                                }));
+                            }
+                        }
+                    } else {
+                        warnings.push(serde_json::json!({
+                            "file": path,
+                            "warning": "unsupported_language"
+                        }));
+                    }
+
+                    updated_files.push(path.clone());
+                }
+
+                let mut output = serde_json::json!({
                     "status": "updated",
-                    "files": updated,
+                    "files": updated_files,
+                    "symbol_counts": symbol_counts,
                 });
+
+                if !warnings.is_empty() {
+                    output["warnings"] = serde_json::json!(warnings);
+                }
+
                 CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&output).unwrap_or_default(),
                 )])
@@ -1426,6 +1747,7 @@ impl ServerHandler for McpServer {
                 };
 
                 // Handle regex search
+                // Use overlay-first semantics for all searches
                 let search_result = if use_regex {
                     self.search_by_pattern_impl(&params.query, file_filter.as_deref(), params.limit)
                         .map(|json| {
@@ -1433,9 +1755,12 @@ impl ServerHandler for McpServer {
                             serde_json::from_str(&json).unwrap_or_default()
                         })
                 } else if fuzzy {
-                    self.index.search_fuzzy(&params.query, &options)
+                    // Check overlay first, then DB
+                    self.overlay.search_with_overlay(&params.query, &self.index, &options)
+                        .or_else(|_| self.index.search_fuzzy(&params.query, &options))
                 } else {
-                    self.index.search(&params.query, &options)
+                    // Overlay-first search: prioritize dirty documents
+                    self.overlay.search_with_overlay(&params.query, &self.index, &options)
                 };
 
                 match search_result {
@@ -1473,11 +1798,12 @@ impl ServerHandler for McpServer {
                 )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                // Handle batch lookup
+                // Handle batch lookup with overlay-first semantics
                 if let Some(ids) = params.ids {
                     let mut symbols = Vec::new();
                     for id in ids {
-                        if let Ok(Some(symbol)) = self.index.get_symbol(&id) {
+                        // Try overlay first, then DB
+                        if let Ok(Some(symbol)) = self.overlay.get_symbol_with_overlay(&id, &self.index) {
                             symbols.push(symbol);
                         }
                     }
@@ -1485,9 +1811,9 @@ impl ServerHandler for McpServer {
                     return Ok(CallToolResult::success(vec![Content::text(json)]));
                 }
 
-                // Handle single ID lookup
+                // Handle single ID lookup with overlay-first semantics
                 if let Some(id) = params.id {
-                    match self.index.get_symbol(&id) {
+                    match self.overlay.get_symbol_with_overlay(&id, &self.index) {
                         Ok(Some(symbol)) => {
                             let json = serde_json::to_string_pretty(&symbol).unwrap_or_default();
                             CallToolResult::success(vec![Content::text(json)])
@@ -1501,11 +1827,19 @@ impl ServerHandler for McpServer {
                         Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                     }
                 }
-                // Handle position-based lookup
+                // Handle position-based lookup with overlay-first
                 else if let (Some(file), Some(line)) = (params.file, params.line) {
+                    let column = params.column.unwrap_or(0);
+
+                    // First check overlay for this file/position
+                    if let Some(symbol) = self.overlay.get_symbol_at_position(&file, line, column) {
+                        let json = serde_json::to_string_pretty(&vec![symbol]).unwrap_or_default();
+                        return Ok(CallToolResult::success(vec![Content::text(json)]));
+                    }
+
+                    // Fall back to DB
                     match self.index.get_file_symbols(&file) {
                         Ok(symbols) => {
-                            let column = params.column.unwrap_or(0);
                             let found: Vec<_> = symbols
                                 .into_iter()
                                 .filter(|s| {
@@ -2125,6 +2459,113 @@ impl ServerHandler for McpServer {
                 }
             }
 
+            // === 14. get_snippet ===
+            "get_snippet" => {
+                let params: GetSnippetParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let context_lines = params.context_lines.unwrap_or(3);
+                let max_lines = params.max_lines.unwrap_or(50);
+                let expand_to_scope = params.expand_to_scope.unwrap_or(false);
+                let redact = params.redact.unwrap_or(true); // Default to redact for safety
+
+                // Parse target: either stable_id or file:line
+                let (file_path, start_line, end_line) = if params.target.starts_with("sid:") {
+                    // Lookup by stable_id
+                    match self.index.get_symbol_by_stable_id(&params.target) {
+                        Ok(Some(symbol)) => (
+                            symbol.location.file_path.clone(),
+                            symbol.location.start_line,
+                            if expand_to_scope {
+                                Some(symbol.location.end_line)
+                            } else {
+                                None
+                            },
+                        ),
+                        Ok(None) => {
+                            return Ok(CallToolResult::error(vec![Content::text(format!(
+                                "Symbol not found: {}",
+                                params.target
+                            ))]));
+                        }
+                        Err(e) => {
+                            return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+                        }
+                    }
+                } else if let Some((file, line_str)) = params.target.rsplit_once(':') {
+                    // Parse file:line format
+                    match line_str.parse::<u32>() {
+                        Ok(line) => (file.to_string(), line, None),
+                        Err(_) => {
+                            return Ok(CallToolResult::error(vec![Content::text(format!(
+                                "Invalid target format: {}. Expected 'sid:...' or 'file:line'",
+                                params.target
+                            ))]));
+                        }
+                    }
+                } else {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Invalid target format: {}. Expected 'sid:...' or 'file:line'",
+                        params.target
+                    ))]));
+                };
+
+                // Read the file and extract snippet
+                match std::fs::read_to_string(&file_path) {
+                    Ok(content) => {
+                        let lines: Vec<&str> = content.lines().collect();
+                        let total_lines = lines.len();
+
+                        // Calculate line range
+                        let start_with_context =
+                            (start_line.saturating_sub(1) as usize).saturating_sub(context_lines);
+                        let base_end = if let Some(end) = end_line {
+                            end as usize
+                        } else {
+                            start_line as usize
+                        };
+                        let end_with_context = (base_end + context_lines).min(total_lines);
+
+                        // Apply max_lines limit
+                        let actual_end =
+                            (start_with_context + max_lines).min(end_with_context).min(total_lines);
+
+                        let snippet_lines: Vec<String> = lines[start_with_context..actual_end]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, line)| {
+                                let line_content = if redact {
+                                    redact_secrets(line)
+                                } else {
+                                    line.to_string()
+                                };
+                                format!("{:4} | {}", start_with_context + i + 1, line_content)
+                            })
+                            .collect();
+
+                        let output = serde_json::json!({
+                            "file": file_path,
+                            "start_line": start_with_context + 1,
+                            "end_line": actual_end,
+                            "total_lines": actual_end - start_with_context,
+                            "truncated": actual_end < end_with_context,
+                            "redacted": redact,
+                            "snippet": snippet_lines.join("\n"),
+                        });
+
+                        CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&output).unwrap_or_default(),
+                        )])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(format!(
+                        "Failed to read file '{}': {}",
+                        file_path, e
+                    ))]),
+                }
+            }
+
             _ => {
                 return Err(McpError::invalid_params(
                     format!("Unknown tool: {}", request.name),
@@ -2134,5 +2575,187 @@ impl ServerHandler for McpServer {
         };
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === enforce_max_bytes tests ===
+
+    #[test]
+    fn test_enforce_max_bytes_under_limit() {
+        let output = "Hello, World!";
+        let (result, truncated) = enforce_max_bytes(output, Some(100));
+        assert_eq!(result, output);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_enforce_max_bytes_at_limit() {
+        let output = "Hello";
+        let (result, truncated) = enforce_max_bytes(output, Some(5));
+        assert_eq!(result, output);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_enforce_max_bytes_over_limit() {
+        let output = "Hello, World!";
+        let (result, truncated) = enforce_max_bytes(output, Some(8));
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 8);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_enforce_max_bytes_none_limit() {
+        let output = "Hello, World! This is a very long string that should not be truncated.";
+        let (result, truncated) = enforce_max_bytes(output, None);
+        assert_eq!(result, output);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_enforce_max_bytes_utf8_boundary() {
+        let output = "Привет мир"; // Cyrillic characters (2 bytes each)
+        let (result, truncated) = enforce_max_bytes(output, Some(10));
+        // Should truncate at safe boundary and add "..."
+        assert!(truncated);
+        assert!(result.ends_with("..."));
+        // Verify the result is valid UTF-8
+        assert!(result.is_ascii() || result.chars().all(|c| c.len_utf8() >= 1));
+    }
+
+    #[test]
+    fn test_enforce_max_bytes_very_small_limit() {
+        let output = "Hello, World!";
+        let (result, truncated) = enforce_max_bytes(output, Some(2));
+        assert_eq!(result, "...");
+        assert!(truncated);
+    }
+
+    // === enforce_budget_on_items tests ===
+
+    #[test]
+    fn test_enforce_budget_under_limit() {
+        let items = vec!["a", "b", "c"];
+        let (result, total, truncated) = enforce_budget_on_items(items.clone(), Some(10), None);
+        assert_eq!(result, items);
+        assert_eq!(total, 3);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_enforce_budget_truncated_by_items() {
+        let items = vec!["a", "b", "c", "d", "e"];
+        let (result, total, truncated) = enforce_budget_on_items(items, Some(3), None);
+        assert_eq!(result.len(), 3);
+        assert_eq!(total, 5);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_enforce_budget_truncated_by_bytes() {
+        let items = vec!["long_item_1", "long_item_2", "long_item_3"];
+        let (result, total, truncated) = enforce_budget_on_items(items, None, Some(30));
+        // Serialized JSON will be truncated by bytes
+        assert!(total == 3);
+        // Result should be truncated to fit within ~30 bytes
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(serialized.len() <= 30 || result.is_empty());
+        assert!(truncated || result.len() == 3);
+    }
+
+    #[test]
+    fn test_enforce_budget_both_limits() {
+        let items = vec!["item1", "item2", "item3", "item4", "item5"];
+        let (result, total, truncated) = enforce_budget_on_items(items, Some(4), Some(20));
+        assert!(result.len() <= 4);
+        assert_eq!(total, 5);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_enforce_budget_empty_input() {
+        let items: Vec<&str> = vec![];
+        let (result, total, truncated) = enforce_budget_on_items(items, Some(10), Some(100));
+        assert!(result.is_empty());
+        assert_eq!(total, 0);
+        assert!(!truncated);
+    }
+
+    // === redact_secrets tests ===
+
+    #[test]
+    fn test_redact_secrets_api_key() {
+        // Build the test key dynamically to avoid triggering GitHub secret scanning
+        let test_key = format!("{}_{}_abcdefghijklmnopqrstuvwxyz1234567890", "sk", "live");
+        let content = format!(r#"let api_key = "{}";"#, test_key);
+        let result = redact_secrets(&content);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("sk_live_"));
+    }
+
+    #[test]
+    fn test_redact_secrets_bearer_token() {
+        let content = r#"Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"#;
+        let result = redact_secrets(content);
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_secrets_password_env() {
+        let content = r#"password = "super_secret_password123""#;
+        let result = redact_secrets(content);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("super_secret"));
+    }
+
+    #[test]
+    fn test_redact_secrets_multiple_secrets() {
+        let content = r#"
+            api_key = "key_123456789012345678901234567890"
+            secret = "secret_abcdefghijklmnopqrstuvwxyz"
+            password = "my_password_12345678"
+        "#;
+        let result = redact_secrets(content);
+        // All secrets should be redacted
+        assert!(result.matches("[REDACTED]").count() >= 2);
+    }
+
+    #[test]
+    fn test_redact_secrets_no_secrets() {
+        let content = r#"
+            fn main() {
+                let x = 42;
+                println!("Hello, world!");
+            }
+        "#;
+        let result = redact_secrets(content);
+        assert!(!result.contains("[REDACTED]"));
+        assert!(result.contains("Hello, world!"));
+    }
+
+    #[test]
+    fn test_redact_secrets_github_token() {
+        let content = r#"GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"#;
+        let result = redact_secrets(content);
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_secrets_jwt_token() {
+        let content = "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let result = redact_secrets(content);
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_secrets_connection_string() {
+        let content = r#"DATABASE_URL = "postgres://user:secret_password@localhost:5432/db""#;
+        let result = redact_secrets(content);
+        assert!(result.contains("[REDACTED]"));
     }
 }

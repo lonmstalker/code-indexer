@@ -16,9 +16,11 @@ pub use dependencies::{
 pub use error::{IndexerError, Result};
 pub use index::sqlite::SqliteIndex;
 pub use index::{
-    CallConfidence, CallGraph, CallGraphEdge, CallGraphNode, CodeIndex, DeadCodeReport,
-    DocumentOverlay, FileImport, FunctionMetrics, ImportType, ReferenceKind, Scope, ScopeKind,
-    SearchOptions, Symbol, SymbolKind, SymbolMetrics, SymbolReference, UncertaintyReason,
+    BudgetInfo, CallConfidence, CallGraph, CallGraphEdge, CallGraphNode, CodeIndex, CompactSymbol,
+    CountsInfo, DeadCodeReport, DocumentOverlay, FileImport, FunctionMetrics, ImportType, IndexStats,
+    Location, NextAction, OutputFormat, OverlayRevision, PaginationCursor, ReferenceKind,
+    ResponseEnvelope, Scope, ScopeKind, SearchOptions, SearchResult, Symbol, SymbolKind,
+    SymbolMetrics, SymbolReference, UncertaintyReason, Visibility,
 };
 pub use indexer::{ExtractionResult, FileWalker, Parser, SymbolExtractor};
 pub use languages::{CrossLanguageAnalyzer, CrossLanguageRef, CrossRefType, LanguageRegistry};

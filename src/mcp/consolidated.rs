@@ -66,6 +66,9 @@ pub struct ListSymbolsParams {
     /// Wrap response in ResponseEnvelope (default: false for backward compatibility)
     #[serde(default)]
     pub envelope: Option<bool>,
+    /// Pagination cursor (base64-encoded, from previous response's next_cursor)
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 // === 4. search_symbols ===
@@ -104,6 +107,9 @@ pub struct SearchSymbolsParams {
     /// Wrap response in ResponseEnvelope (default: false for backward compatibility)
     #[serde(default)]
     pub envelope: Option<bool>,
+    /// Pagination cursor (base64-encoded, from previous response's next_cursor)
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 // === 5. get_symbol ===
@@ -168,6 +174,9 @@ pub struct ConsolidatedFindReferencesParams {
     /// Wrap response in ResponseEnvelope (default: false)
     #[serde(default)]
     pub envelope: Option<bool>,
+    /// Pagination cursor (base64-encoded, from previous response's next_cursor)
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 // === 8. analyze_call_graph ===
@@ -252,6 +261,26 @@ pub struct GetStatsParams {
     /// Include architecture summary
     #[serde(default)]
     pub include_architecture: Option<bool>,
+}
+
+// === 13. get_snippet ===
+/// Parameters for getting code snippets with budget control
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GetSnippetParams {
+    /// Target: stable_id (e.g. "sid:rust:fn:main@src/main.rs:10") or file:line (e.g. "src/main.rs:10")
+    pub target: String,
+    /// Number of context lines before and after (default: 3)
+    #[serde(default)]
+    pub context_lines: Option<usize>,
+    /// Maximum total lines to return (default: 50)
+    #[serde(default)]
+    pub max_lines: Option<usize>,
+    /// Expand to full scope boundary (function, struct, etc.)
+    #[serde(default)]
+    pub expand_to_scope: Option<bool>,
+    /// Redact sensitive information (API keys, tokens, passwords). Default: true for agent mode.
+    #[serde(default)]
+    pub redact: Option<bool>,
 }
 
 // =====================================================
