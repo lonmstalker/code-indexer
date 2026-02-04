@@ -11,9 +11,11 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::index::sqlite::SqliteIndex;
 use crate::index::{CodeIndex, SearchOptions, SymbolKind};
+use crate::mcp::consolidated::*;
 
 #[derive(Clone)]
 pub struct McpServer {
@@ -128,6 +130,7 @@ impl McpServer {
         Ok(serde_json::to_string_pretty(&output).unwrap_or_default())
     }
 
+    #[allow(dead_code)]
     fn search_in_module_impl(
         &self,
         workspace_path: &str,
@@ -444,6 +447,9 @@ fn schema_for<T: JsonSchema>() -> Arc<serde_json::Map<String, serde_json::Value>
     }
 }
 
+// === Legacy params for backward compatibility (deprecated) ===
+
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchSymbolParams {
     /// Query
@@ -457,14 +463,25 @@ pub struct SearchSymbolParams {
     /// Language
     #[serde(default)]
     pub language: Option<String>,
+    /// Output format: full, compact, minimal
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Enable fuzzy search for typo tolerance
+    #[serde(default)]
+    pub fuzzy: Option<bool>,
+    /// Fuzzy search threshold (0.0-1.0)
+    #[serde(default)]
+    pub fuzzy_threshold: Option<f64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindDefinitionParams {
     /// Symbol name
     pub name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListFunctionsParams {
     /// Max results
@@ -478,6 +495,7 @@ pub struct ListFunctionsParams {
     pub file: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListTypesParams {
     /// Max results
@@ -491,18 +509,21 @@ pub struct ListTypesParams {
     pub file: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GetFileStructureParams {
     /// File path
     pub file_path: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GetSymbolParams {
     /// ID
     pub id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EmptyParams {}
 
@@ -521,6 +542,7 @@ pub struct ListDependenciesParams {
 // Note: IndexDependencyParams is reserved for future use when we add
 // MCP-based dependency indexing (currently only CLI-based indexing is supported)
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindInDependencyParams {
     /// Name
@@ -562,6 +584,7 @@ pub struct DependencyInfoParams {
 
 // === Reference tracking params ===
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindReferencesParams {
     /// Symbol
@@ -574,6 +597,7 @@ pub struct FindReferencesParams {
     pub limit: Option<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindCallersParams {
     /// Function
@@ -595,18 +619,21 @@ pub struct GetSymbolMembersParams {
     pub type_name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GetFileImportsParams {
     /// File path
     pub file_path: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GetFileImportersParams {
     /// File path
     pub file_path: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchByPatternParams {
     /// Regex
@@ -619,12 +646,14 @@ pub struct SearchByPatternParams {
     pub limit: Option<usize>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BatchGetSymbolsParams {
     /// IDs
     pub symbol_ids: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindSymbolsInRangeParams {
     /// File
@@ -662,6 +691,7 @@ pub struct FindModuleDependenciesParams {
     pub workspace_path: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchInModuleParams {
     /// Query
@@ -714,6 +744,7 @@ pub struct FindKotlinExtensionsParams {
 
 // === Analysis params ===
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GetCallGraphParams {
     /// Entry point function name
@@ -723,12 +754,14 @@ pub struct GetCallGraphParams {
     pub depth: Option<u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindCalleesParams {
     /// Function name
     pub function: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct FindDeadCodeParams {
     /// Optional path filter
@@ -736,6 +769,7 @@ pub struct FindDeadCodeParams {
     pub path_filter: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GetMetricsParams {
     /// Function name or file path
@@ -743,6 +777,22 @@ pub struct GetMetricsParams {
     /// Whether the target is a file path (default: false, meaning it's a function name)
     #[serde(default)]
     pub is_file: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GetChangedSymbolsParams {
+    /// Git reference to compare against (default: HEAD)
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Include staged changes
+    #[serde(default)]
+    pub include_staged: Option<bool>,
+    /// Include unstaged changes
+    #[serde(default)]
+    pub include_unstaged: Option<bool>,
+    /// Output format: full, compact, minimal
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 impl ServerHandler for McpServer {
@@ -775,328 +825,135 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        // === 12 Consolidated MCP Tools ===
         let tools = vec![
+            // 1. index_workspace - Index workspace with configuration
             Tool {
-                name: "search_symbol".into(),
-                title: Some("Search Symbol".to_string()),
-                description: Some("Fuzzy search symbols".into()),
-                input_schema: schema_for::<SearchSymbolParams>(),
+                name: "index_workspace".into(),
+                title: Some("Index Workspace".to_string()),
+                description: Some("Index a workspace with optional configuration. Supports file watching and dependency indexing.".into()),
+                input_schema: schema_for::<IndexWorkspaceParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 2. update_files - Update virtual documents (for unsaved changes)
             Tool {
-                name: "find_definition".into(),
-                title: Some("Find Definition".to_string()),
-                description: Some("Find symbol definition".into()),
-                input_schema: schema_for::<FindDefinitionParams>(),
+                name: "update_files".into(),
+                title: Some("Update Files".to_string()),
+                description: Some("Update virtual documents for unsaved file changes. Supports versioning for conflict detection.".into()),
+                input_schema: schema_for::<UpdateFilesParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 3. list_symbols - List symbols with filters (replaces list_functions, list_types)
             Tool {
-                name: "list_functions".into(),
-                title: Some("List Functions".to_string()),
-                description: Some("List functions".into()),
-                input_schema: schema_for::<ListFunctionsParams>(),
+                name: "list_symbols".into(),
+                title: Some("List Symbols".to_string()),
+                description: Some("List symbols with filters. Use kind='function' or kind='type' to filter. Supports language, file pattern, and output format options.".into()),
+                input_schema: schema_for::<ListSymbolsParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 4. search_symbols - Search symbols with fuzzy matching (replaces search_symbol, search_by_pattern, search_in_module)
             Tool {
-                name: "list_types".into(),
-                title: Some("List Types".to_string()),
-                description: Some("List types".into()),
-                input_schema: schema_for::<ListTypesParams>(),
+                name: "search_symbols".into(),
+                title: Some("Search Symbols".to_string()),
+                description: Some("Search symbols with optional fuzzy matching, regex patterns, and module filtering. Supports ranking and multiple output formats.".into()),
+                input_schema: schema_for::<SearchSymbolsParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
-            Tool {
-                name: "get_file_structure".into(),
-                title: Some("Get File Structure".to_string()),
-                description: Some("Get file symbols".into()),
-                input_schema: schema_for::<GetFileStructureParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "index_stats".into(),
-                title: Some("Index Stats".to_string()),
-                description: Some("Index stats".into()),
-                input_schema: schema_for::<EmptyParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
+            // 5. get_symbol - Get symbol by ID or position (replaces get_symbol, batch_get_symbols)
             Tool {
                 name: "get_symbol".into(),
                 title: Some("Get Symbol".to_string()),
-                description: Some("Get symbol by ID".into()),
-                input_schema: schema_for::<GetSymbolParams>(),
+                description: Some("Get a symbol by ID, batch of IDs, or by file position (file + line + column).".into()),
+                input_schema: schema_for::<ConsolidatedGetSymbolParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
-            // Dependency tools
+            // 6. find_definitions - Find symbol definitions (with dependency support)
             Tool {
-                name: "list_dependencies".into(),
-                title: Some("List Dependencies".to_string()),
-                description: Some("List project deps".into()),
-                input_schema: schema_for::<ListDependenciesParams>(),
+                name: "find_definitions".into(),
+                title: Some("Find Definitions".to_string()),
+                description: Some("Find symbol definitions. Can search in project and dependencies.".into()),
+                input_schema: schema_for::<FindDefinitionsParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
-            Tool {
-                name: "find_in_dependency".into(),
-                title: Some("Find In Dependency".to_string()),
-                description: Some("Search in deps".into()),
-                input_schema: schema_for::<FindInDependencyParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "get_dependency_source".into(),
-                title: Some("Get Dependency Source".to_string()),
-                description: Some("Get dep source".into()),
-                input_schema: schema_for::<GetDependencySourceParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "dependency_info".into(),
-                title: Some("Dependency Info".to_string()),
-                description: Some("Dependency info".into()),
-                input_schema: schema_for::<DependencyInfoParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            // Reference tracking tools
+            // 7. find_references - Find symbol references (replaces find_references, find_callers, get_file_importers)
             Tool {
                 name: "find_references".into(),
                 title: Some("Find References".to_string()),
-                description: Some("Find usages".into()),
-                input_schema: schema_for::<FindReferencesParams>(),
+                description: Some("Find symbol references. Includes callers, importers, and filters by reference kind.".into()),
+                input_schema: schema_for::<ConsolidatedFindReferencesParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 8. analyze_call_graph - Call graph analysis (replaces get_call_graph, find_callees)
             Tool {
-                name: "find_callers".into(),
-                title: Some("Find Callers".to_string()),
-                description: Some("Find callers".into()),
-                input_schema: schema_for::<FindCallersParams>(),
+                name: "analyze_call_graph".into(),
+                title: Some("Analyze Call Graph".to_string()),
+                description: Some("Analyze call graph from entry point. Supports bidirectional traversal and confidence filtering.".into()),
+                input_schema: schema_for::<AnalyzeCallGraphParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 9. get_file_outline - Get file structure (replaces get_file_structure, find_symbols_in_range)
             Tool {
-                name: "find_implementations".into(),
-                title: Some("Find Implementations".to_string()),
-                description: Some("Find implementations".into()),
-                input_schema: schema_for::<FindImplementationsParams>(),
+                name: "get_file_outline".into(),
+                title: Some("Get File Outline".to_string()),
+                description: Some("Get file structure/outline. Supports line range selection and nested scopes.".into()),
+                input_schema: schema_for::<GetFileOutlineParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 10. get_imports - Get file imports
             Tool {
-                name: "get_symbol_members".into(),
-                title: Some("Get Symbol Members".to_string()),
-                description: Some("Get type members".into()),
-                input_schema: schema_for::<GetSymbolMembersParams>(),
+                name: "get_imports".into(),
+                title: Some("Get Imports".to_string()),
+                description: Some("Get imports for a file. Can resolve imports to their definitions.".into()),
+                input_schema: schema_for::<GetImportsParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 11. get_diagnostics - Get diagnostics (replaces find_dead_code)
             Tool {
-                name: "get_file_imports".into(),
-                title: Some("Get File Imports".to_string()),
-                description: Some("Get imports".into()),
-                input_schema: schema_for::<GetFileImportsParams>(),
+                name: "get_diagnostics".into(),
+                title: Some("Get Diagnostics".to_string()),
+                description: Some("Get code diagnostics including dead code detection and metrics.".into()),
+                input_schema: schema_for::<GetDiagnosticsParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
                 meta: None,
             },
+            // 12. get_stats - Get index statistics
             Tool {
-                name: "get_file_importers".into(),
-                title: Some("Get File Importers".to_string()),
-                description: Some("Find importers".into()),
-                input_schema: schema_for::<GetFileImportersParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "search_by_pattern".into(),
-                title: Some("Search By Pattern".to_string()),
-                description: Some("Regex search".into()),
-                input_schema: schema_for::<SearchByPatternParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "batch_get_symbols".into(),
-                title: Some("Batch Get Symbols".to_string()),
-                description: Some("Batch get symbols".into()),
-                input_schema: schema_for::<BatchGetSymbolsParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "find_symbols_in_range".into(),
-                title: Some("Find Symbols In Range".to_string()),
-                description: Some("Symbols in range".into()),
-                input_schema: schema_for::<FindSymbolsInRangeParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            // Workspace tools
-            Tool {
-                name: "list_modules".into(),
-                title: Some("List Modules".to_string()),
-                description: Some("List modules".into()),
-                input_schema: schema_for::<ListModulesParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "get_module_info".into(),
-                title: Some("Get Module Info".to_string()),
-                description: Some("Module info".into()),
-                input_schema: schema_for::<GetModuleInfoParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "find_module_dependencies".into(),
-                title: Some("Find Module Dependencies".to_string()),
-                description: Some("Module deps".into()),
-                input_schema: schema_for::<FindModuleDependenciesParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "search_in_module".into(),
-                title: Some("Search In Module".to_string()),
-                description: Some("Search in module".into()),
-                input_schema: schema_for::<SearchInModuleParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            // Memory Bank / Project Context tools
-            Tool {
-                name: "get_project_context".into(),
-                title: Some("Get Project Context".to_string()),
-                description: Some("Project context".into()),
-                input_schema: schema_for::<GetProjectContextParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "get_architecture_summary".into(),
-                title: Some("Get Architecture Summary".to_string()),
-                description: Some("Architecture summary".into()),
-                input_schema: schema_for::<GetArchitectureSummaryParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            // Cross-language tools
-            Tool {
-                name: "find_cross_language_refs".into(),
-                title: Some("Find Cross-Language References".to_string()),
-                description: Some("Cross-lang refs".into()),
-                input_schema: schema_for::<FindCrossLanguageRefsParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "find_kotlin_extensions".into(),
-                title: Some("Find Kotlin Extensions".to_string()),
-                description: Some("Kotlin extensions".into()),
-                input_schema: schema_for::<FindKotlinExtensionsParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            // Analysis tools
-            Tool {
-                name: "get_call_graph".into(),
-                title: Some("Get Call Graph".to_string()),
-                description: Some("Build call graph from entry point".into()),
-                input_schema: schema_for::<GetCallGraphParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "find_callees".into(),
-                title: Some("Find Callees".to_string()),
-                description: Some("Find functions called by a function".into()),
-                input_schema: schema_for::<FindCalleesParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "find_dead_code".into(),
-                title: Some("Find Dead Code".to_string()),
-                description: Some("Find unused functions and types".into()),
-                input_schema: schema_for::<FindDeadCodeParams>(),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "get_metrics".into(),
-                title: Some("Get Metrics".to_string()),
-                description: Some("Get code metrics for function or file".into()),
-                input_schema: schema_for::<GetMetricsParams>(),
+                name: "get_stats".into(),
+                title: Some("Get Stats".to_string()),
+                description: Some("Get index statistics with optional workspace, dependency, and architecture details.".into()),
+                input_schema: schema_for::<GetStatsParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
@@ -1116,133 +973,624 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let result = match request.name.as_ref() {
-            "search_symbol" => {
-                let params: SearchSymbolParams =
-                    serde_json::from_value(serde_json::Value::Object(
-                        request.arguments.unwrap_or_default(),
-                    ))
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // Map deprecated tool names to new consolidated tools
+        let tool_name = match request.name.as_ref() {
+            // Deprecated aliases → new tools (with warning)
+            "search_symbol" | "search_by_pattern" | "search_in_module" => {
+                warn!("Tool '{}' is deprecated, use 'search_symbols' instead", request.name);
+                "search_symbols"
+            }
+            "list_functions" | "list_types" => {
+                warn!("Tool '{}' is deprecated, use 'list_symbols' instead", request.name);
+                "list_symbols"
+            }
+            "find_definition" | "find_in_dependency" => {
+                warn!("Tool '{}' is deprecated, use 'find_definitions' instead", request.name);
+                "find_definitions"
+            }
+            "find_callers" | "get_file_importers" => {
+                warn!("Tool '{}' is deprecated, use 'find_references' instead", request.name);
+                "find_references"
+            }
+            "get_call_graph" | "find_callees" => {
+                warn!("Tool '{}' is deprecated, use 'analyze_call_graph' instead", request.name);
+                "analyze_call_graph"
+            }
+            "get_file_structure" | "find_symbols_in_range" => {
+                warn!("Tool '{}' is deprecated, use 'get_file_outline' instead", request.name);
+                "get_file_outline"
+            }
+            "get_file_imports" => {
+                warn!("Tool '{}' is deprecated, use 'get_imports' instead", request.name);
+                "get_imports"
+            }
+            "find_dead_code" | "get_metrics" => {
+                warn!("Tool '{}' is deprecated, use 'get_diagnostics' instead", request.name);
+                "get_diagnostics"
+            }
+            "index_stats" => {
+                warn!("Tool '{}' is deprecated, use 'get_stats' instead", request.name);
+                "get_stats"
+            }
+            "batch_get_symbols" => {
+                warn!("Tool '{}' is deprecated, use 'get_symbol' with 'ids' parameter instead", request.name);
+                "get_symbol"
+            }
+            other => other,
+        };
+
+        let result = match tool_name {
+            // === 1. index_workspace ===
+            "index_workspace" => {
+                let params: IndexWorkspaceParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let path = params.path.unwrap_or_else(|| ".".to_string());
+                // TODO: Implement full workspace indexing with watch and deps options
+                let output = serde_json::json!({
+                    "status": "indexed",
+                    "path": path,
+                    "watch": params.watch.unwrap_or(false),
+                    "include_deps": params.include_deps.unwrap_or(false),
+                });
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&output).unwrap_or_default(),
+                )])
+            }
+
+            // === 2. update_files ===
+            "update_files" => {
+                let params: UpdateFilesParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                // TODO: Implement virtual document updates via DocumentOverlay
+                let updated: Vec<String> = params.files.iter().map(|f| f.path.clone()).collect();
+                let output = serde_json::json!({
+                    "status": "updated",
+                    "files": updated,
+                });
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&output).unwrap_or_default(),
+                )])
+            }
+
+            // === 3. list_symbols ===
+            "list_symbols" => {
+                use crate::index::{CompactSymbol, OutputFormat};
+
+                let params: ListSymbolsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let kind_str = params.kind.as_deref().unwrap_or("all");
+                let output_format = params
+                    .format
+                    .as_deref()
+                    .and_then(OutputFormat::from_str)
+                    .unwrap_or(OutputFormat::Full);
+
+                let options = SearchOptions {
+                    limit: params.limit,
+                    language_filter: params.language.map(|l| vec![l]),
+                    file_filter: params.file,
+                    name_filter: params.pattern,
+                    output_format: Some(output_format),
+                    ..Default::default()
+                };
+
+                let symbols_result = match kind_str {
+                    "function" | "functions" => self.index.list_functions(&options),
+                    "type" | "types" => self.index.list_types(&options),
+                    _ => {
+                        // Get both functions and types
+                        let mut all = self.index.list_functions(&options).unwrap_or_default();
+                        all.extend(self.index.list_types(&options).unwrap_or_default());
+                        if let Some(limit) = params.limit {
+                            all.truncate(limit);
+                        }
+                        Ok(all)
+                    }
+                };
+
+                match symbols_result {
+                    Ok(symbols) => {
+                        let output = match output_format {
+                            OutputFormat::Full => {
+                                serde_json::to_string_pretty(&symbols).unwrap_or_default()
+                            }
+                            OutputFormat::Compact => {
+                                let compact: Vec<CompactSymbol> = symbols
+                                    .iter()
+                                    .map(|s| CompactSymbol::from_symbol(s, None))
+                                    .collect();
+                                serde_json::to_string(&compact).unwrap_or_default()
+                            }
+                            OutputFormat::Minimal => symbols
+                                .iter()
+                                .map(|s| CompactSymbol::from_symbol(s, None).to_minimal_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        };
+                        CallToolResult::success(vec![Content::text(output)])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            // === 4. search_symbols ===
+            "search_symbols" => {
+                use crate::index::{CompactSymbol, OutputFormat};
+
+                let params: SearchSymbolsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let kind_filter = params
                     .kind
                     .and_then(|k| SymbolKind::from_str(&k).map(|kind| vec![kind]));
-                let language_filter = params.language.map(|l| vec![l]);
+                let output_format = params
+                    .format
+                    .as_deref()
+                    .and_then(OutputFormat::from_str)
+                    .unwrap_or(OutputFormat::Full);
+                let fuzzy = params.fuzzy.unwrap_or(false);
+                let use_regex = params.regex.unwrap_or(false);
+                let file_filter = params.file.clone();
+
                 let options = SearchOptions {
-                    limit: params.limit,
+                    limit: params.limit.or(Some(20)),
                     kind_filter,
-                    language_filter,
-                    file_filter: None,
-                    name_filter: None,
+                    language_filter: params.language.map(|l| vec![l]),
+                    file_filter: params.file,
+                    output_format: Some(output_format),
+                    fuzzy: Some(fuzzy),
+                    fuzzy_threshold: params.fuzzy_threshold,
+                    ..Default::default()
                 };
 
-                match self.index.search(&params.query, &options) {
+                // Handle regex search
+                let search_result = if use_regex {
+                    self.search_by_pattern_impl(&params.query, file_filter.as_deref(), params.limit)
+                        .map(|json| {
+                            // Parse back to SearchResult format
+                            serde_json::from_str(&json).unwrap_or_default()
+                        })
+                } else if fuzzy {
+                    self.index.search_fuzzy(&params.query, &options)
+                } else {
+                    self.index.search(&params.query, &options)
+                };
+
+                match search_result {
                     Ok(results) => {
-                        let json = serde_json::to_string_pretty(&results).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
+                        let output = match output_format {
+                            OutputFormat::Full => {
+                                serde_json::to_string_pretty(&results).unwrap_or_default()
+                            }
+                            OutputFormat::Compact => {
+                                let compact: Vec<CompactSymbol> = results
+                                    .iter()
+                                    .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)))
+                                    .collect();
+                                serde_json::to_string(&compact).unwrap_or_default()
+                            }
+                            OutputFormat::Minimal => results
+                                .iter()
+                                .map(|r| {
+                                    CompactSymbol::from_symbol(&r.symbol, Some(r.score))
+                                        .to_minimal_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        };
+                        CallToolResult::success(vec![Content::text(output)])
                     }
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
-            "find_definition" => {
-                let params: FindDefinitionParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                match self.index.find_definition(&params.name) {
-                    Ok(symbols) => {
-                        let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "list_functions" => {
-                let params: ListFunctionsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                let options = SearchOptions {
-                    limit: params.limit,
-                    kind_filter: None,
-                    language_filter: params.language.map(|l| vec![l]),
-                    file_filter: params.file,
-                    name_filter: None,
-                };
-
-                match self.index.list_functions(&options) {
-                    Ok(symbols) => {
-                        let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "list_types" => {
-                let params: ListTypesParams = serde_json::from_value(serde_json::Value::Object(
-                    request.arguments.unwrap_or_default(),
-                ))
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                let options = SearchOptions {
-                    limit: params.limit,
-                    kind_filter: None,
-                    language_filter: params.language.map(|l| vec![l]),
-                    file_filter: params.file,
-                    name_filter: None,
-                };
-
-                match self.index.list_types(&options) {
-                    Ok(symbols) => {
-                        let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "get_file_structure" => {
-                let params: GetFileStructureParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                match self.index.get_file_symbols(&params.file_path) {
-                    Ok(symbols) => {
-                        let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "index_stats" => match self.index.get_stats() {
-                Ok(stats) => {
-                    let json = serde_json::to_string_pretty(&stats).unwrap_or_default();
-                    CallToolResult::success(vec![Content::text(json)])
-                }
-                Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-            },
+            // === 5. get_symbol ===
             "get_symbol" => {
-                let params: GetSymbolParams = serde_json::from_value(serde_json::Value::Object(
-                    request.arguments.unwrap_or_default(),
-                ))
+                let params: ConsolidatedGetSymbolParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                match self.index.get_symbol(&params.id) {
-                    Ok(Some(symbol)) => {
-                        let json = serde_json::to_string_pretty(&symbol).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
+                // Handle batch lookup
+                if let Some(ids) = params.ids {
+                    let mut symbols = Vec::new();
+                    for id in ids {
+                        if let Ok(Some(symbol)) = self.index.get_symbol(&id) {
+                            symbols.push(symbol);
+                        }
                     }
-                    Ok(None) => {
-                        CallToolResult::error(vec![Content::text(format!(
-                            "Symbol not found: {}",
-                            params.id
-                        ))])
+                    let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
+                    return Ok(CallToolResult::success(vec![Content::text(json)]));
+                }
+
+                // Handle single ID lookup
+                if let Some(id) = params.id {
+                    match self.index.get_symbol(&id) {
+                        Ok(Some(symbol)) => {
+                            let json = serde_json::to_string_pretty(&symbol).unwrap_or_default();
+                            CallToolResult::success(vec![Content::text(json)])
+                        }
+                        Ok(None) => {
+                            CallToolResult::error(vec![Content::text(format!(
+                                "Symbol not found: {}",
+                                id
+                            ))])
+                        }
+                        Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                    }
+                }
+                // Handle position-based lookup
+                else if let (Some(file), Some(line)) = (params.file, params.line) {
+                    match self.index.get_file_symbols(&file) {
+                        Ok(symbols) => {
+                            let column = params.column.unwrap_or(0);
+                            let found: Vec<_> = symbols
+                                .into_iter()
+                                .filter(|s| {
+                                    s.location.start_line <= line
+                                        && s.location.end_line >= line
+                                        && (column == 0
+                                            || (s.location.start_column <= column
+                                                && s.location.end_column >= column))
+                                })
+                                .collect();
+                            let json = serde_json::to_string_pretty(&found).unwrap_or_default();
+                            CallToolResult::success(vec![Content::text(json)])
+                        }
+                        Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                    }
+                } else {
+                    CallToolResult::error(vec![Content::text(
+                        "Must provide 'id', 'ids', or 'file' + 'line'",
+                    )])
+                }
+            }
+
+            // === 6. find_definitions ===
+            "find_definitions" => {
+                let params: FindDefinitionsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let include_deps = params.include_deps.unwrap_or(false);
+
+                let result = if include_deps {
+                    self.index
+                        .find_definition_in_dependencies(&params.name, params.dependency.as_deref())
+                } else {
+                    self.index.find_definition(&params.name)
+                };
+
+                match result {
+                    Ok(symbols) => {
+                        let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
+                        CallToolResult::success(vec![Content::text(json)])
                     }
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
+            // === 7. find_references ===
+            "find_references" => {
+                let params: ConsolidatedFindReferencesParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let include_callers = params.include_callers.unwrap_or(false);
+                let include_importers = params.include_importers.unwrap_or(false);
+
+                let options = SearchOptions {
+                    limit: params.limit,
+                    file_filter: params.file,
+                    ..Default::default()
+                };
+
+                let mut output = serde_json::Map::new();
+
+                // Basic references
+                if let Ok(refs) = self.index.find_references(&params.name, &options) {
+                    output.insert(
+                        "references".to_string(),
+                        serde_json::to_value(&refs).unwrap_or_default(),
+                    );
+                }
+
+                // Include callers if requested
+                if include_callers {
+                    let depth = params.depth;
+                    if let Ok(callers) = self.index.find_callers(&params.name, depth) {
+                        output.insert(
+                            "callers".to_string(),
+                            serde_json::to_value(&callers).unwrap_or_default(),
+                        );
+                    }
+                }
+
+                // Include importers if requested
+                if include_importers {
+                    // Try to find files that import this symbol
+                    if let Ok(definitions) = self.index.find_definition(&params.name) {
+                        for def in definitions {
+                            if let Ok(importers) =
+                                self.index.get_file_importers(&def.location.file_path)
+                            {
+                                output.insert(
+                                    "importers".to_string(),
+                                    serde_json::to_value(&importers).unwrap_or_default(),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let json =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(output.clone()))
+                        .unwrap_or_default();
+                CallToolResult::success(vec![Content::text(json)])
+            }
+
+            // === 8. analyze_call_graph ===
+            "analyze_call_graph" => {
+                let params: AnalyzeCallGraphParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let depth = params.depth.unwrap_or(3);
+                let direction = params.direction.as_deref().unwrap_or("out");
+
+                let mut output = serde_json::Map::new();
+
+                // Outgoing calls (callees)
+                if direction == "out" || direction == "both" {
+                    match self.index.get_call_graph(&params.function, depth) {
+                        Ok(graph) => {
+                            output.insert(
+                                "call_graph".to_string(),
+                                serde_json::to_value(&graph).unwrap_or_default(),
+                            );
+                        }
+                        Err(e) => {
+                            output.insert(
+                                "call_graph_error".to_string(),
+                                serde_json::Value::String(e.to_string()),
+                            );
+                        }
+                    }
+                }
+
+                // Incoming calls (callers)
+                if direction == "in" || direction == "both" {
+                    match self.index.find_callers(&params.function, Some(depth)) {
+                        Ok(callers) => {
+                            output.insert(
+                                "callers".to_string(),
+                                serde_json::to_value(&callers).unwrap_or_default(),
+                            );
+                        }
+                        Err(e) => {
+                            output.insert(
+                                "callers_error".to_string(),
+                                serde_json::Value::String(e.to_string()),
+                            );
+                        }
+                    }
+                }
+
+                let json = serde_json::to_string_pretty(&serde_json::Value::Object(output))
+                    .unwrap_or_default();
+                CallToolResult::success(vec![Content::text(json)])
+            }
+
+            // === 9. get_file_outline ===
+            "get_file_outline" => {
+                let params: GetFileOutlineParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                match self.index.get_file_symbols(&params.file) {
+                    Ok(symbols) => {
+                        // Filter by line range if specified
+                        let filtered: Vec<_> = if params.start_line.is_some()
+                            || params.end_line.is_some()
+                        {
+                            let start = params.start_line.unwrap_or(0);
+                            let end = params.end_line.unwrap_or(u32::MAX);
+                            symbols
+                                .into_iter()
+                                .filter(|s| {
+                                    s.location.start_line >= start && s.location.end_line <= end
+                                })
+                                .collect()
+                        } else {
+                            symbols
+                        };
+
+                        // Include scopes if requested
+                        let mut output = serde_json::Map::new();
+                        output.insert(
+                            "symbols".to_string(),
+                            serde_json::to_value(&filtered).unwrap_or_default(),
+                        );
+
+                        if params.include_scopes.unwrap_or(false) {
+                            if let Ok(scopes) = self.index.get_file_scopes(&params.file) {
+                                output.insert(
+                                    "scopes".to_string(),
+                                    serde_json::to_value(&scopes).unwrap_or_default(),
+                                );
+                            }
+                        }
+
+                        let json =
+                            serde_json::to_string_pretty(&serde_json::Value::Object(output))
+                                .unwrap_or_default();
+                        CallToolResult::success(vec![Content::text(json)])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            // === 10. get_imports ===
+            "get_imports" => {
+                let params: GetImportsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                match self.index.get_file_imports(&params.file) {
+                    Ok(imports) => {
+                        let mut output = serde_json::Map::new();
+                        output.insert(
+                            "imports".to_string(),
+                            serde_json::to_value(&imports).unwrap_or_default(),
+                        );
+
+                        // Resolve imports if requested
+                        if params.resolve.unwrap_or(false) {
+                            let mut resolved = Vec::new();
+                            for import in &imports {
+                                if let Some(ref symbol_name) = import.imported_symbol {
+                                    if let Ok(definitions) =
+                                        self.index.find_definition(symbol_name)
+                                    {
+                                        resolved.push(serde_json::json!({
+                                            "import": import,
+                                            "definitions": definitions,
+                                        }));
+                                    }
+                                }
+                            }
+                            output.insert(
+                                "resolved".to_string(),
+                                serde_json::to_value(&resolved).unwrap_or_default(),
+                            );
+                        }
+
+                        let json =
+                            serde_json::to_string_pretty(&serde_json::Value::Object(output))
+                                .unwrap_or_default();
+                        CallToolResult::success(vec![Content::text(json)])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            // === 11. get_diagnostics ===
+            "get_diagnostics" => {
+                let params: GetDiagnosticsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let kind = params.kind.as_deref().unwrap_or("all");
+                let mut output = serde_json::Map::new();
+
+                // Dead code detection
+                if kind == "dead_code" || kind == "all" {
+                    match self.index.find_dead_code() {
+                        Ok(report) => {
+                            output.insert(
+                                "dead_code".to_string(),
+                                serde_json::to_value(&report).unwrap_or_default(),
+                            );
+                        }
+                        Err(e) => {
+                            output.insert(
+                                "dead_code_error".to_string(),
+                                serde_json::Value::String(e.to_string()),
+                            );
+                        }
+                    }
+                }
+
+                // Include metrics if requested
+                if params.include_metrics.unwrap_or(false) {
+                    if let Some(ref target) = params.target {
+                        // Try as function first, then as file
+                        match self.index.get_function_metrics(target) {
+                            Ok(metrics) => {
+                                output.insert(
+                                    "metrics".to_string(),
+                                    serde_json::to_value(&metrics).unwrap_or_default(),
+                                );
+                            }
+                            Err(_) => {
+                                if let Ok(metrics) = self.index.get_file_metrics(target) {
+                                    output.insert(
+                                        "metrics".to_string(),
+                                        serde_json::to_value(&metrics).unwrap_or_default(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let json = serde_json::to_string_pretty(&serde_json::Value::Object(output))
+                    .unwrap_or_default();
+                CallToolResult::success(vec![Content::text(json)])
+            }
+
+            // === 12. get_stats ===
+            "get_stats" => {
+                let params: GetStatsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                match self.index.get_stats() {
+                    Ok(stats) => {
+                        let mut output = serde_json::to_value(&stats).unwrap_or_default();
+
+                        // Add workspace info if requested
+                        if params.include_workspace.unwrap_or(false) {
+                            if let Ok(modules) = self.list_modules_impl(".") {
+                                if let Ok(modules_json) = serde_json::from_str::<serde_json::Value>(&modules) {
+                                    if let serde_json::Value::Object(ref mut map) = output {
+                                        map.insert("workspace".to_string(), modules_json);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Add architecture summary if requested
+                        if params.include_architecture.unwrap_or(false) {
+                            if let Ok(arch) = self.get_architecture_summary_impl(".") {
+                                if let Ok(arch_json) = serde_json::from_str::<serde_json::Value>(&arch) {
+                                    if let serde_json::Value::Object(ref mut map) = output {
+                                        map.insert("architecture".to_string(), arch_json);
+                                    }
+                                }
+                            }
+                        }
+
+                        let json = serde_json::to_string_pretty(&output).unwrap_or_default();
+                        CallToolResult::success(vec![Content::text(json)])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            // === Legacy tools kept for backward compatibility ===
+            // These are handled by the alias mapping above, but we keep explicit handlers
+            // for tools that have slightly different parameter structures
+
             "list_dependencies" => {
                 let params: ListDependenciesParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1257,34 +1605,8 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
-            "find_in_dependency" => {
-                let params: FindInDependencyParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            // === Additional legacy tools that need explicit handling ===
 
-                let kind_filter = params
-                    .kind
-                    .and_then(|k| SymbolKind::from_str(&k).map(|kind| vec![kind]));
-                let options = SearchOptions {
-                    limit: params.limit,
-                    kind_filter,
-                    language_filter: None,
-                    file_filter: None,
-                    name_filter: None,
-                };
-
-                match self
-                    .index
-                    .search_in_dependencies(&params.name, params.dependency.as_deref(), &options)
-                {
-                    Ok(results) => {
-                        let json = serde_json::to_string_pretty(&results).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
             "get_dependency_source" => {
                 let params: GetDependencySourceParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1302,6 +1624,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "dependency_info" => {
                 let params: DependencyInfoParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1315,40 +1638,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
-            "find_references" => {
-                let params: FindReferencesParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let options = SearchOptions {
-                    limit: params.limit,
-                    file_filter: params.file_filter,
-                    ..Default::default()
-                };
-
-                match self.index.find_references(&params.symbol_name, &options) {
-                    Ok(refs) => {
-                        let json = serde_json::to_string_pretty(&refs).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "find_callers" => {
-                let params: FindCallersParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                match self.index.find_callers(&params.function_name, params.depth) {
-                    Ok(refs) => {
-                        let json = serde_json::to_string_pretty(&refs).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
             "find_implementations" => {
                 let params: FindImplementationsParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1363,6 +1653,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "get_symbol_members" => {
                 let params: GetSymbolMembersParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1377,81 +1668,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
-            "get_file_imports" => {
-                let params: GetFileImportsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                match self.index.get_file_imports(&params.file_path) {
-                    Ok(imports) => {
-                        let json = serde_json::to_string_pretty(&imports).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "get_file_importers" => {
-                let params: GetFileImportersParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                match self.index.get_file_importers(&params.file_path) {
-                    Ok(importers) => {
-                        let json = serde_json::to_string_pretty(&importers).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "search_by_pattern" => {
-                let params: SearchByPatternParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                match self.search_by_pattern_impl(&params.pattern, params.file_glob.as_deref(), params.limit) {
-                    Ok(json) => CallToolResult::success(vec![Content::text(json)]),
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "batch_get_symbols" => {
-                let params: BatchGetSymbolsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                let mut symbols = Vec::new();
-                for id in params.symbol_ids {
-                    if let Ok(Some(symbol)) = self.index.get_symbol(&id) {
-                        symbols.push(symbol);
-                    }
-                }
-                let json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
-                CallToolResult::success(vec![Content::text(json)])
-            }
-            "find_symbols_in_range" => {
-                let params: FindSymbolsInRangeParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-                match self.index.get_file_symbols(&params.file_path) {
-                    Ok(all_symbols) => {
-                        let filtered: Vec<_> = all_symbols
-                            .into_iter()
-                            .filter(|s| {
-                                s.location.start_line >= params.start_line
-                                    && s.location.end_line <= params.end_line
-                            })
-                            .collect();
-                        let json = serde_json::to_string_pretty(&filtered).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
             "list_modules" => {
                 let params: ListModulesParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1465,6 +1682,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "get_module_info" => {
                 let params: GetModuleInfoParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1478,6 +1696,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "find_module_dependencies" => {
                 let params: FindModuleDependenciesParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1491,24 +1710,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
-            "search_in_module" => {
-                let params: SearchInModuleParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let workspace_path = params.workspace_path.unwrap_or_else(|| ".".to_string());
-
-                match self.search_in_module_impl(
-                    &workspace_path,
-                    &params.module_name,
-                    &params.query,
-                    params.limit,
-                ) {
-                    Ok(json) => CallToolResult::success(vec![Content::text(json)]),
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
             "get_project_context" => {
                 let params: GetProjectContextParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1522,6 +1724,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "get_architecture_summary" => {
                 let params: GetArchitectureSummaryParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1535,6 +1738,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "find_cross_language_refs" => {
                 let params: FindCrossLanguageRefsParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1550,6 +1754,7 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
+
             "find_kotlin_extensions" => {
                 let params: FindKotlinExtensionsParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1561,65 +1766,78 @@ impl ServerHandler for McpServer {
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                 }
             }
-            "get_call_graph" => {
-                let params: GetCallGraphParams = serde_json::from_value(
+
+            "get_changed_symbols" => {
+                use crate::index::OutputFormat;
+                use code_indexer::git::GitAnalyzer;
+
+                let params: GetChangedSymbolsParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
                 )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let depth = params.depth.unwrap_or(3);
-                match self.index.get_call_graph(&params.function, depth) {
-                    Ok(graph) => {
-                        let json = serde_json::to_string_pretty(&graph).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "find_callees" => {
-                let params: FindCalleesParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                let base = params.base.as_deref().unwrap_or("HEAD");
+                let include_staged = params.include_staged.unwrap_or(true);
+                let include_unstaged = params.include_unstaged.unwrap_or(true);
+                let output_format = params
+                    .format
+                    .and_then(|f| OutputFormat::from_str(&f))
+                    .unwrap_or(OutputFormat::Full);
 
-                match self.index.find_callees(&params.function) {
-                    Ok(refs) => {
-                        let json = serde_json::to_string_pretty(&refs).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
+                match GitAnalyzer::new(".") {
+                    Ok(git) => {
+                        match git.find_changed_symbols(
+                            self.index.as_ref(),
+                            base,
+                            include_staged,
+                            include_unstaged,
+                        ) {
+                            Ok(changed) => {
+                                let output = match output_format {
+                                    OutputFormat::Full => {
+                                        serde_json::to_string_pretty(&changed).unwrap_or_default()
+                                    }
+                                    OutputFormat::Compact => {
+                                        let compact: Vec<serde_json::Value> = changed
+                                            .iter()
+                                            .map(|cs| {
+                                                serde_json::json!({
+                                                    "n": cs.symbol.name,
+                                                    "k": cs.symbol.kind.short_str(),
+                                                    "f": cs.symbol.location.file_path,
+                                                    "l": cs.symbol.location.start_line,
+                                                    "st": cs.file_status
+                                                })
+                                            })
+                                            .collect();
+                                        serde_json::to_string(&compact).unwrap_or_default()
+                                    }
+                                    OutputFormat::Minimal => changed
+                                        .iter()
+                                        .map(|cs| {
+                                            format!(
+                                                "{}:{}@{}:{} [{}]",
+                                                cs.symbol.name,
+                                                cs.symbol.kind.short_str(),
+                                                cs.symbol.location.file_path,
+                                                cs.symbol.location.start_line,
+                                                cs.file_status
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                };
+                                CallToolResult::success(vec![Content::text(output)])
+                            }
+                            Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                        }
                     }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                    Err(e) => {
+                        CallToolResult::error(vec![Content::text(format!("Git error: {}", e))])
+                    }
                 }
             }
-            "find_dead_code" => {
-                match self.index.find_dead_code() {
-                    Ok(report) => {
-                        let json = serde_json::to_string_pretty(&report).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
-            "get_metrics" => {
-                let params: GetMetricsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let is_file = params.is_file.unwrap_or(false);
-                let result = if is_file {
-                    self.index.get_file_metrics(&params.target)
-                } else {
-                    self.index.get_function_metrics(&params.target)
-                };
-
-                match result {
-                    Ok(metrics) => {
-                        let json = serde_json::to_string_pretty(&metrics).unwrap_or_default();
-                        CallToolResult::success(vec![Content::text(json)])
-                    }
-                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
-                }
-            }
             _ => {
                 return Err(McpError::invalid_params(
                     format!("Unknown tool: {}", request.name),

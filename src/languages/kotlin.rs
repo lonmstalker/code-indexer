@@ -46,12 +46,16 @@ impl LanguageGrammar for KotlinGrammar {
 
     fn imports_query(&self) -> &str {
         r#"
-        (import_header
+        (import
             (identifier) @import_path
         ) @import
 
+        (import
+            (qualified_identifier) @import_path
+        ) @import
+
         (package_header
-            (identifier) @package_path
+            (qualified_identifier) @package_path
         ) @package
         "#
     }
@@ -80,11 +84,26 @@ impl LanguageGrammar for KotlinGrammar {
             (identifier) @type_use
         ) @type_ref
 
-        ; Class inheritance
-        (class_declaration
+        ; Class inheritance via delegation_specifiers
+        (delegation_specifiers
             (delegation_specifier
-                (user_type
-                    (identifier) @extends_type
+                (constructor_invocation
+                    (type
+                        (user_type
+                            (identifier) @extends_type
+                        )
+                    )
+                )
+            )
+        ) @extends
+
+        ; Class inheritance via type (interfaces)
+        (delegation_specifiers
+            (delegation_specifier
+                (type
+                    (user_type
+                        (identifier) @extends_type
+                    )
                 )
             )
         ) @extends

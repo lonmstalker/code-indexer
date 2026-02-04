@@ -1,8 +1,10 @@
 pub mod models;
+pub mod overlay;
 pub mod sqlite;
 
 use crate::error::Result;
 pub use models::*;
+pub use overlay::DocumentOverlay;
 
 pub trait CodeIndex: Send + Sync {
     #[allow(dead_code)]
@@ -11,6 +13,8 @@ pub trait CodeIndex: Send + Sync {
     fn remove_file(&self, file_path: &str) -> Result<()>;
     fn get_symbol(&self, id: &str) -> Result<Option<Symbol>>;
     fn search(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>>;
+    /// Fuzzy search with typo tolerance using Jaro-Winkler similarity
+    fn search_fuzzy(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>>;
     fn find_definition(&self, name: &str) -> Result<Vec<Symbol>>;
     fn list_functions(&self, options: &SearchOptions) -> Result<Vec<Symbol>>;
     fn list_types(&self, options: &SearchOptions) -> Result<Vec<Symbol>>;

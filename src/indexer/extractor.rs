@@ -90,6 +90,20 @@ impl SymbolExtractor {
             }
 
             if let (Some(name), Some(node)) = (name, node) {
+                // For Rust: skip function_item inside impl blocks (they are captured as methods)
+                // This prevents duplicate symbols for impl methods
+                if kind == SymbolKind::Function && parsed.language == "rust" {
+                    if let Some(parent) = node.parent() {
+                        if parent.kind() == "declaration_list" {
+                            if let Some(grandparent) = parent.parent() {
+                                if grandparent.kind() == "impl_item" {
+                                    continue; // Skip - will be captured as method
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let location = Location::new(
                     file_path,
                     node.start_position().row as u32 + 1,

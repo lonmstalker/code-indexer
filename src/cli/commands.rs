@@ -6,9 +6,10 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
 use code_indexer::dependencies::{DependencyRegistry, ProjectInfo};
+use code_indexer::git::GitAnalyzer;
 use crate::error::Result;
 use crate::index::sqlite::SqliteIndex;
-use crate::index::{CodeIndex, SearchOptions};
+use crate::index::{CodeIndex, SearchOptions, OutputFormat, CompactSymbol};
 use crate::indexer::watcher::FileEvent;
 use crate::indexer::{FileWalker, FileWatcher, Parser as CodeParser, SymbolExtractor};
 use crate::languages::LanguageRegistry;
@@ -63,15 +64,152 @@ pub enum Commands {
         /// Watch for file changes and update index
         #[arg(long)]
         watch: bool,
+
+        /// Also index dependencies (deep indexing)
+        #[arg(long)]
+        deep_deps: bool,
     },
 
     /// Start MCP server
     Serve,
 
-    /// Query the index
-    Query {
-        #[command(subcommand)]
-        query: QueryCommands,
+    /// Search and list symbols (replaces query search/functions/types)
+    Symbols {
+        /// Search query (optional - if omitted, lists all symbols)
+        query: Option<String>,
+
+        /// Filter by kind: function, type, all (default: all)
+        #[arg(long, short, default_value = "all")]
+        kind: String,
+
+        /// Maximum number of results
+        #[arg(long, default_value = "100")]
+        limit: usize,
+
+        /// Filter by language
+        #[arg(long)]
+        language: Option<String>,
+
+        /// Filter by file path
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Filter by name pattern (glob: * and ? supported)
+        #[arg(long)]
+        pattern: Option<String>,
+
+        /// Output format: full, compact, minimal
+        #[arg(long, default_value = "full")]
+        format: String,
+
+        /// Enable fuzzy search for typo tolerance
+        #[arg(long)]
+        fuzzy: bool,
+
+        /// Fuzzy search threshold (0.0-1.0)
+        #[arg(long, default_value = "0.7")]
+        fuzzy_threshold: f64,
+    },
+
+    /// Find symbol definitions
+    Definition {
+        /// Symbol name
+        name: String,
+
+        /// Also search in dependencies
+        #[arg(long)]
+        include_deps: bool,
+
+        /// Filter by specific dependency
+        #[arg(long)]
+        dep: Option<String>,
+    },
+
+    /// Find symbol references (replaces find_references + find_callers)
+    References {
+        /// Symbol name
+        name: String,
+
+        /// Include callers (who calls this function)
+        #[arg(long)]
+        callers: bool,
+
+        /// Depth for caller search (default: 1)
+        #[arg(long, default_value = "1")]
+        depth: u32,
+
+        /// Filter by file path
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Maximum number of results
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Analyze call graph (replaces get_call_graph + find_callees)
+    CallGraph {
+        /// Entry point function name
+        function: String,
+
+        /// Direction: out (callees), in (callers), both
+        #[arg(long, default_value = "out")]
+        direction: String,
+
+        /// Maximum depth (default: 3)
+        #[arg(long, default_value = "3")]
+        depth: u32,
+
+        /// Include possible (uncertain) calls
+        #[arg(long)]
+        include_possible: bool,
+    },
+
+    /// Get file outline/structure
+    Outline {
+        /// File path
+        file: PathBuf,
+
+        /// Start line (for range selection)
+        #[arg(long)]
+        start_line: Option<u32>,
+
+        /// End line (for range selection)
+        #[arg(long)]
+        end_line: Option<u32>,
+
+        /// Include scopes
+        #[arg(long)]
+        scopes: bool,
+    },
+
+    /// Get file imports
+    Imports {
+        /// File path
+        file: PathBuf,
+
+        /// Resolve imports to their definitions
+        #[arg(long)]
+        resolve: bool,
+    },
+
+    /// Show changed symbols (git diff)
+    Changed {
+        /// Git reference to compare against (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+
+        /// Include staged changes
+        #[arg(long)]
+        staged: bool,
+
+        /// Include unstaged changes
+        #[arg(long)]
+        unstaged: bool,
+
+        /// Output format: full, compact, minimal
+        #[arg(long, default_value = "full")]
+        format: String,
     },
 
     /// Show index statistics
@@ -85,62 +223,75 @@ pub enum Commands {
         #[command(subcommand)]
         command: DepsCommands,
     },
+
+    // === Legacy commands (deprecated, hidden) ===
+    /// Query the index (deprecated: use symbols, definition, references instead)
+    #[command(hide = true)]
+    Query {
+        #[command(subcommand)]
+        query: QueryCommands,
+    },
 }
 
+/// Legacy query commands (deprecated)
 #[derive(Subcommand)]
 pub enum QueryCommands {
-    /// Search for symbols
+    /// Search for symbols (deprecated: use 'symbols' command)
     Search {
-        /// Search query
         query: String,
-
-        /// Maximum number of results
         #[arg(long, default_value = "20")]
         limit: usize,
+        #[arg(long, default_value = "full")]
+        format: String,
+        #[arg(long)]
+        fuzzy: bool,
+        #[arg(long, default_value = "0.7")]
+        fuzzy_threshold: f64,
     },
 
-    /// Find symbol definition
+    /// Find symbol definition (deprecated: use 'definition' command)
     Definition {
-        /// Symbol name
         name: String,
     },
 
-    /// List functions
+    /// List functions (deprecated: use 'symbols --kind function')
     Functions {
-        /// Maximum number of results
         #[arg(long, default_value = "100")]
         limit: usize,
-
-        /// Filter by language
         #[arg(long)]
         language: Option<String>,
-
-        /// Filter by file path
         #[arg(long)]
         file: Option<String>,
-
-        /// Filter by name pattern (glob: * and ? supported)
         #[arg(long)]
         pattern: Option<String>,
+        #[arg(long, default_value = "full")]
+        format: String,
     },
 
-    /// List types
+    /// List types (deprecated: use 'symbols --kind type')
     Types {
-        /// Maximum number of results
         #[arg(long, default_value = "100")]
         limit: usize,
-
-        /// Filter by language
         #[arg(long)]
         language: Option<String>,
-
-        /// Filter by file path
         #[arg(long)]
         file: Option<String>,
-
-        /// Filter by name pattern (glob: * and ? supported)
         #[arg(long)]
         pattern: Option<String>,
+        #[arg(long, default_value = "full")]
+        format: String,
+    },
+
+    /// Show changed symbols (deprecated: use 'changed' command)
+    Changed {
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        #[arg(long)]
+        staged: bool,
+        #[arg(long)]
+        unstaged: bool,
+        #[arg(long, default_value = "full")]
+        format: String,
     },
 }
 
@@ -319,31 +470,64 @@ pub async fn run_mcp_server(db_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn search_symbols(db_path: &PathBuf, query: &str, limit: usize) -> Result<()> {
+pub fn search_symbols(
+    db_path: &PathBuf,
+    query: &str,
+    limit: usize,
+    format: &str,
+    fuzzy: bool,
+    fuzzy_threshold: f64,
+) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
+    let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
     let options = SearchOptions {
         limit: Some(limit),
+        output_format: Some(output_format),
+        fuzzy: Some(fuzzy),
+        fuzzy_threshold: Some(fuzzy_threshold),
         ..Default::default()
     };
 
-    let results = index.search(query, &options)?;
+    let results = if fuzzy {
+        index.search_fuzzy(query, &options)?
+    } else {
+        index.search(query, &options)?
+    };
 
     if results.is_empty() {
         println!("No symbols found for query: {}", query);
         return Ok(());
     }
 
-    for result in results {
-        let symbol = result.symbol;
-        let kind = symbol.kind.as_str();
-        let location = format!(
-            "{}:{}",
-            symbol.location.file_path, symbol.location.start_line
-        );
-        println!(
-            "{} ({}) - {} [score: {:.2}]",
-            symbol.name, kind, location, result.score
-        );
+    match output_format {
+        OutputFormat::Full => {
+            for result in results {
+                let symbol = result.symbol;
+                let kind = symbol.kind.as_str();
+                let location = format!(
+                    "{}:{}",
+                    symbol.location.file_path, symbol.location.start_line
+                );
+                println!(
+                    "{} ({}) - {} [score: {:.2}]",
+                    symbol.name, kind, location, result.score
+                );
+            }
+        }
+        OutputFormat::Compact => {
+            let compact: Vec<CompactSymbol> = results
+                .iter()
+                .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)))
+                .collect();
+            println!("{}", serde_json::to_string(&compact).unwrap_or_default());
+        }
+        OutputFormat::Minimal => {
+            let lines: Vec<String> = results
+                .iter()
+                .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)).to_minimal_string())
+                .collect();
+            println!("{}", lines.join(", "));
+        }
     }
 
     Ok(())
@@ -379,13 +563,16 @@ pub fn list_functions(
     language: Option<String>,
     file: Option<String>,
     pattern: Option<String>,
+    format: &str,
 ) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
+    let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
     let options = SearchOptions {
         limit: Some(limit),
         language_filter: language.map(|l| vec![l]),
         file_filter: file,
         name_filter: pattern,
+        output_format: Some(output_format),
         ..Default::default()
     };
 
@@ -396,13 +583,31 @@ pub fn list_functions(
         return Ok(());
     }
 
-    for symbol in symbols {
-        let kind = symbol.kind.as_str();
-        let location = format!(
-            "{}:{}",
-            symbol.location.file_path, symbol.location.start_line
-        );
-        println!("{} ({}) - {}", symbol.name, kind, location);
+    match output_format {
+        OutputFormat::Full => {
+            for symbol in symbols {
+                let kind = symbol.kind.as_str();
+                let location = format!(
+                    "{}:{}",
+                    symbol.location.file_path, symbol.location.start_line
+                );
+                println!("{} ({}) - {}", symbol.name, kind, location);
+            }
+        }
+        OutputFormat::Compact => {
+            let compact: Vec<CompactSymbol> = symbols
+                .iter()
+                .map(|s| CompactSymbol::from_symbol(s, None))
+                .collect();
+            println!("{}", serde_json::to_string(&compact).unwrap_or_default());
+        }
+        OutputFormat::Minimal => {
+            let lines: Vec<String> = symbols
+                .iter()
+                .map(|s| CompactSymbol::from_symbol(s, None).to_minimal_string())
+                .collect();
+            println!("{}", lines.join(", "));
+        }
     }
 
     Ok(())
@@ -414,13 +619,16 @@ pub fn list_types(
     language: Option<String>,
     file: Option<String>,
     pattern: Option<String>,
+    format: &str,
 ) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
+    let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
     let options = SearchOptions {
         limit: Some(limit),
         language_filter: language.map(|l| vec![l]),
         file_filter: file,
         name_filter: pattern,
+        output_format: Some(output_format),
         ..Default::default()
     };
 
@@ -431,13 +639,31 @@ pub fn list_types(
         return Ok(());
     }
 
-    for symbol in symbols {
-        let kind = symbol.kind.as_str();
-        let location = format!(
-            "{}:{}",
-            symbol.location.file_path, symbol.location.start_line
-        );
-        println!("{} ({}) - {}", symbol.name, kind, location);
+    match output_format {
+        OutputFormat::Full => {
+            for symbol in symbols {
+                let kind = symbol.kind.as_str();
+                let location = format!(
+                    "{}:{}",
+                    symbol.location.file_path, symbol.location.start_line
+                );
+                println!("{} ({}) - {}", symbol.name, kind, location);
+            }
+        }
+        OutputFormat::Compact => {
+            let compact: Vec<CompactSymbol> = symbols
+                .iter()
+                .map(|s| CompactSymbol::from_symbol(s, None))
+                .collect();
+            println!("{}", serde_json::to_string(&compact).unwrap_or_default());
+        }
+        OutputFormat::Minimal => {
+            let lines: Vec<String> = symbols
+                .iter()
+                .map(|s| CompactSymbol::from_symbol(s, None).to_minimal_string())
+                .collect();
+            println!("{}", lines.join(", "));
+        }
     }
 
     Ok(())
@@ -480,6 +706,380 @@ pub fn clear_index(db_path: &PathBuf) -> Result<()> {
     index.clear()?;
     println!("Index cleared");
     Ok(())
+}
+
+// === New consolidated commands ===
+
+/// Unified symbols command (replaces search, list_functions, list_types)
+pub fn symbols(
+    db_path: &PathBuf,
+    query: Option<String>,
+    kind: &str,
+    limit: usize,
+    language: Option<String>,
+    file: Option<String>,
+    pattern: Option<String>,
+    format: &str,
+    fuzzy: bool,
+    fuzzy_threshold: f64,
+) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+    let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
+
+    // If query is provided, search; otherwise list
+    if let Some(ref q) = query {
+        let kind_filter = match kind {
+            "function" | "functions" => Some(vec![crate::index::SymbolKind::Function]),
+            "type" | "types" => Some(vec![
+                crate::index::SymbolKind::Class,
+                crate::index::SymbolKind::Struct,
+                crate::index::SymbolKind::Enum,
+                crate::index::SymbolKind::Interface,
+                crate::index::SymbolKind::TypeAlias,
+            ]),
+            _ => None,
+        };
+
+        let options = SearchOptions {
+            limit: Some(limit),
+            kind_filter,
+            language_filter: language.map(|l| vec![l]),
+            file_filter: file,
+            name_filter: pattern,
+            output_format: Some(output_format),
+            fuzzy: Some(fuzzy),
+            fuzzy_threshold: Some(fuzzy_threshold),
+            ..Default::default()
+        };
+
+        let results = if fuzzy {
+            index.search_fuzzy(q, &options)?
+        } else {
+            index.search(q, &options)?
+        };
+
+        if results.is_empty() {
+            println!("No symbols found for query: {}", q);
+            return Ok(());
+        }
+
+        print_search_results(&results, output_format);
+    } else {
+        // List mode
+        let options = SearchOptions {
+            limit: Some(limit),
+            language_filter: language.map(|l| vec![l]),
+            file_filter: file,
+            name_filter: pattern,
+            output_format: Some(output_format),
+            ..Default::default()
+        };
+
+        let symbols = match kind {
+            "function" | "functions" => index.list_functions(&options)?,
+            "type" | "types" => index.list_types(&options)?,
+            _ => {
+                let mut all = index.list_functions(&options).unwrap_or_default();
+                all.extend(index.list_types(&options).unwrap_or_default());
+                all.truncate(limit);
+                all
+            }
+        };
+
+        if symbols.is_empty() {
+            println!("No symbols found");
+            return Ok(());
+        }
+
+        print_symbols(&symbols, output_format);
+    }
+
+    Ok(())
+}
+
+/// Find references command
+pub fn find_references(
+    db_path: &PathBuf,
+    name: &str,
+    include_callers: bool,
+    depth: u32,
+    file: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+
+    let options = SearchOptions {
+        limit: Some(limit),
+        file_filter: file,
+        ..Default::default()
+    };
+
+    // Get basic references
+    let refs = index.find_references(name, &options)?;
+
+    println!("References for '{}':", name);
+    if refs.is_empty() {
+        println!("  No references found");
+    } else {
+        for r in &refs {
+            println!(
+                "  {} ({:?}) at {}:{}",
+                r.symbol_name, r.kind, r.file_path, r.line
+            );
+        }
+    }
+
+    // Include callers if requested
+    if include_callers {
+        println!("\nCallers:");
+        match index.find_callers(name, Some(depth)) {
+            Ok(callers) => {
+                if callers.is_empty() {
+                    println!("  No callers found");
+                } else {
+                    for c in callers {
+                        println!(
+                            "  {} at {}:{}",
+                            c.symbol_name, c.file_path, c.line
+                        );
+                    }
+                }
+            }
+            Err(e) => println!("  Error finding callers: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Call graph analysis command
+pub fn analyze_call_graph(
+    db_path: &PathBuf,
+    function: &str,
+    direction: &str,
+    depth: u32,
+    _include_possible: bool,
+) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+
+    println!("Call graph for '{}' (direction: {}, depth: {}):", function, direction, depth);
+
+    // Outgoing calls (callees)
+    if direction == "out" || direction == "both" {
+        println!("\nOutgoing calls (callees):");
+        match index.get_call_graph(function, depth) {
+            Ok(graph) => {
+                if graph.edges.is_empty() {
+                    println!("  No outgoing calls found");
+                } else {
+                    for edge in &graph.edges {
+                        let target = edge.to.as_deref().unwrap_or(&edge.callee_name);
+                        println!(
+                            "  {} -> {} at {}:{}",
+                            edge.from, target, edge.call_site_file, edge.call_site_line
+                        );
+                    }
+                }
+            }
+            Err(e) => println!("  Error: {}", e),
+        }
+    }
+
+    // Incoming calls (callers)
+    if direction == "in" || direction == "both" {
+        println!("\nIncoming calls (callers):");
+        match index.find_callers(function, Some(depth)) {
+            Ok(callers) => {
+                if callers.is_empty() {
+                    println!("  No callers found");
+                } else {
+                    for c in callers {
+                        println!(
+                            "  {} <- {} at {}:{}",
+                            function, c.symbol_name, c.file_path, c.line
+                        );
+                    }
+                }
+            }
+            Err(e) => println!("  Error: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Get file outline command
+pub fn get_outline(
+    db_path: &PathBuf,
+    file: &PathBuf,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    include_scopes: bool,
+) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+    let file_path = file.to_string_lossy();
+
+    let symbols = index.get_file_symbols(&file_path)?;
+
+    // Filter by line range if specified
+    let filtered: Vec<_> = if start_line.is_some() || end_line.is_some() {
+        let start = start_line.unwrap_or(0);
+        let end = end_line.unwrap_or(u32::MAX);
+        symbols
+            .into_iter()
+            .filter(|s| s.location.start_line >= start && s.location.end_line <= end)
+            .collect()
+    } else {
+        symbols
+    };
+
+    println!("Outline for {}:", file_path);
+
+    if filtered.is_empty() {
+        println!("  No symbols found");
+    } else {
+        for symbol in &filtered {
+            let indent = if symbol.parent.is_some() { "    " } else { "  " };
+            println!(
+                "{}{} ({}) - lines {}-{}",
+                indent,
+                symbol.name,
+                symbol.kind.as_str(),
+                symbol.location.start_line,
+                symbol.location.end_line
+            );
+        }
+    }
+
+    // Include scopes if requested
+    if include_scopes {
+        println!("\nScopes:");
+        match index.get_file_scopes(&file_path) {
+            Ok(scopes) => {
+                if scopes.is_empty() {
+                    println!("  No scopes found");
+                } else {
+                    for scope in scopes {
+                        let name = scope.name.as_deref().unwrap_or("<anonymous>");
+                        println!(
+                            "  {} ({}) - lines {}-{}",
+                            name,
+                            scope.kind.as_str(),
+                            scope.start_line,
+                            scope.end_line
+                        );
+                    }
+                }
+            }
+            Err(e) => println!("  Error: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Get file imports command
+pub fn get_imports(db_path: &PathBuf, file: &PathBuf, resolve: bool) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+    let file_path = file.to_string_lossy();
+
+    let imports = index.get_file_imports(&file_path)?;
+
+    println!("Imports for {}:", file_path);
+
+    if imports.is_empty() {
+        println!("  No imports found");
+        return Ok(());
+    }
+
+    for import in &imports {
+        let symbol = import.imported_symbol.as_deref().unwrap_or("<module>");
+        let path = import.imported_path.as_deref().unwrap_or("");
+        println!("  {} from {}", symbol, path);
+
+        // Resolve if requested
+        if resolve {
+            if let Some(ref symbol_name) = import.imported_symbol {
+                match index.find_definition(symbol_name) {
+                    Ok(defs) => {
+                        for def in defs {
+                            println!(
+                                "    -> {} at {}:{}",
+                                def.name, def.location.file_path, def.location.start_line
+                            );
+                        }
+                    }
+                    Err(_) => println!("    -> (could not resolve)"),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Helper functions for output
+
+fn print_search_results(results: &[crate::index::SearchResult], format: OutputFormat) {
+    match format {
+        OutputFormat::Full => {
+            for result in results {
+                let symbol = &result.symbol;
+                let kind = symbol.kind.as_str();
+                let location = format!(
+                    "{}:{}",
+                    symbol.location.file_path, symbol.location.start_line
+                );
+                println!(
+                    "{} ({}) - {} [score: {:.2}]",
+                    symbol.name, kind, location, result.score
+                );
+            }
+        }
+        OutputFormat::Compact => {
+            let compact: Vec<CompactSymbol> = results
+                .iter()
+                .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)))
+                .collect();
+            println!("{}", serde_json::to_string(&compact).unwrap_or_default());
+        }
+        OutputFormat::Minimal => {
+            let lines: Vec<String> = results
+                .iter()
+                .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)).to_minimal_string())
+                .collect();
+            println!("{}", lines.join(", "));
+        }
+    }
+}
+
+fn print_symbols(symbols: &[crate::index::Symbol], format: OutputFormat) {
+    match format {
+        OutputFormat::Full => {
+            for symbol in symbols {
+                let kind = symbol.kind.as_str();
+                let location = format!(
+                    "{}:{}",
+                    symbol.location.file_path, symbol.location.start_line
+                );
+                println!("{} ({}) - {}", symbol.name, kind, location);
+            }
+        }
+        OutputFormat::Compact => {
+            let compact: Vec<CompactSymbol> = symbols
+                .iter()
+                .map(|s| CompactSymbol::from_symbol(s, None))
+                .collect();
+            println!("{}", serde_json::to_string(&compact).unwrap_or_default());
+        }
+        OutputFormat::Minimal => {
+            let lines: Vec<String> = symbols
+                .iter()
+                .map(|s| CompactSymbol::from_symbol(s, None).to_minimal_string())
+                .collect();
+            println!("{}", lines.join(", "));
+        }
+    }
 }
 
 // === Dependency Commands ===
@@ -802,4 +1402,85 @@ fn find_and_parse_project(path: &Path, registry: &DependencyRegistry) -> Result<
     Err(crate::error::IndexerError::FileNotFound(
         "No manifest file found in directory".to_string(),
     ))
+}
+
+/// Gets symbols from changed files (git diff)
+pub fn get_changed_symbols(
+    db_path: &PathBuf,
+    base: &str,
+    staged: bool,
+    unstaged: bool,
+    format: &str,
+) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+    let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
+
+    // Use current directory as repo path (db_path is usually .code-index.db in the repo)
+    let repo_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let git = GitAnalyzer::new(repo_path)?;
+
+    // If neither staged nor unstaged is specified, show all uncommitted changes
+    let (include_staged, include_unstaged) = if !staged && !unstaged {
+        (true, true)
+    } else {
+        (staged, unstaged)
+    };
+
+    let changed_symbols = git.find_changed_symbols(&index, base, include_staged, include_unstaged)?;
+
+    if changed_symbols.is_empty() {
+        println!("No changed symbols found");
+        return Ok(());
+    }
+
+    match output_format {
+        OutputFormat::Full => {
+            println!("Changed symbols ({}):", changed_symbols.len());
+            for cs in changed_symbols {
+                let kind = cs.symbol.kind.as_str();
+                let location = format!(
+                    "{}:{}",
+                    cs.symbol.location.file_path, cs.symbol.location.start_line
+                );
+                println!(
+                    "  {} ({}) - {} [{}]",
+                    cs.symbol.name, kind, location, cs.file_status
+                );
+            }
+        }
+        OutputFormat::Compact => {
+            let compact: Vec<serde_json::Value> = changed_symbols
+                .iter()
+                .map(|cs| {
+                    serde_json::json!({
+                        "n": cs.symbol.name,
+                        "k": cs.symbol.kind.short_str(),
+                        "f": cs.symbol.location.file_path,
+                        "l": cs.symbol.location.start_line,
+                        "st": cs.file_status
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&compact).unwrap_or_default());
+        }
+        OutputFormat::Minimal => {
+            let lines: Vec<String> = changed_symbols
+                .iter()
+                .map(|cs| {
+                    format!(
+                        "{}:{}@{}:{} [{}]",
+                        cs.symbol.name,
+                        cs.symbol.kind.short_str(),
+                        cs.symbol.location.file_path,
+                        cs.symbol.location.start_line,
+                        cs.file_status
+                    )
+                })
+                .collect();
+            println!("{}", lines.join(", "));
+        }
+    }
+
+    Ok(())
 }

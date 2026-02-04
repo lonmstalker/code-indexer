@@ -5,9 +5,9 @@ use std::sync::Mutex;
 use crate::dependencies::{Dependency, Ecosystem, ProjectInfo, SymbolSource};
 use crate::error::Result;
 use crate::index::{
-    CallGraph, CallGraphEdge, CallGraphNode, CodeIndex, DeadCodeReport, FileImport,
-    FunctionMetrics, ImportType, IndexStats, ReferenceKind, SearchOptions, SearchResult, Symbol,
-    SymbolKind, SymbolReference, Visibility,
+    CallConfidence, CallGraph, CallGraphEdge, CallGraphNode, CodeIndex, DeadCodeReport, FileImport,
+    FunctionMetrics, ImportType, IndexStats, ReferenceKind, Scope, ScopeKind, SearchOptions,
+    SearchResult, Symbol, SymbolKind, SymbolMetrics, SymbolReference, UncertaintyReason, Visibility,
 };
 use crate::indexer::ExtractionResult;
 
@@ -147,6 +147,46 @@ impl SqliteIndex {
             CREATE INDEX IF NOT EXISTS idx_imports_file ON file_imports(file_path);
             CREATE INDEX IF NOT EXISTS idx_imports_path ON file_imports(imported_path);
             CREATE INDEX IF NOT EXISTS idx_imports_symbol ON file_imports(imported_symbol);
+
+            -- Scopes table for scope resolution
+            CREATE TABLE IF NOT EXISTS scopes (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                parent_id INTEGER REFERENCES scopes(id),
+                kind TEXT NOT NULL,
+                name TEXT,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_scopes_file ON scopes(file_path);
+            CREATE INDEX IF NOT EXISTS idx_scopes_range ON scopes(file_path, start_offset, end_offset);
+
+            -- Call edges table with confidence
+            CREATE TABLE IF NOT EXISTS call_edges (
+                id INTEGER PRIMARY KEY,
+                caller_symbol_id TEXT NOT NULL REFERENCES symbols(id),
+                callee_symbol_id TEXT REFERENCES symbols(id),
+                callee_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                column_num INTEGER NOT NULL,
+                confidence TEXT NOT NULL DEFAULT 'certain',
+                reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_calls_caller ON call_edges(caller_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_calls_callee ON call_edges(callee_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_calls_callee_name ON call_edges(callee_name);
+
+            -- Symbol metrics table for ranking
+            CREATE TABLE IF NOT EXISTS symbol_metrics (
+                symbol_id TEXT PRIMARY KEY REFERENCES symbols(id),
+                pagerank REAL DEFAULT 0.0,
+                incoming_refs INTEGER DEFAULT 0,
+                outgoing_refs INTEGER DEFAULT 0,
+                git_recency REAL DEFAULT 0.0
+            );
             "#,
         )?;
 
@@ -176,6 +216,32 @@ impl SqliteIndex {
             )?;
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_symbols_dependency ON symbols(dependency_id)",
+                [],
+            )?;
+        }
+
+        // Add scope_id and fqdn columns if they don't exist
+        let has_scope_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('symbols') WHERE name = 'scope_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_scope_id {
+            conn.execute(
+                "ALTER TABLE symbols ADD COLUMN scope_id INTEGER REFERENCES scopes(id)",
+                [],
+            )?;
+            conn.execute("ALTER TABLE symbols ADD COLUMN fqdn TEXT", [])?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_scope ON symbols(scope_id)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_fqdn ON symbols(fqdn)",
                 [],
             )?;
         }
@@ -550,6 +616,324 @@ impl SqliteIndex {
         Ok(())
     }
 
+    // === Scope Methods ===
+
+    /// Adds scopes to the database
+    pub fn add_scopes(&self, scopes: Vec<Scope>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for scope in scopes {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO scopes
+                (id, file_path, parent_id, kind, name, start_offset, end_offset, start_line, end_line)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    scope.id,
+                    scope.file_path,
+                    scope.parent_id,
+                    scope.kind.as_str(),
+                    scope.name,
+                    scope.start_offset,
+                    scope.end_offset,
+                    scope.start_line,
+                    scope.end_line,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gets all scopes for a file
+    pub fn get_file_scopes(&self, file_path: &str) -> Result<Vec<Scope>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, file_path, parent_id, kind, name, start_offset, end_offset, start_line, end_line
+            FROM scopes
+            WHERE file_path = ?1
+            ORDER BY start_offset
+            "#,
+        )?;
+
+        let scopes = stmt
+            .query_map(params![file_path], |row| {
+                let kind_str: String = row.get(3)?;
+                Ok(Scope {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    parent_id: row.get(2)?,
+                    kind: ScopeKind::from_str(&kind_str).unwrap_or(ScopeKind::Block),
+                    name: row.get(4)?,
+                    start_offset: row.get(5)?,
+                    end_offset: row.get(6)?,
+                    start_line: row.get(7)?,
+                    end_line: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(scopes)
+    }
+
+    /// Finds the scope containing a given offset in a file
+    pub fn find_scope_at_offset(&self, file_path: &str, offset: u32) -> Result<Option<Scope>> {
+        let conn = self.conn.lock().unwrap();
+        let scope = conn
+            .query_row(
+                r#"
+                SELECT id, file_path, parent_id, kind, name, start_offset, end_offset, start_line, end_line
+                FROM scopes
+                WHERE file_path = ?1 AND start_offset <= ?2 AND end_offset >= ?2
+                ORDER BY (end_offset - start_offset) ASC
+                LIMIT 1
+                "#,
+                params![file_path, offset],
+                |row| {
+                    let kind_str: String = row.get(3)?;
+                    Ok(Scope {
+                        id: row.get(0)?,
+                        file_path: row.get(1)?,
+                        parent_id: row.get(2)?,
+                        kind: ScopeKind::from_str(&kind_str).unwrap_or(ScopeKind::Block),
+                        name: row.get(4)?,
+                        start_offset: row.get(5)?,
+                        end_offset: row.get(6)?,
+                        start_line: row.get(7)?,
+                        end_line: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(scope)
+    }
+
+    /// Removes scopes for a file
+    pub fn remove_file_scopes(&self, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM scopes WHERE file_path = ?1", params![file_path])?;
+        Ok(())
+    }
+
+    // === Call Edge Methods ===
+
+    /// Adds call edges to the database
+    pub fn add_call_edges(&self, edges: Vec<CallGraphEdge>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for edge in edges {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO call_edges
+                (caller_symbol_id, callee_symbol_id, callee_name, file_path, line, column_num, confidence, reason)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    edge.from,
+                    edge.to,
+                    edge.callee_name,
+                    edge.call_site_file,
+                    edge.call_site_line,
+                    edge.call_site_column,
+                    edge.confidence.as_str(),
+                    edge.reason.map(|r| r.as_str().to_string()),
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gets call edges from a caller
+    pub fn get_call_edges_from(&self, caller_id: &str) -> Result<Vec<CallGraphEdge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT caller_symbol_id, callee_symbol_id, callee_name, file_path, line, column_num, confidence, reason
+            FROM call_edges
+            WHERE caller_symbol_id = ?1
+            ORDER BY line, column_num
+            "#,
+        )?;
+
+        let edges = stmt
+            .query_map(params![caller_id], |row| {
+                let confidence_str: String = row.get(6)?;
+                let reason_str: Option<String> = row.get(7)?;
+                Ok(CallGraphEdge {
+                    from: row.get(0)?,
+                    to: row.get(1)?,
+                    callee_name: row.get(2)?,
+                    call_site_file: row.get(3)?,
+                    call_site_line: row.get(4)?,
+                    call_site_column: row.get(5)?,
+                    confidence: CallConfidence::from_str(&confidence_str)
+                        .unwrap_or(CallConfidence::Certain),
+                    reason: reason_str.and_then(|s| UncertaintyReason::from_str(&s)),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+
+    /// Gets call edges to a callee
+    pub fn get_call_edges_to(&self, callee_id: &str) -> Result<Vec<CallGraphEdge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT caller_symbol_id, callee_symbol_id, callee_name, file_path, line, column_num, confidence, reason
+            FROM call_edges
+            WHERE callee_symbol_id = ?1
+            ORDER BY file_path, line
+            "#,
+        )?;
+
+        let edges = stmt
+            .query_map(params![callee_id], |row| {
+                let confidence_str: String = row.get(6)?;
+                let reason_str: Option<String> = row.get(7)?;
+                Ok(CallGraphEdge {
+                    from: row.get(0)?,
+                    to: row.get(1)?,
+                    callee_name: row.get(2)?,
+                    call_site_file: row.get(3)?,
+                    call_site_line: row.get(4)?,
+                    call_site_column: row.get(5)?,
+                    confidence: CallConfidence::from_str(&confidence_str)
+                        .unwrap_or(CallConfidence::Certain),
+                    reason: reason_str.and_then(|s| UncertaintyReason::from_str(&s)),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+
+    /// Gets call edges by callee name (for unresolved lookups)
+    pub fn get_call_edges_by_name(&self, callee_name: &str) -> Result<Vec<CallGraphEdge>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT caller_symbol_id, callee_symbol_id, callee_name, file_path, line, column_num, confidence, reason
+            FROM call_edges
+            WHERE callee_name = ?1
+            ORDER BY file_path, line
+            "#,
+        )?;
+
+        let edges = stmt
+            .query_map(params![callee_name], |row| {
+                let confidence_str: String = row.get(6)?;
+                let reason_str: Option<String> = row.get(7)?;
+                Ok(CallGraphEdge {
+                    from: row.get(0)?,
+                    to: row.get(1)?,
+                    callee_name: row.get(2)?,
+                    call_site_file: row.get(3)?,
+                    call_site_line: row.get(4)?,
+                    call_site_column: row.get(5)?,
+                    confidence: CallConfidence::from_str(&confidence_str)
+                        .unwrap_or(CallConfidence::Certain),
+                    reason: reason_str.and_then(|s| UncertaintyReason::from_str(&s)),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+
+    /// Removes call edges for a file
+    pub fn remove_file_call_edges(&self, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM call_edges WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        Ok(())
+    }
+
+    // === Symbol Metrics Methods ===
+
+    /// Updates metrics for a symbol
+    pub fn update_symbol_metrics(&self, metrics: &SymbolMetrics) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO symbol_metrics
+            (symbol_id, pagerank, incoming_refs, outgoing_refs, git_recency)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![
+                metrics.symbol_id,
+                metrics.pagerank,
+                metrics.incoming_refs,
+                metrics.outgoing_refs,
+                metrics.git_recency,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Gets metrics for a symbol
+    pub fn get_symbol_metrics(&self, symbol_id: &str) -> Result<Option<SymbolMetrics>> {
+        let conn = self.conn.lock().unwrap();
+        let metrics = conn
+            .query_row(
+                r#"
+                SELECT symbol_id, pagerank, incoming_refs, outgoing_refs, git_recency
+                FROM symbol_metrics
+                WHERE symbol_id = ?1
+                "#,
+                params![symbol_id],
+                |row| {
+                    Ok(SymbolMetrics {
+                        symbol_id: row.get(0)?,
+                        pagerank: row.get(1)?,
+                        incoming_refs: row.get(2)?,
+                        outgoing_refs: row.get(3)?,
+                        git_recency: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(metrics)
+    }
+
+    /// Batch updates symbol metrics
+    pub fn update_symbol_metrics_batch(&self, metrics_list: Vec<SymbolMetrics>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        for metrics in metrics_list {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO symbol_metrics
+                (symbol_id, pagerank, incoming_refs, outgoing_refs, git_recency)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    metrics.symbol_id,
+                    metrics.pagerank,
+                    metrics.incoming_refs,
+                    metrics.outgoing_refs,
+                    metrics.git_recency,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Batch insert all extraction results (symbols, references, imports) in a single transaction.
     /// Returns the total number of symbols inserted.
     pub fn add_extraction_results_batch(&self, results: Vec<ExtractionResult>) -> Result<usize> {
@@ -648,7 +1032,184 @@ impl SqliteIndex {
             signature: row.get(10)?,
             doc_comment: row.get(11)?,
             parent: row.get(12)?,
+            scope_id: None, // Not loaded from basic queries
+            fqdn: None,     // Not loaded from basic queries
         })
+    }
+
+    /// Read symbol with extended fields including scope_id and fqdn
+    #[allow(dead_code)]
+    fn symbol_from_row_extended(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
+        let kind_str: String = row.get(2)?;
+        let visibility_str: Option<String> = row.get(9)?;
+
+        Ok(Symbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function),
+            location: crate::index::Location {
+                file_path: row.get(3)?,
+                start_line: row.get(4)?,
+                start_column: row.get(5)?,
+                end_line: row.get(6)?,
+                end_column: row.get(7)?,
+            },
+            language: row.get(8)?,
+            visibility: visibility_str.and_then(|s| Visibility::from_str(&s)),
+            signature: row.get(10)?,
+            doc_comment: row.get(11)?,
+            parent: row.get(12)?,
+            scope_id: row.get(13).ok(),
+            fqdn: row.get(14).ok(),
+        })
+    }
+
+    /// Computes an advanced score for a symbol in search results.
+    /// Scoring formula:
+    /// - 0.4 * name_match_score (how well the name matches the query)
+    /// - 0.2 * visibility_score (public > internal > private)
+    /// - 0.2 * pagerank_score (importance based on call graph)
+    /// - 0.1 * git_recency_score (recently modified symbols rank higher)
+    /// - 0.1 * locality_score (symbols in same/nearby files rank higher)
+    fn compute_advanced_score(
+        &self,
+        symbol: &Symbol,
+        name_match_score: f64,
+        current_file: Option<&str>,
+    ) -> f64 {
+        // Base score from name matching
+        let name_score = name_match_score * 0.4;
+
+        // Visibility score (public symbols are more likely to be searched for)
+        let visibility_score = match symbol.visibility.as_ref() {
+            Some(Visibility::Public) => 1.0,
+            Some(Visibility::Internal) => 0.7,
+            Some(Visibility::Protected) => 0.5,
+            Some(Visibility::Private) => 0.3,
+            None => 0.5, // Unknown visibility
+        } * 0.2;
+
+        // Try to get metrics for pagerank and recency
+        let (pagerank_score, recency_score) =
+            if let Ok(Some(metrics)) = self.get_symbol_metrics(&symbol.id) {
+                // Normalize pagerank (typically 0-1, but cap at 1)
+                let pr = (metrics.pagerank.min(1.0).max(0.0)) * 0.2;
+                // Git recency is already 0-1
+                let rec = (metrics.git_recency.min(1.0).max(0.0)) * 0.1;
+                (pr, rec)
+            } else {
+                (0.0, 0.0)
+            };
+
+        // Locality score (same file = 1.0, same directory = 0.5, else 0.0)
+        let locality_score = if let Some(current) = current_file {
+            if symbol.location.file_path == current {
+                1.0
+            } else {
+                // Check if in same directory
+                let current_dir = std::path::Path::new(current).parent();
+                let symbol_dir = std::path::Path::new(&symbol.location.file_path).parent();
+                if current_dir.is_some() && current_dir == symbol_dir {
+                    0.5
+                } else {
+                    0.0
+                }
+            }
+        } else {
+            0.0
+        } * 0.1;
+
+        name_score + visibility_score + pagerank_score + recency_score + locality_score
+    }
+
+    /// Performs prefix search for short queries (less than 4 characters).
+    /// Short queries are too ambiguous for fuzzy matching, so we only do prefix match.
+    fn search_prefix(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        let limit = options.limit.unwrap_or(100);
+        let query_lower = query.to_lowercase();
+        let use_advanced = options.use_advanced_ranking.unwrap_or(false);
+        let current_file = options.current_file.clone();
+
+        // Fetch symbols from database
+        let symbols = {
+            let conn = self.conn.lock().unwrap();
+
+            let mut sql = String::from(
+                r#"
+                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                       language, visibility, signature, doc_comment, parent
+                FROM symbols
+                WHERE name LIKE ?1
+                "#,
+            );
+
+            let prefix_pattern = format!("{}%", query.replace(['%', '_'], ""));
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(prefix_pattern)];
+
+            if let Some(ref kinds) = options.kind_filter {
+                let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for kind in kinds {
+                    params_vec.push(Box::new(kind.as_str().to_string()));
+                }
+            }
+
+            if let Some(ref langs) = options.language_filter {
+                let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND language IN ({})", placeholders.join(",")));
+                for lang in langs {
+                    params_vec.push(Box::new(lang.clone()));
+                }
+            }
+
+            if let Some(ref file) = options.file_filter {
+                sql.push_str(" AND file_path LIKE ?");
+                params_vec.push(Box::new(format!("%{}%", file)));
+            }
+
+            sql.push_str(&format!(" ORDER BY name LIMIT {}", limit));
+
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+
+            let mut stmt = conn.prepare(&sql)?;
+            let symbols: Vec<Symbol> = stmt
+                .query_map(params_refs.as_slice(), Self::symbol_from_row)?
+                .filter_map(|r| r.ok())
+                .collect();
+            symbols
+        };
+
+        // Calculate scores (outside of connection lock)
+        let current_file_ref = current_file.as_deref();
+
+        let mut results: Vec<SearchResult> = symbols
+            .into_iter()
+            .map(|symbol| {
+                let name_lower = symbol.name.to_lowercase();
+                // Exact match = 1.0, prefix match = 0.8, contains = 0.5
+                let name_score = if name_lower == query_lower {
+                    1.0
+                } else if name_lower.starts_with(&query_lower) {
+                    0.8
+                } else {
+                    0.5
+                };
+
+                let score = if use_advanced {
+                    self.compute_advanced_score(&symbol, name_score, current_file_ref)
+                } else {
+                    name_score
+                };
+
+                SearchResult { symbol, score }
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+
+        Ok(results)
     }
 }
 
@@ -740,63 +1301,202 @@ impl CodeIndex for SqliteIndex {
     }
 
     fn search(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
-        let conn = self.conn.lock().unwrap();
         let limit = options.limit.unwrap_or(100);
+        let use_advanced = options.use_advanced_ranking.unwrap_or(false);
+        let current_file = options.current_file.clone();
 
-        let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
+        // Fetch results from database
+        let initial_results = {
+            let conn = self.conn.lock().unwrap();
+            let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
 
-        let mut sql = String::from(
-            r#"
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent,
-                   bm25(symbols_fts) as score
-            FROM symbols s
-            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
-            WHERE symbols_fts MATCH ?1
-            "#,
-        );
+            let mut sql = String::from(
+                r#"
+                SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                       s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                       s.doc_comment, s.parent,
+                       bm25(symbols_fts) as score
+                FROM symbols s
+                JOIN symbols_fts ON s.rowid = symbols_fts.rowid
+                WHERE symbols_fts MATCH ?1
+                "#,
+            );
 
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
 
-        if let Some(ref kinds) = options.kind_filter {
-            let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
-            sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(",")));
-            for kind in kinds {
-                params_vec.push(Box::new(kind.as_str().to_string()));
+            if let Some(ref kinds) = options.kind_filter {
+                let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(",")));
+                for kind in kinds {
+                    params_vec.push(Box::new(kind.as_str().to_string()));
+                }
             }
-        }
 
-        if let Some(ref langs) = options.language_filter {
-            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
-            sql.push_str(&format!(" AND s.language IN ({})", placeholders.join(",")));
-            for lang in langs {
-                params_vec.push(Box::new(lang.clone()));
+            if let Some(ref langs) = options.language_filter {
+                let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND s.language IN ({})", placeholders.join(",")));
+                for lang in langs {
+                    params_vec.push(Box::new(lang.clone()));
+                }
             }
-        }
 
-        if let Some(ref file) = options.file_filter {
-            sql.push_str(" AND s.file_path LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", file)));
-        }
+            if let Some(ref file) = options.file_filter {
+                sql.push_str(" AND s.file_path LIKE ?");
+                params_vec.push(Box::new(format!("%{}%", file)));
+            }
 
-        sql.push_str(&format!(" ORDER BY score LIMIT {}", limit));
+            // Get more results initially if we're using advanced ranking (need to re-sort)
+            let fetch_limit = if use_advanced {
+                limit * 3 // Fetch more to allow for re-ranking
+            } else {
+                limit
+            };
+            sql.push_str(&format!(" ORDER BY score LIMIT {}", fetch_limit));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
 
-        let mut stmt = conn.prepare(&sql)?;
-        let results = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                let symbol = Self::symbol_from_row(row)?;
-                let score: f64 = row.get(13)?;
-                Ok(SearchResult {
-                    symbol,
-                    score: -score,
+            let mut stmt = conn.prepare(&sql)?;
+            let results: Vec<(Symbol, f64)> = stmt
+                .query_map(params_refs.as_slice(), |row| {
+                    let symbol = Self::symbol_from_row(row)?;
+                    let score: f64 = row.get(13)?;
+                    Ok((symbol, -score)) // bm25 returns negative scores
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            results
+        };
+
+        // Apply advanced ranking if enabled (outside of connection lock)
+        let current_file_ref = current_file.as_deref();
+
+        let mut results: Vec<SearchResult> = if use_advanced {
+            initial_results
+                .into_iter()
+                .map(|(symbol, bm25_score)| {
+                    // Normalize bm25 score to 0-1 range (approximation)
+                    let name_match = (bm25_score / 10.0).min(1.0).max(0.0);
+                    let final_score =
+                        self.compute_advanced_score(&symbol, name_match, current_file_ref);
+                    SearchResult {
+                        symbol,
+                        score: final_score,
+                    }
                 })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                .collect()
+        } else {
+            initial_results
+                .into_iter()
+                .map(|(symbol, score)| SearchResult { symbol, score })
+                .collect()
+        };
+
+        // Re-sort and truncate if using advanced ranking
+        if use_advanced {
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(limit);
+        }
 
         Ok(results)
+    }
+
+    fn search_fuzzy(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        use strsim::jaro_winkler;
+
+        // For short queries (< 4 chars), fuzzy search is too ambiguous.
+        // Fall back to prefix search for better results.
+        if query.len() < 4 {
+            return self.search_prefix(query, options);
+        }
+
+        let limit = options.limit.unwrap_or(100);
+        let threshold = options.fuzzy_threshold.unwrap_or(0.7);
+        let use_advanced = options.use_advanced_ranking.unwrap_or(false);
+        let current_file = options.current_file.clone();
+
+        // Fetch all symbols from database
+        let all_symbols = {
+            let conn = self.conn.lock().unwrap();
+
+            let mut sql = String::from(
+                r#"
+                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                       language, visibility, signature, doc_comment, parent
+                FROM symbols
+                WHERE 1=1
+                "#,
+            );
+
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+            if let Some(ref kinds) = options.kind_filter {
+                let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND kind IN ({})", placeholders.join(",")));
+                for kind in kinds {
+                    params_vec.push(Box::new(kind.as_str().to_string()));
+                }
+            }
+
+            if let Some(ref langs) = options.language_filter {
+                let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND language IN ({})", placeholders.join(",")));
+                for lang in langs {
+                    params_vec.push(Box::new(lang.clone()));
+                }
+            }
+
+            if let Some(ref file) = options.file_filter {
+                sql.push_str(" AND file_path LIKE ?");
+                params_vec.push(Box::new(format!("%{}%", file)));
+            }
+
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+
+            let mut stmt = conn.prepare(&sql)?;
+            let symbols: Vec<Symbol> = stmt
+                .query_map(params_refs.as_slice(), Self::symbol_from_row)?
+                .filter_map(|r| r.ok())
+                .collect();
+            symbols
+        };
+
+        // Calculate fuzzy scores with advanced ranking if enabled (outside connection lock)
+        let query_lower = query.to_lowercase();
+        let current_file_ref = current_file.as_deref();
+
+        let mut scored: Vec<SearchResult> = all_symbols
+            .into_iter()
+            .filter_map(|symbol| {
+                let name_lower = symbol.name.to_lowercase();
+                let fuzzy_score = jaro_winkler(&query_lower, &name_lower);
+
+                if fuzzy_score >= threshold {
+                    let final_score = if use_advanced {
+                        self.compute_advanced_score(&symbol, fuzzy_score, current_file_ref)
+                    } else {
+                        fuzzy_score
+                    };
+                    Some(SearchResult {
+                        symbol,
+                        score: final_score,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by score descending and limit
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored)
     }
 
     fn find_definition(&self, name: &str) -> Result<Vec<Symbol>> {
@@ -1389,9 +2089,13 @@ impl CodeIndex for SqliteIndex {
                     // Add edge
                     graph.edges.push(CallGraphEdge {
                         from: from_id.clone(),
-                        to: to_id.clone(),
+                        to: Some(to_id.clone()),
+                        callee_name: callee_name.clone(),
                         call_site_line: call_line,
+                        call_site_column: 0,
                         call_site_file: file_path.clone(),
+                        confidence: CallConfidence::Certain,
+                        reason: None,
                     });
 
                     // Add node if not visited

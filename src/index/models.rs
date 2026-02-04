@@ -1,5 +1,73 @@
 use serde::{Deserialize, Serialize};
 
+/// Output format for search results
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OutputFormat {
+    /// Full JSON output with all fields
+    #[default]
+    Full,
+    /// Compact JSON with abbreviated field names: {n, k, f, l, s}
+    Compact,
+    /// Minimal single-line format: "name:kind@file:line"
+    Minimal,
+}
+
+impl OutputFormat {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "full" | "json" => Some(OutputFormat::Full),
+            "compact" => Some(OutputFormat::Compact),
+            "minimal" | "min" => Some(OutputFormat::Minimal),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutputFormat::Full => "full",
+            OutputFormat::Compact => "compact",
+            OutputFormat::Minimal => "minimal",
+        }
+    }
+}
+
+/// Compact representation of a symbol for reduced token usage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactSymbol {
+    /// Symbol name
+    pub n: String,
+    /// Kind (abbreviated)
+    pub k: String,
+    /// File path
+    pub f: String,
+    /// Line number
+    pub l: u32,
+    /// Score (optional, for search results)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s: Option<f64>,
+}
+
+impl CompactSymbol {
+    pub fn from_symbol(symbol: &Symbol, score: Option<f64>) -> Self {
+        Self {
+            n: symbol.name.clone(),
+            k: symbol.kind.short_str().to_string(),
+            f: symbol.location.file_path.clone(),
+            l: symbol.location.start_line,
+            s: score,
+        }
+    }
+
+    /// Format as minimal single-line string: "name:kind@file:line"
+    pub fn to_minimal_string(&self) -> String {
+        if let Some(score) = self.s {
+            format!("{}:{}@{}:{} [{:.2}]", self.n, self.k, self.f, self.l, score)
+        } else {
+            format!("{}:{}@{}:{}", self.n, self.k, self.f, self.l)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
     Function,
@@ -35,6 +103,26 @@ impl SymbolKind {
             SymbolKind::Module => "module",
             SymbolKind::Import => "import",
             SymbolKind::TypeAlias => "type_alias",
+        }
+    }
+
+    /// Short string representation for compact output (2-3 chars)
+    pub fn short_str(&self) -> &'static str {
+        match self {
+            SymbolKind::Function => "fn",
+            SymbolKind::Method => "met",
+            SymbolKind::Struct => "str",
+            SymbolKind::Class => "cls",
+            SymbolKind::Interface => "int",
+            SymbolKind::Trait => "trt",
+            SymbolKind::Enum => "enm",
+            SymbolKind::EnumVariant => "var",
+            SymbolKind::Constant => "cst",
+            SymbolKind::Variable => "val",
+            SymbolKind::Field => "fld",
+            SymbolKind::Module => "mod",
+            SymbolKind::Import => "imp",
+            SymbolKind::TypeAlias => "typ",
         }
     }
 
@@ -126,6 +214,12 @@ pub struct Symbol {
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
     pub parent: Option<String>,
+    /// Scope ID where this symbol is defined
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<i64>,
+    /// Fully Qualified Domain Name (e.g., "crate::module::Type::method")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fqdn: Option<String>,
 }
 
 impl Symbol {
@@ -145,6 +239,8 @@ impl Symbol {
             signature: None,
             doc_comment: None,
             parent: None,
+            scope_id: None,
+            fqdn: None,
         }
     }
 
@@ -166,6 +262,18 @@ impl Symbol {
     #[allow(dead_code)]
     pub fn with_parent(mut self, parent: impl Into<String>) -> Self {
         self.parent = Some(parent.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_scope_id(mut self, scope_id: i64) -> Self {
+        self.scope_id = Some(scope_id);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_fqdn(mut self, fqdn: impl Into<String>) -> Self {
+        self.fqdn = Some(fqdn.into());
         self
     }
 }
@@ -202,6 +310,16 @@ pub struct SearchOptions {
     pub file_filter: Option<String>,
     /// Name pattern filter (glob: * and ? supported, e.g., "format*")
     pub name_filter: Option<String>,
+    /// Output format (full, compact, minimal)
+    pub output_format: Option<OutputFormat>,
+    /// Enable fuzzy search for typo tolerance
+    pub fuzzy: Option<bool>,
+    /// Fuzzy search threshold (0.0-1.0, default 0.7)
+    pub fuzzy_threshold: Option<f64>,
+    /// Current file path for locality-aware ranking
+    pub current_file: Option<String>,
+    /// Use advanced ranking with metrics (visibility, pagerank, recency)
+    pub use_advanced_ranking: Option<bool>,
 }
 
 /// Type of reference to a symbol
@@ -329,6 +447,156 @@ impl ImportType {
     }
 }
 
+// === Scope Models ===
+
+/// Kind of scope in the code
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeKind {
+    /// File-level scope
+    File,
+    /// Module scope (Rust mod, Python module, etc.)
+    Module,
+    /// Class scope
+    Class,
+    /// Function/method scope
+    Function,
+    /// Block scope (if, for, while, etc.)
+    Block,
+    /// Closure/lambda scope
+    Closure,
+}
+
+impl ScopeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScopeKind::File => "file",
+            ScopeKind::Module => "module",
+            ScopeKind::Class => "class",
+            ScopeKind::Function => "function",
+            ScopeKind::Block => "block",
+            ScopeKind::Closure => "closure",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "file" => Some(ScopeKind::File),
+            "module" => Some(ScopeKind::Module),
+            "class" => Some(ScopeKind::Class),
+            "function" => Some(ScopeKind::Function),
+            "block" => Some(ScopeKind::Block),
+            "closure" => Some(ScopeKind::Closure),
+            _ => None,
+        }
+    }
+}
+
+/// A scope in the code representing a lexical context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scope {
+    /// Unique identifier for this scope
+    pub id: i64,
+    /// File path where this scope is defined
+    pub file_path: String,
+    /// Parent scope ID (None for file-level scope)
+    pub parent_id: Option<i64>,
+    /// Kind of scope
+    pub kind: ScopeKind,
+    /// Optional name (for named scopes like functions, classes)
+    pub name: Option<String>,
+    /// Start byte offset in the file
+    pub start_offset: u32,
+    /// End byte offset in the file
+    pub end_offset: u32,
+    /// Start line number
+    pub start_line: u32,
+    /// End line number
+    pub end_line: u32,
+}
+
+// === Call Confidence Models ===
+
+/// Confidence level for call graph edges
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallConfidence {
+    /// Call target is definitely known (direct call, known type)
+    Certain,
+    /// Call target is possible but not certain (virtual dispatch, dynamic)
+    Possible,
+}
+
+impl CallConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CallConfidence::Certain => "certain",
+            CallConfidence::Possible => "possible",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "certain" => Some(CallConfidence::Certain),
+            "possible" => Some(CallConfidence::Possible),
+            _ => None,
+        }
+    }
+}
+
+/// Reason why a call has uncertain target
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UncertaintyReason {
+    /// Virtual dispatch through interface/trait
+    VirtualDispatch,
+    /// Receiver type is unknown at static analysis time
+    DynamicReceiver,
+    /// Multiple candidate implementations
+    MultipleCandidates,
+    /// Higher-order function (callback, closure parameter)
+    HigherOrderFunction,
+    /// External library call without source
+    ExternalLibrary,
+}
+
+impl UncertaintyReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UncertaintyReason::VirtualDispatch => "virtual_dispatch",
+            UncertaintyReason::DynamicReceiver => "dynamic_receiver",
+            UncertaintyReason::MultipleCandidates => "multiple_candidates",
+            UncertaintyReason::HigherOrderFunction => "higher_order_function",
+            UncertaintyReason::ExternalLibrary => "external_library",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "virtual_dispatch" => Some(UncertaintyReason::VirtualDispatch),
+            "dynamic_receiver" => Some(UncertaintyReason::DynamicReceiver),
+            "multiple_candidates" => Some(UncertaintyReason::MultipleCandidates),
+            "higher_order_function" => Some(UncertaintyReason::HigherOrderFunction),
+            "external_library" => Some(UncertaintyReason::ExternalLibrary),
+            _ => None,
+        }
+    }
+}
+
+// === Symbol Metrics Models ===
+
+/// Metrics for a symbol used in ranking
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SymbolMetrics {
+    /// Symbol ID
+    pub symbol_id: String,
+    /// PageRank score (importance based on call graph)
+    pub pagerank: f64,
+    /// Number of incoming references
+    pub incoming_refs: u32,
+    /// Number of outgoing references
+    pub outgoing_refs: u32,
+    /// Git recency score (how recently modified)
+    pub git_recency: f64,
+}
+
 // === Call Graph Models ===
 
 /// Represents a call graph starting from an entry point
@@ -373,12 +641,27 @@ pub struct CallGraphNode {
 pub struct CallGraphEdge {
     /// ID of the calling function
     pub from: String,
-    /// ID of the called function
-    pub to: String,
+    /// ID of the called function (None if unresolved)
+    pub to: Option<String>,
+    /// Name of the callee (for display/debugging)
+    pub callee_name: String,
     /// Line number of the call site
     pub call_site_line: u32,
+    /// Column number of the call site
+    #[serde(default)]
+    pub call_site_column: u32,
     /// File containing the call site
     pub call_site_file: String,
+    /// Confidence level for this call edge
+    #[serde(default = "default_confidence")]
+    pub confidence: CallConfidence,
+    /// Reason for uncertainty (if confidence is Possible)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<UncertaintyReason>,
+}
+
+fn default_confidence() -> CallConfidence {
+    CallConfidence::Certain
 }
 
 // === Function Metrics Models ===

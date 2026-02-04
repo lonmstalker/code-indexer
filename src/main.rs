@@ -22,36 +22,83 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { path, watch } => {
+        // === New consolidated commands ===
+        Commands::Index { path, watch, deep_deps } => {
             cli::index_directory(&path, &cli.db, watch)?;
+            if deep_deps {
+                cli::index_dependencies(&path, &cli.db, None, false)?;
+            }
         }
         Commands::Serve => {
             cli::run_mcp_server(&cli.db).await?;
         }
-        Commands::Query { query } => match query {
-            QueryCommands::Search { query, limit } => {
-                cli::search_symbols(&cli.db, &query, limit)?;
-            }
-            QueryCommands::Definition { name } => {
+        Commands::Symbols {
+            query,
+            kind,
+            limit,
+            language,
+            file,
+            pattern,
+            format,
+            fuzzy,
+            fuzzy_threshold,
+        } => {
+            cli::symbols(
+                &cli.db,
+                query,
+                &kind,
+                limit,
+                language,
+                file,
+                pattern,
+                &format,
+                fuzzy,
+                fuzzy_threshold,
+            )?;
+        }
+        Commands::Definition { name, include_deps, dep } => {
+            if include_deps {
+                cli::find_in_dependencies(&cli.db, &name, dep, 20)?;
+            } else {
                 cli::find_definition(&cli.db, &name)?;
             }
-            QueryCommands::Functions {
-                limit,
-                language,
-                file,
-                pattern,
-            } => {
-                cli::list_functions(&cli.db, limit, language, file, pattern)?;
-            }
-            QueryCommands::Types {
-                limit,
-                language,
-                file,
-                pattern,
-            } => {
-                cli::list_types(&cli.db, limit, language, file, pattern)?;
-            }
-        },
+        }
+        Commands::References {
+            name,
+            callers,
+            depth,
+            file,
+            limit,
+        } => {
+            cli::find_references(&cli.db, &name, callers, depth, file, limit)?;
+        }
+        Commands::CallGraph {
+            function,
+            direction,
+            depth,
+            include_possible,
+        } => {
+            cli::analyze_call_graph(&cli.db, &function, &direction, depth, include_possible)?;
+        }
+        Commands::Outline {
+            file,
+            start_line,
+            end_line,
+            scopes,
+        } => {
+            cli::get_outline(&cli.db, &file, start_line, end_line, scopes)?;
+        }
+        Commands::Imports { file, resolve } => {
+            cli::get_imports(&cli.db, &file, resolve)?;
+        }
+        Commands::Changed {
+            base,
+            staged,
+            unstaged,
+            format,
+        } => {
+            cli::get_changed_symbols(&cli.db, &base, staged, unstaged, &format)?;
+        }
         Commands::Stats => {
             cli::show_stats(&cli.db)?;
         }
@@ -75,6 +122,50 @@ async fn main() -> anyhow::Result<()> {
                 cli::show_dependency_info(&path, &cli.db, &name)?;
             }
         },
+        // === Legacy commands (deprecated) ===
+        Commands::Query { query } => {
+            eprintln!("Warning: 'query' command is deprecated. Use 'symbols', 'definition', or 'references' instead.");
+            match query {
+                QueryCommands::Search {
+                    query,
+                    limit,
+                    format,
+                    fuzzy,
+                    fuzzy_threshold,
+                } => {
+                    cli::search_symbols(&cli.db, &query, limit, &format, fuzzy, fuzzy_threshold)?;
+                }
+                QueryCommands::Definition { name } => {
+                    cli::find_definition(&cli.db, &name)?;
+                }
+                QueryCommands::Functions {
+                    limit,
+                    language,
+                    file,
+                    pattern,
+                    format,
+                } => {
+                    cli::list_functions(&cli.db, limit, language, file, pattern, &format)?;
+                }
+                QueryCommands::Types {
+                    limit,
+                    language,
+                    file,
+                    pattern,
+                    format,
+                } => {
+                    cli::list_types(&cli.db, limit, language, file, pattern, &format)?;
+                }
+                QueryCommands::Changed {
+                    base,
+                    staged,
+                    unstaged,
+                    format,
+                } => {
+                    cli::get_changed_symbols(&cli.db, &base, staged, unstaged, &format)?;
+                }
+            }
+        }
     }
 
     Ok(())
