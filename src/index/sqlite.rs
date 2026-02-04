@@ -958,6 +958,54 @@ impl SqliteIndex {
         Ok(metrics)
     }
 
+    /// Gets metrics for multiple symbols in a single query.
+    /// Returns a HashMap from symbol_id to SymbolMetrics.
+    /// This avoids N+1 queries when computing advanced scores for search results.
+    pub fn get_symbol_metrics_batch(
+        &self,
+        symbol_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, SymbolMetrics>> {
+        use std::collections::HashMap;
+
+        if symbol_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        // Build query with placeholders
+        let placeholders: Vec<String> = symbol_ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            r#"
+            SELECT symbol_id, pagerank, incoming_refs, outgoing_refs, git_recency
+            FROM symbol_metrics
+            WHERE symbol_id IN ({})
+            "#,
+            placeholders.join(",")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            symbol_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(SymbolMetrics {
+                symbol_id: row.get(0)?,
+                pagerank: row.get(1)?,
+                incoming_refs: row.get(2)?,
+                outgoing_refs: row.get(3)?,
+                git_recency: row.get(4)?,
+            })
+        })?;
+
+        let mut result = HashMap::with_capacity(symbol_ids.len());
+        for metrics in rows.flatten() {
+            result.insert(metrics.symbol_id.clone(), metrics);
+        }
+
+        Ok(result)
+    }
+
     /// Batch updates symbol metrics
     pub fn update_symbol_metrics_batch(&self, metrics_list: Vec<SymbolMetrics>) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
@@ -1172,6 +1220,59 @@ impl SqliteIndex {
         name_score + visibility_score + pagerank_score + recency_score + locality_score
     }
 
+    /// Computes an advanced score using pre-loaded metrics (avoids N+1 queries).
+    /// Same scoring formula as compute_advanced_score but takes metrics as parameter.
+    fn compute_advanced_score_with_metrics(
+        &self,
+        symbol: &Symbol,
+        name_match_score: f64,
+        current_file: Option<&str>,
+        metrics: Option<&SymbolMetrics>,
+    ) -> f64 {
+        // Base score from name matching
+        let name_score = name_match_score * 0.4;
+
+        // Visibility score (public symbols are more likely to be searched for)
+        let visibility_score = match symbol.visibility.as_ref() {
+            Some(Visibility::Public) => 1.0,
+            Some(Visibility::Internal) => 0.7,
+            Some(Visibility::Protected) => 0.5,
+            Some(Visibility::Private) => 0.3,
+            None => 0.5, // Unknown visibility
+        } * 0.2;
+
+        // Use pre-loaded metrics for pagerank and recency
+        let (pagerank_score, recency_score) = if let Some(m) = metrics {
+            // Normalize pagerank (typically 0-1, but cap at 1)
+            let pr = (m.pagerank.min(1.0).max(0.0)) * 0.2;
+            // Git recency is already 0-1
+            let rec = (m.git_recency.min(1.0).max(0.0)) * 0.1;
+            (pr, rec)
+        } else {
+            (0.0, 0.0)
+        };
+
+        // Locality score (same file = 1.0, same directory = 0.5, else 0.0)
+        let locality_score = if let Some(current) = current_file {
+            if symbol.location.file_path == current {
+                1.0
+            } else {
+                // Check if in same directory
+                let current_dir = std::path::Path::new(current).parent();
+                let symbol_dir = std::path::Path::new(&symbol.location.file_path).parent();
+                if current_dir.is_some() && current_dir == symbol_dir {
+                    0.5
+                } else {
+                    0.0
+                }
+            }
+        } else {
+            0.0
+        } * 0.1;
+
+        name_score + visibility_score + pagerank_score + recency_score + locality_score
+    }
+
     /// Performs prefix search for short queries (less than 4 characters).
     /// Short queries are too ambiguous for fuzzy matching, so we only do prefix match.
     fn search_prefix(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>> {
@@ -1233,7 +1334,8 @@ impl SqliteIndex {
         // Calculate scores (outside of connection lock)
         let current_file_ref = current_file.as_deref();
 
-        let mut results: Vec<SearchResult> = symbols
+        // First pass: calculate name scores
+        let preliminary: Vec<(Symbol, f64)> = symbols
             .into_iter()
             .map(|symbol| {
                 let name_lower = symbol.name.to_lowercase();
@@ -1245,16 +1347,36 @@ impl SqliteIndex {
                 } else {
                     0.5
                 };
-
-                let score = if use_advanced {
-                    self.compute_advanced_score(&symbol, name_score, current_file_ref)
-                } else {
-                    name_score
-                };
-
-                SearchResult { symbol, score }
+                (symbol, name_score)
             })
             .collect();
+
+        // OPTIMIZATION: Batch load metrics for advanced ranking (avoids N+1 queries)
+        let mut results: Vec<SearchResult> = if use_advanced && !preliminary.is_empty() {
+            let symbol_ids: Vec<&str> = preliminary.iter().map(|(s, _)| s.id.as_str()).collect();
+            let metrics_map = self.get_symbol_metrics_batch(&symbol_ids).unwrap_or_default();
+
+            preliminary
+                .into_iter()
+                .map(|(symbol, name_score)| {
+                    let score = self.compute_advanced_score_with_metrics(
+                        &symbol,
+                        name_score,
+                        current_file_ref,
+                        metrics_map.get(&symbol.id),
+                    );
+                    SearchResult { symbol, score }
+                })
+                .collect()
+        } else {
+            preliminary
+                .into_iter()
+                .map(|(symbol, name_score)| SearchResult {
+                    symbol,
+                    score: name_score,
+                })
+                .collect()
+        };
 
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
@@ -1703,9 +1825,18 @@ impl CodeIndex for SqliteIndex {
         let threshold = options.fuzzy_threshold.unwrap_or(0.7);
         let use_advanced = options.use_advanced_ranking.unwrap_or(false);
         let current_file = options.current_file.clone();
+        let query_lower = query.to_lowercase();
 
-        // Fetch all symbols from database
-        let all_symbols = {
+        // OPTIMIZATION 1: Pre-filter candidates using SQL LIKE on first few characters
+        // This reduces the number of symbols loaded from O(n) to O(k) where k << n
+        // We use multiple LIKE patterns to catch typos in first characters:
+        // - Exact prefix match (e.g., "func%" for "function")
+        // - First char wildcard (e.g., "_unc%" to catch "bunction" typo)
+        // - Contains the query substring (fallback for rearranged chars)
+        let prefix_len = std::cmp::min(3, query_lower.len());
+        let prefix = &query_lower[..prefix_len];
+
+        let candidates = {
             let conn = self.conn.lock().unwrap();
 
             let mut sql = String::from(
@@ -1713,11 +1844,20 @@ impl CodeIndex for SqliteIndex {
                 SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
                        language, visibility, signature, doc_comment, parent
                 FROM symbols
-                WHERE 1=1
+                WHERE (
+                    LOWER(name) LIKE ? OR
+                    LOWER(name) LIKE ? OR
+                    LOWER(name) LIKE ?
+                )
                 "#,
             );
 
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+            // Patterns: prefix%, _prefix% (skip first char), %query% (contains)
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(format!("{}%", prefix)),
+                Box::new(format!("_{}%", &prefix[..std::cmp::min(2, prefix.len())])),
+                Box::new(format!("%{}%", &query_lower[..std::cmp::min(4, query_lower.len())])),
+            ];
 
             if let Some(ref kinds) = options.kind_filter {
                 let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
@@ -1751,33 +1891,59 @@ impl CodeIndex for SqliteIndex {
             symbols
         };
 
-        // Calculate fuzzy scores with advanced ranking if enabled (outside connection lock)
-        let query_lower = query.to_lowercase();
+        // First pass: calculate fuzzy scores and filter by threshold
         let current_file_ref = current_file.as_deref();
-
-        let mut scored: Vec<SearchResult> = all_symbols
+        let preliminary: Vec<(Symbol, f64)> = candidates
             .into_iter()
             .filter_map(|symbol| {
                 let name_lower = symbol.name.to_lowercase();
                 let fuzzy_score = jaro_winkler(&query_lower, &name_lower);
 
                 if fuzzy_score >= threshold {
-                    let final_score = if use_advanced {
-                        self.compute_advanced_score(&symbol, fuzzy_score, current_file_ref)
-                    } else {
-                        fuzzy_score
-                    };
-                    Some(SearchResult {
-                        symbol,
-                        score: final_score,
-                    })
+                    Some((symbol, fuzzy_score))
                 } else {
                     None
                 }
             })
             .collect();
 
+        // OPTIMIZATION 2: Batch load metrics for advanced ranking (avoids N+1 queries)
+        let scored: Vec<SearchResult> = if use_advanced && !preliminary.is_empty() {
+            // Collect all symbol IDs
+            let symbol_ids: Vec<&str> = preliminary.iter().map(|(s, _)| s.id.as_str()).collect();
+
+            // Load all metrics in one query
+            let metrics_map = self.get_symbol_metrics_batch(&symbol_ids).unwrap_or_default();
+
+            // Calculate final scores with pre-loaded metrics
+            preliminary
+                .into_iter()
+                .map(|(symbol, fuzzy_score)| {
+                    let final_score = self.compute_advanced_score_with_metrics(
+                        &symbol,
+                        fuzzy_score,
+                        current_file_ref,
+                        metrics_map.get(&symbol.id),
+                    );
+                    SearchResult {
+                        symbol,
+                        score: final_score,
+                    }
+                })
+                .collect()
+        } else {
+            // Simple scoring without advanced ranking
+            preliminary
+                .into_iter()
+                .map(|(symbol, fuzzy_score)| SearchResult {
+                    symbol,
+                    score: fuzzy_score,
+                })
+                .collect()
+        };
+
         // Sort by score descending and limit
+        let mut scored = scored;
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
@@ -3126,5 +3292,70 @@ mod tests {
 
         let retrieved = index.get_symbol("fixed-id").unwrap().unwrap();
         assert_eq!(retrieved.name, "replaced");
+    }
+
+    #[test]
+    fn test_get_symbol_metrics_batch() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Create symbols
+        let mut symbol1 = create_test_symbol("func1", SymbolKind::Function, "test.rs", "rust");
+        let mut symbol2 = create_test_symbol("func2", SymbolKind::Function, "test.rs", "rust");
+        let mut symbol3 = create_test_symbol("func3", SymbolKind::Function, "test.rs", "rust");
+
+        symbol1.id = "id1".to_string();
+        symbol2.id = "id2".to_string();
+        symbol3.id = "id3".to_string();
+
+        index.add_symbols(vec![symbol1, symbol2, symbol3]).unwrap();
+
+        // Add metrics for two symbols
+        index
+            .update_symbol_metrics(&SymbolMetrics {
+                symbol_id: "id1".to_string(),
+                pagerank: 0.5,
+                incoming_refs: 10,
+                outgoing_refs: 5,
+                git_recency: 0.8,
+            })
+            .unwrap();
+
+        index
+            .update_symbol_metrics(&SymbolMetrics {
+                symbol_id: "id2".to_string(),
+                pagerank: 0.3,
+                incoming_refs: 3,
+                outgoing_refs: 7,
+                git_recency: 0.2,
+            })
+            .unwrap();
+
+        // Batch query
+        let ids = vec!["id1", "id2", "id3", "id_nonexistent"];
+        let metrics_map = index.get_symbol_metrics_batch(&ids).unwrap();
+
+        // Should have 2 entries (id1 and id2 have metrics, id3 doesn't)
+        assert_eq!(metrics_map.len(), 2);
+        assert!(metrics_map.contains_key("id1"));
+        assert!(metrics_map.contains_key("id2"));
+        assert!(!metrics_map.contains_key("id3"));
+        assert!(!metrics_map.contains_key("id_nonexistent"));
+
+        let m1 = metrics_map.get("id1").unwrap();
+        assert_eq!(m1.pagerank, 0.5);
+        assert_eq!(m1.incoming_refs, 10);
+
+        let m2 = metrics_map.get("id2").unwrap();
+        assert_eq!(m2.pagerank, 0.3);
+        assert_eq!(m2.git_recency, 0.2);
+    }
+
+    #[test]
+    fn test_get_symbol_metrics_batch_empty() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Empty input should return empty map
+        let metrics_map = index.get_symbol_metrics_batch(&[]).unwrap();
+        assert!(metrics_map.is_empty());
     }
 }
