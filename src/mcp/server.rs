@@ -436,6 +436,261 @@ impl McpServer {
 
         Ok(serde_json::to_string_pretty(&info).unwrap_or_default())
     }
+
+    // === Summary-First Contract Implementation ===
+
+    fn get_context_bundle_impl(
+        &self,
+        params: GetContextBundleParams,
+    ) -> crate::error::Result<crate::index::ResponseEnvelope<ContextBundle>> {
+        use crate::index::{
+            CodeIndex, CountsInfo, NextAction, OutputFormat, PaginationCursor, ResponseEnvelope,
+            SearchOptions,
+        };
+        use std::collections::HashMap;
+
+        let input = params.input.unwrap_or_default();
+        let budget = params.budget.unwrap_or_default();
+        let format = params
+            .format
+            .as_deref()
+            .and_then(OutputFormat::from_str)
+            .unwrap_or(OutputFormat::Minimal);
+
+        let max_items = budget.max_items.unwrap_or(20);
+        let sample_k = budget.sample_k.unwrap_or(5);
+        let include_snippets = budget.include_snippets.unwrap_or(false);
+        let _snippet_lines = budget.snippet_lines.unwrap_or(3);
+
+        let mut symbol_cards: Vec<SymbolCard> = Vec::new();
+        let mut top_usages: Vec<UsageRef> = Vec::new();
+        let mut call_neighborhood: Option<CallNeighborhood> = None;
+        let mut imports_relevant: Vec<RelevantImport> = Vec::new();
+        let mut next_actions: Vec<NextAction> = Vec::new();
+
+        // Search by query if provided
+        if let Some(ref query) = input.query {
+            let options = SearchOptions {
+                limit: Some(max_items),
+                current_file: input.file.clone(),
+                use_advanced_ranking: Some(true),
+                ..Default::default()
+            };
+
+            let results = self.index.search(query, &options)?;
+
+            // Build symbol cards
+            for (rank, result) in results.iter().enumerate() {
+                let symbol = &result.symbol;
+                let stable_id = symbol.compute_stable_id(None);
+
+                let card = SymbolCard {
+                    id: stable_id,
+                    fqdn: symbol.fqdn.clone(),
+                    kind: symbol.kind.as_str().to_string(),
+                    sig: symbol.signature.clone(),
+                    loc: format!(
+                        "{}:{}",
+                        symbol.location.file_path, symbol.location.start_line
+                    ),
+                    rank: (rank + 1) as u32,
+                    snippet: if include_snippets {
+                        // TODO: Load snippet from file
+                        None
+                    } else {
+                        None
+                    },
+                };
+                symbol_cards.push(card);
+            }
+
+            // Get top usages (diversified: 1-2 per file)
+            if !symbol_cards.is_empty() {
+                let first_symbol_name = &results[0].symbol.name;
+                if let Ok(refs) = self.index.find_references(first_symbol_name, &SearchOptions::default()) {
+                    let mut files_seen: HashMap<String, usize> = HashMap::new();
+                    for r in refs.iter().take(10) {
+                        let count = files_seen.entry(r.file_path.clone()).or_insert(0);
+                        if *count < 2 {
+                            top_usages.push(UsageRef {
+                                file: r.file_path.clone(),
+                                line: r.line,
+                                context: None,
+                                kind: r.kind.as_str().to_string(),
+                            });
+                            *count += 1;
+                        }
+                    }
+                }
+            }
+
+            // Suggest next actions if more results available
+            if results.len() == max_items {
+                let cursor = PaginationCursor::from_offset(max_items);
+                next_actions.push(
+                    NextAction::new(
+                        "get_context_bundle",
+                        serde_json::json!({
+                            "input": { "query": query },
+                            "cursor": cursor.encode()
+                        }),
+                    )
+                    .with_hint("Load more results"),
+                );
+            }
+        }
+
+        // Lookup by symbol IDs if provided
+        if let Some(ref ids) = input.symbol_ids {
+            for sid in ids.iter().take(max_items) {
+                // Try stable_id first, then regular id
+                let symbol = if sid.starts_with("sid:") {
+                    self.index.get_symbol_by_stable_id(sid)?
+                } else {
+                    self.index.get_symbol(sid)?
+                };
+
+                if let Some(symbol) = symbol {
+                    let stable_id = symbol.compute_stable_id(None);
+                    let card = SymbolCard {
+                        id: stable_id,
+                        fqdn: symbol.fqdn.clone(),
+                        kind: symbol.kind.as_str().to_string(),
+                        sig: symbol.signature.clone(),
+                        loc: format!(
+                            "{}:{}",
+                            symbol.location.file_path, symbol.location.start_line
+                        ),
+                        rank: (symbol_cards.len() + 1) as u32,
+                        snippet: None,
+                    };
+                    symbol_cards.push(card);
+                }
+            }
+        }
+
+        // Get call neighborhood for first symbol
+        if !symbol_cards.is_empty() {
+            if let Some(first_card) = symbol_cards.first() {
+                // Find symbol by ID to get its name
+                let symbol_name = if let Some(ref query) = input.query {
+                    query.clone()
+                } else {
+                    first_card.id.clone()
+                };
+
+                let mut callers = Vec::new();
+                let mut callees = Vec::new();
+
+                // Get callers
+                if let Ok(refs) = self.index.find_callers(&symbol_name, Some(1)) {
+                    for r in refs.iter().take(5) {
+                        callers.push(CallRef {
+                            name: r.symbol_name.clone(),
+                            id: r.symbol_id.clone(),
+                            loc: format!("{}:{}", r.file_path, r.line),
+                            confidence: "certain".to_string(),
+                        });
+                    }
+                }
+
+                // Get callees
+                if let Ok(refs) = self.index.find_callees(&symbol_name) {
+                    for r in refs.iter().take(5) {
+                        callees.push(CallRef {
+                            name: r.symbol_name.clone(),
+                            id: r.symbol_id.clone(),
+                            loc: format!("{}:{}", r.file_path, r.line),
+                            confidence: "certain".to_string(),
+                        });
+                    }
+                }
+
+                if !callers.is_empty() || !callees.is_empty() {
+                    call_neighborhood = Some(CallNeighborhood { callers, callees });
+                }
+            }
+        }
+
+        // Get relevant imports for current file
+        if let Some(ref file) = input.file {
+            if let Ok(imports) = self.index.get_file_imports(file) {
+                for imp in imports.iter().take(10) {
+                    imports_relevant.push(RelevantImport {
+                        path: imp.imported_path.clone().unwrap_or_default(),
+                        symbol: imp.imported_symbol.clone(),
+                        from_file: imp.file_path.clone(),
+                    });
+                }
+            }
+        }
+
+        // Build the bundle
+        let bundle = ContextBundle {
+            symbol_cards: symbol_cards.clone(),
+            top_usages,
+            call_neighborhood,
+            imports_relevant,
+        };
+
+        // Build response envelope
+        let total = symbol_cards.len();
+        let truncated = total >= max_items;
+
+        let envelope = if truncated {
+            let sample: Vec<ContextBundle> = vec![bundle.clone()];
+            let counts = CountsInfo::new(total, sample_k.min(total));
+            ResponseEnvelope::truncated(sample, counts, None)
+        } else {
+            ResponseEnvelope::with_items(vec![bundle], format)
+        };
+
+        Ok(envelope.with_next(next_actions))
+    }
+}
+
+// === Helper Functions for Envelope Support ===
+
+/// Wrap a value in ResponseEnvelope for backward compatibility
+///
+/// Usage: `wrap_in_envelope(results, envelope_requested)`
+/// If `envelope_requested` is true, wraps in envelope; otherwise returns raw JSON
+#[allow(dead_code)]
+pub fn wrap_in_envelope<T: serde::Serialize + Clone>(
+    items: Vec<T>,
+    use_envelope: bool,
+    format: crate::index::OutputFormat,
+) -> String {
+    if use_envelope {
+        let envelope = crate::index::ResponseEnvelope::with_items(items, format);
+        serde_json::to_string_pretty(&envelope).unwrap_or_default()
+    } else {
+        serde_json::to_string_pretty(&items).unwrap_or_default()
+    }
+}
+
+/// Wrap a single value in ResponseEnvelope
+#[allow(dead_code)]
+pub fn wrap_single_in_envelope<T: serde::Serialize + Clone>(
+    item: T,
+    use_envelope: bool,
+    format: crate::index::OutputFormat,
+) -> String {
+    if use_envelope {
+        let envelope = crate::index::ResponseEnvelope::with_items(vec![item], format);
+        serde_json::to_string_pretty(&envelope).unwrap_or_default()
+    } else {
+        serde_json::to_string_pretty(&item).unwrap_or_default()
+    }
+}
+
+/// Extract envelope parameter from request arguments
+#[allow(dead_code)]
+pub fn extract_envelope_param(args: &Option<serde_json::Map<String, serde_json::Value>>) -> bool {
+    args.as_ref()
+        .and_then(|m| m.get("envelope"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn schema_for<T: JsonSchema>() -> Arc<serde_json::Map<String, serde_json::Value>> {
@@ -954,6 +1209,22 @@ impl ServerHandler for McpServer {
                 title: Some("Get Stats".to_string()),
                 description: Some("Get index statistics with optional workspace, dependency, and architecture details.".into()),
                 input_schema: schema_for::<GetStatsParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 13. get_context_bundle - Summary-first AI-agent entry point
+            Tool {
+                name: "get_context_bundle".into(),
+                title: Some("Get Context Bundle".to_string()),
+                description: Some(
+                    "Primary AI-agent entry point. Returns symbol cards, top usages, call neighborhood, \
+                     and relevant imports in a single call. Supports budget constraints for token efficiency. \
+                     Use this instead of multiple search/find calls for better context understanding."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetContextBundleParams>(),
                 output_schema: None,
                 annotations: None,
                 icons: None,
@@ -1581,6 +1852,22 @@ impl ServerHandler for McpServer {
                         }
 
                         let json = serde_json::to_string_pretty(&output).unwrap_or_default();
+                        CallToolResult::success(vec![Content::text(json)])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            // === 13. get_context_bundle (Summary-First Contract) ===
+            "get_context_bundle" => {
+                let params: GetContextBundleParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                match self.get_context_bundle_impl(params) {
+                    Ok(result) => {
+                        let json = serde_json::to_string_pretty(&result).unwrap_or_default();
                         CallToolResult::success(vec![Content::text(json)])
                     }
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),

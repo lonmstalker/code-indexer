@@ -6,8 +6,9 @@ use crate::dependencies::{Dependency, Ecosystem, ProjectInfo, SymbolSource};
 use crate::error::Result;
 use crate::index::{
     CallConfidence, CallGraph, CallGraphEdge, CallGraphNode, CodeIndex, DeadCodeReport, FileImport,
-    FunctionMetrics, ImportType, IndexStats, ReferenceKind, Scope, ScopeKind, SearchOptions,
-    SearchResult, Symbol, SymbolKind, SymbolMetrics, SymbolReference, UncertaintyReason, Visibility,
+    FunctionMetrics, ImportType, IndexStats, PaginationCursor, ReferenceKind, Scope, ScopeKind,
+    SearchOptions, SearchResult, Symbol, SymbolKind, SymbolMetrics, SymbolReference,
+    UncertaintyReason, Visibility,
 };
 use crate::indexer::ExtractionResult;
 
@@ -242,6 +243,30 @@ impl SqliteIndex {
             )?;
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_symbols_fqdn ON symbols(fqdn)",
+                [],
+            )?;
+        }
+
+        // Add stable_id column if it doesn't exist (for summary-first contract)
+        let has_stable_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('symbols') WHERE name = 'stable_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_stable_id {
+            conn.execute("ALTER TABLE symbols ADD COLUMN stable_id TEXT", [])?;
+            // Unique index for stable_id
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_stable_id ON symbols(stable_id)",
+                [],
+            )?;
+            // Composite index for cursor-based pagination: (kind, file_path, start_line, id)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_symbols_cursor ON symbols(kind, file_path, start_line, id)",
                 [],
             )?;
         }
@@ -1210,6 +1235,241 @@ impl SqliteIndex {
         results.truncate(limit);
 
         Ok(results)
+    }
+
+    // === Summary-First Contract Methods ===
+
+    /// Search with cursor-based pagination for deterministic results
+    ///
+    /// Uses sorting: (score DESC, kind, file_path, start_line, stable_id)
+    /// Returns results after the cursor position.
+    pub fn search_paginated(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        cursor: Option<&PaginationCursor>,
+        include_total: bool,
+    ) -> Result<(Vec<SearchResult>, Option<usize>)> {
+        let limit = options.limit.unwrap_or(20);
+        let conn = self.conn.lock().unwrap();
+        let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
+
+        // Build base query
+        let mut sql = String::from(
+            r#"
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent, s.stable_id,
+                   bm25(symbols_fts) as score
+            FROM symbols s
+            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
+            WHERE symbols_fts MATCH ?1
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query.clone())];
+
+        // Apply filters
+        if let Some(ref kinds) = options.kind_filter {
+            let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(",")));
+            for kind in kinds {
+                params_vec.push(Box::new(kind.as_str().to_string()));
+            }
+        }
+
+        if let Some(ref langs) = options.language_filter {
+            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.language IN ({})", placeholders.join(",")));
+            for lang in langs {
+                params_vec.push(Box::new(lang.clone()));
+            }
+        }
+
+        if let Some(ref file) = options.file_filter {
+            sql.push_str(" AND s.file_path LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", file)));
+        }
+
+        // Apply cursor for pagination (keyset pagination)
+        if let Some(cur) = cursor {
+            if let (Some(score), Some(kind), Some(file), Some(line)) =
+                (&cur.score, &cur.kind, &cur.file, &cur.line)
+            {
+                sql.push_str(
+                    r#" AND (
+                    -bm25(symbols_fts) < ?
+                    OR (-bm25(symbols_fts) = ? AND s.kind > ?)
+                    OR (-bm25(symbols_fts) = ? AND s.kind = ? AND s.file_path > ?)
+                    OR (-bm25(symbols_fts) = ? AND s.kind = ? AND s.file_path = ? AND s.start_line > ?)
+                )"#,
+                );
+                // score (inverted for bm25)
+                params_vec.push(Box::new(*score));
+                params_vec.push(Box::new(*score));
+                params_vec.push(Box::new(kind.clone()));
+                params_vec.push(Box::new(*score));
+                params_vec.push(Box::new(kind.clone()));
+                params_vec.push(Box::new(file.clone()));
+                params_vec.push(Box::new(*score));
+                params_vec.push(Box::new(kind.clone()));
+                params_vec.push(Box::new(file.clone()));
+                params_vec.push(Box::new(*line));
+            } else if let Some(offset) = cur.offset {
+                // Fallback to offset-based pagination
+                sql.push_str(&format!(" OFFSET {}", offset));
+            }
+        }
+
+        // Deterministic ordering
+        sql.push_str(
+            " ORDER BY -bm25(symbols_fts) DESC, s.kind ASC, s.file_path ASC, s.start_line ASC, s.id ASC",
+        );
+        sql.push_str(&format!(" LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let results: Vec<SearchResult> = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let symbol = Self::symbol_from_row(row)?;
+                let score: f64 = row.get(14)?;
+                Ok(SearchResult {
+                    symbol,
+                    score: -score,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Optionally count total
+        let total = if include_total {
+            let count_sql = format!(
+                r#"
+                SELECT COUNT(*)
+                FROM symbols s
+                JOIN symbols_fts ON s.rowid = symbols_fts.rowid
+                WHERE symbols_fts MATCH ?1
+                "#
+            );
+            let count: i64 = conn.query_row(&count_sql, params![fts_query], |row| row.get(0))?;
+            Some(count as usize)
+        } else {
+            None
+        };
+
+        Ok((results, total))
+    }
+
+    /// Search excluding specific file paths (for overlay-priority search)
+    pub fn search_excluding_files(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        exclude_files: &[String],
+    ) -> Result<Vec<SearchResult>> {
+        if exclude_files.is_empty() {
+            return CodeIndex::search(self, query, options);
+        }
+
+        let limit = options.limit.unwrap_or(100);
+        let conn = self.conn.lock().unwrap();
+        let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
+
+        let mut sql = String::from(
+            r#"
+            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
+                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
+                   s.doc_comment, s.parent,
+                   bm25(symbols_fts) as score
+            FROM symbols s
+            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
+            WHERE symbols_fts MATCH ?1
+            "#,
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+
+        // Exclude files
+        let placeholders: Vec<String> = exclude_files.iter().map(|_| "?".to_string()).collect();
+        sql.push_str(&format!(
+            " AND s.file_path NOT IN ({})",
+            placeholders.join(",")
+        ));
+        for file in exclude_files {
+            params_vec.push(Box::new(file.clone()));
+        }
+
+        // Apply other filters
+        if let Some(ref kinds) = options.kind_filter {
+            let placeholders: Vec<String> = kinds.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(",")));
+            for kind in kinds {
+                params_vec.push(Box::new(kind.as_str().to_string()));
+            }
+        }
+
+        if let Some(ref langs) = options.language_filter {
+            let placeholders: Vec<String> = langs.iter().map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND s.language IN ({})", placeholders.join(",")));
+            for lang in langs {
+                params_vec.push(Box::new(lang.clone()));
+            }
+        }
+
+        if let Some(ref file) = options.file_filter {
+            sql.push_str(" AND s.file_path LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", file)));
+        }
+
+        sql.push_str(&format!(" ORDER BY score LIMIT {}", limit));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let results: Vec<SearchResult> = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let symbol = Self::symbol_from_row(row)?;
+                let score: f64 = row.get(13)?;
+                Ok(SearchResult {
+                    symbol,
+                    score: -score,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get symbol by stable ID
+    pub fn get_symbol_by_stable_id(&self, stable_id: &str) -> Result<Option<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                   language, visibility, signature, doc_comment, parent
+            FROM symbols WHERE stable_id = ?1
+            "#,
+        )?;
+
+        let symbol = stmt
+            .query_row(params![stable_id], Self::symbol_from_row)
+            .optional()?;
+
+        Ok(symbol)
+    }
+
+    /// Update stable_id for a symbol
+    pub fn update_stable_id(&self, symbol_id: &str, stable_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE symbols SET stable_id = ?1 WHERE id = ?2",
+            params![stable_id, symbol_id],
+        )?;
+        Ok(())
     }
 }
 

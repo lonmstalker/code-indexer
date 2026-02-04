@@ -178,6 +178,140 @@ impl DocumentOverlay {
         let docs = self.documents.read().unwrap();
         docs.get(path).map(|d| d.dirty).unwrap_or(false)
     }
+
+    // === Summary-First Contract: Overlay-Priority Methods ===
+
+    /// Search symbols with overlay priority
+    ///
+    /// 1. First searches in overlay documents
+    /// 2. Then searches in DB excluding overlay file paths
+    /// 3. Merges results with overlay symbols having priority
+    pub fn search_with_overlay(
+        &self,
+        query: &str,
+        db_index: &crate::index::sqlite::SqliteIndex,
+        options: &crate::index::SearchOptions,
+    ) -> crate::error::Result<Vec<crate::index::SearchResult>> {
+        let query_lower = query.to_lowercase();
+        let limit = options.limit.unwrap_or(20);
+
+        // Collect overlay file paths
+        let overlay_paths = self.all_paths();
+
+        // Search in overlay symbols
+        let mut overlay_results: Vec<crate::index::SearchResult> = {
+            let docs = self.documents.read().unwrap();
+            docs.values()
+                .flat_map(|doc| {
+                    doc.symbols.iter().filter_map(|sym| {
+                        // Simple name matching for overlay
+                        let name_lower = sym.name.to_lowercase();
+                        if name_lower.contains(&query_lower) || name_lower.starts_with(&query_lower)
+                        {
+                            // Calculate simple score based on match quality
+                            let score = if name_lower == query_lower {
+                                1.0
+                            } else if name_lower.starts_with(&query_lower) {
+                                0.9
+                            } else {
+                                0.7
+                            };
+                            Some(crate::index::SearchResult {
+                                symbol: sym.clone(),
+                                score,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        // Sort overlay results by score
+        overlay_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // If we have enough from overlay, return early
+        if overlay_results.len() >= limit {
+            overlay_results.truncate(limit);
+            return Ok(overlay_results);
+        }
+
+        // Search DB excluding overlay files
+        let remaining_limit = limit - overlay_results.len();
+        let mut db_options = options.clone();
+        db_options.limit = Some(remaining_limit);
+
+        let db_results = db_index.search_excluding_files(query, &db_options, &overlay_paths)?;
+
+        // Merge results: overlay first, then DB
+        overlay_results.extend(db_results);
+        overlay_results.truncate(limit);
+
+        Ok(overlay_results)
+    }
+
+    /// Get symbol with overlay priority
+    ///
+    /// Checks overlay first, falls back to database if not found
+    pub fn get_symbol_with_overlay(
+        &self,
+        symbol_id: &str,
+        db_index: &crate::index::sqlite::SqliteIndex,
+    ) -> crate::error::Result<Option<Symbol>> {
+        // First check overlay documents for a symbol with this ID
+        {
+            let docs = self.documents.read().unwrap();
+            for doc in docs.values() {
+                if let Some(sym) = doc.symbols.iter().find(|s| s.id == symbol_id) {
+                    return Ok(Some(sym.clone()));
+                }
+            }
+        }
+
+        // Fall back to database
+        use crate::index::CodeIndex;
+        db_index.get_symbol(symbol_id)
+    }
+
+    /// Get symbol at a specific file position with overlay priority
+    pub fn get_symbol_at_position(
+        &self,
+        file_path: &str,
+        line: u32,
+        column: u32,
+    ) -> Option<Symbol> {
+        let docs = self.documents.read().unwrap();
+        if let Some(doc) = docs.get(file_path) {
+            // Find symbol that contains this position
+            doc.symbols.iter().find(|s| {
+                s.location.file_path == file_path
+                    && s.location.start_line <= line
+                    && s.location.end_line >= line
+                    && (s.location.start_line != line || s.location.start_column <= column)
+                    && (s.location.end_line != line || s.location.end_column >= column)
+            }).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Get all overlay symbols matching a name pattern
+    pub fn find_symbols_by_name(&self, name: &str) -> Vec<Symbol> {
+        let name_lower = name.to_lowercase();
+        let docs = self.documents.read().unwrap();
+        docs.values()
+            .flat_map(|doc| {
+                doc.symbols.iter().filter(|s| {
+                    s.name.to_lowercase() == name_lower
+                }).cloned()
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

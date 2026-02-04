@@ -1,4 +1,282 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+
+// =====================================================
+// Response Envelope Types (Summary-First Contract)
+// =====================================================
+
+/// Unified response envelope for all MCP tool responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseEnvelope<T> {
+    /// Response metadata
+    pub meta: ResponseMeta,
+    /// Full items (when within budget)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<T>>,
+    /// Sample items (when response is truncated)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample: Option<Vec<T>>,
+    /// Suggested next actions for the AI agent
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<NextAction>,
+}
+
+impl<T> ResponseEnvelope<T> {
+    /// Creates a new envelope with items
+    pub fn with_items(items: Vec<T>, format: OutputFormat) -> Self {
+        Self {
+            meta: ResponseMeta {
+                format,
+                truncated: false,
+                budget: None,
+                counts: None,
+                next_cursor: None,
+                warnings: Vec::new(),
+            },
+            items: Some(items),
+            sample: None,
+            next: Vec::new(),
+        }
+    }
+
+    /// Creates a new envelope with truncated response
+    pub fn truncated(sample: Vec<T>, counts: CountsInfo, next_cursor: Option<String>) -> Self {
+        Self {
+            meta: ResponseMeta {
+                format: OutputFormat::Minimal,
+                truncated: true,
+                budget: None,
+                counts: Some(counts),
+                next_cursor,
+                warnings: Vec::new(),
+            },
+            items: None,
+            sample: Some(sample),
+            next: Vec::new(),
+        }
+    }
+
+    /// Sets the format
+    pub fn with_format(mut self, format: OutputFormat) -> Self {
+        self.meta.format = format;
+        self
+    }
+
+    /// Sets budget info
+    pub fn with_budget(mut self, budget: BudgetInfo) -> Self {
+        self.meta.budget = Some(budget);
+        self
+    }
+
+    /// Sets counts info
+    pub fn with_counts(mut self, counts: CountsInfo) -> Self {
+        self.meta.counts = Some(counts);
+        self
+    }
+
+    /// Adds a warning
+    pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
+        self.meta.warnings.push(warning.into());
+        self
+    }
+
+    /// Adds next actions
+    pub fn with_next(mut self, next: Vec<NextAction>) -> Self {
+        self.next = next;
+        self
+    }
+
+    /// Sets the next cursor for pagination
+    pub fn with_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.meta.next_cursor = Some(cursor.into());
+        self
+    }
+}
+
+/// Metadata for response envelope
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseMeta {
+    /// Output format used
+    pub format: OutputFormat,
+    /// Whether the response was truncated due to budget
+    pub truncated: bool,
+    /// Budget information (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetInfo>,
+    /// Counts information (for truncated responses)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts: Option<CountsInfo>,
+    /// Cursor for next page (if paginated)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Warnings to display
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Budget information for response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetInfo {
+    /// Maximum items requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<usize>,
+    /// Maximum bytes requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// Approximate tokens used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approx_tokens: Option<usize>,
+    /// Actual bytes returned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_bytes: Option<usize>,
+}
+
+impl Default for BudgetInfo {
+    fn default() -> Self {
+        Self {
+            max_items: None,
+            max_bytes: None,
+            approx_tokens: None,
+            actual_bytes: None,
+        }
+    }
+}
+
+/// Counts information for truncated responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountsInfo {
+    /// Total matching items
+    pub total: usize,
+    /// Items returned in this response
+    pub returned: usize,
+    /// Items by kind (e.g., {"function": 10, "struct": 5})
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub by_kind: std::collections::HashMap<String, usize>,
+}
+
+impl CountsInfo {
+    pub fn new(total: usize, returned: usize) -> Self {
+        Self {
+            total,
+            returned,
+            by_kind: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_by_kind(mut self, by_kind: std::collections::HashMap<String, usize>) -> Self {
+        self.by_kind = by_kind;
+        self
+    }
+}
+
+/// Suggested next action for AI agent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NextAction {
+    /// Tool to call
+    pub tool: String,
+    /// Suggested arguments
+    pub args: serde_json::Value,
+    /// Human-readable hint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl NextAction {
+    pub fn new(tool: impl Into<String>, args: serde_json::Value) -> Self {
+        Self {
+            tool: tool.into(),
+            args,
+            hint: None,
+        }
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+// =====================================================
+// Pagination Cursor
+// =====================================================
+
+/// Cursor for deterministic pagination
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginationCursor {
+    /// Last seen score (for relevance sorting)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    /// Last seen kind
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Last seen file path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Last seen line number
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Last seen stable ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    /// Offset for simple pagination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+}
+
+impl PaginationCursor {
+    /// Creates a new cursor from a search result
+    pub fn from_search_result(result: &SearchResult, stable_id: Option<String>) -> Self {
+        Self {
+            score: Some(result.score),
+            kind: Some(result.symbol.kind.as_str().to_string()),
+            file: Some(result.symbol.location.file_path.clone()),
+            line: Some(result.symbol.location.start_line),
+            stable_id,
+            offset: None,
+        }
+    }
+
+    /// Creates a simple offset-based cursor
+    pub fn from_offset(offset: usize) -> Self {
+        Self {
+            score: None,
+            kind: None,
+            file: None,
+            line: None,
+            stable_id: None,
+            offset: Some(offset),
+        }
+    }
+
+    /// Encodes cursor to base64 string
+    pub fn encode(&self) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        URL_SAFE_NO_PAD.encode(json.as_bytes())
+    }
+
+    /// Decodes cursor from base64 string
+    pub fn decode(encoded: &str) -> Option<Self> {
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+        let json = String::from_utf8(bytes).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+}
+
+impl Default for PaginationCursor {
+    fn default() -> Self {
+        Self {
+            score: None,
+            kind: None,
+            file: None,
+            line: None,
+            stable_id: None,
+            offset: None,
+        }
+    }
+}
 
 /// Output format for search results
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -275,6 +553,52 @@ impl Symbol {
     pub fn with_fqdn(mut self, fqdn: impl Into<String>) -> Self {
         self.fqdn = Some(fqdn.into());
         self
+    }
+
+    /// Computes a stable identifier for this symbol
+    ///
+    /// The stable ID is deterministic and based on:
+    /// - workspace (optional prefix)
+    /// - language
+    /// - fqdn (or name if fqdn is not available)
+    /// - kind
+    /// - normalized signature (without whitespace variations)
+    ///
+    /// Format: `sid:{16-char hex hash}`
+    pub fn compute_stable_id(&self, workspace: Option<&str>) -> String {
+        let mut hasher = DefaultHasher::new();
+
+        // Include workspace if provided
+        if let Some(ws) = workspace {
+            ws.hash(&mut hasher);
+        }
+
+        // Include language
+        self.language.hash(&mut hasher);
+
+        // Include fqdn or name
+        if let Some(ref fqdn) = self.fqdn {
+            fqdn.hash(&mut hasher);
+        } else {
+            self.name.hash(&mut hasher);
+        }
+
+        // Include kind
+        self.kind.as_str().hash(&mut hasher);
+
+        // Include normalized signature (remove extra whitespace)
+        if let Some(ref sig) = self.signature {
+            let normalized: String = sig.split_whitespace().collect::<Vec<_>>().join(" ");
+            normalized.hash(&mut hasher);
+        }
+
+        format!("sid:{:016x}", hasher.finish())
+    }
+
+    /// Returns the stable ID if it was pre-computed, or computes it
+    pub fn get_or_compute_stable_id(&self, workspace: Option<&str>) -> String {
+        // For now, always compute. In the future, we could cache this.
+        self.compute_stable_id(workspace)
     }
 }
 
@@ -972,5 +1296,148 @@ mod tests {
         assert_eq!(symbol.kind, parsed.kind);
         assert_eq!(symbol.location, parsed.location);
         assert_eq!(symbol.visibility, parsed.visibility);
+    }
+
+    // === ResponseEnvelope tests ===
+
+    #[test]
+    fn test_response_envelope_with_items() {
+        let items = vec!["item1".to_string(), "item2".to_string()];
+        let envelope = ResponseEnvelope::with_items(items.clone(), OutputFormat::Full);
+
+        assert!(!envelope.meta.truncated);
+        assert_eq!(envelope.items, Some(items));
+        assert!(envelope.sample.is_none());
+    }
+
+    #[test]
+    fn test_response_envelope_truncated() {
+        let sample = vec!["sample1".to_string()];
+        let counts = CountsInfo::new(100, 1);
+        let envelope: ResponseEnvelope<String> =
+            ResponseEnvelope::truncated(sample.clone(), counts, Some("cursor123".to_string()));
+
+        assert!(envelope.meta.truncated);
+        assert!(envelope.items.is_none());
+        assert_eq!(envelope.sample, Some(sample));
+        assert_eq!(envelope.meta.next_cursor, Some("cursor123".to_string()));
+    }
+
+    #[test]
+    fn test_response_envelope_serialization() {
+        let envelope = ResponseEnvelope::with_items(vec!["test".to_string()], OutputFormat::Compact)
+            .with_warning("Test warning");
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: ResponseEnvelope<String> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(envelope.meta.format, parsed.meta.format);
+        assert_eq!(envelope.meta.warnings, parsed.meta.warnings);
+    }
+
+    // === PaginationCursor tests ===
+
+    #[test]
+    fn test_pagination_cursor_encode_decode() {
+        let cursor = PaginationCursor {
+            score: Some(0.95),
+            kind: Some("function".to_string()),
+            file: Some("test.rs".to_string()),
+            line: Some(42),
+            stable_id: Some("sid:1234567890abcdef".to_string()),
+            offset: None,
+        };
+
+        let encoded = cursor.encode();
+        let decoded = PaginationCursor::decode(&encoded).unwrap();
+
+        assert_eq!(cursor.score, decoded.score);
+        assert_eq!(cursor.kind, decoded.kind);
+        assert_eq!(cursor.file, decoded.file);
+        assert_eq!(cursor.line, decoded.line);
+        assert_eq!(cursor.stable_id, decoded.stable_id);
+    }
+
+    #[test]
+    fn test_pagination_cursor_from_offset() {
+        let cursor = PaginationCursor::from_offset(50);
+        assert_eq!(cursor.offset, Some(50));
+        assert!(cursor.score.is_none());
+    }
+
+    #[test]
+    fn test_pagination_cursor_invalid_decode() {
+        assert!(PaginationCursor::decode("invalid-base64!!!").is_none());
+        assert!(PaginationCursor::decode("").is_none());
+    }
+
+    // === Stable ID tests ===
+
+    #[test]
+    fn test_symbol_stable_id_deterministic() {
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+        let symbol = Symbol::new("my_func", SymbolKind::Function, loc, "rust")
+            .with_signature("fn my_func(x: i32) -> i32");
+
+        let sid1 = symbol.compute_stable_id(Some("workspace"));
+        let sid2 = symbol.compute_stable_id(Some("workspace"));
+
+        assert_eq!(sid1, sid2);
+        assert!(sid1.starts_with("sid:"));
+        assert_eq!(sid1.len(), 20); // "sid:" + 16 hex chars
+    }
+
+    #[test]
+    fn test_symbol_stable_id_different_for_different_symbols() {
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+
+        let symbol1 = Symbol::new("func1", SymbolKind::Function, loc.clone(), "rust");
+        let symbol2 = Symbol::new("func2", SymbolKind::Function, loc, "rust");
+
+        let sid1 = symbol1.compute_stable_id(None);
+        let sid2 = symbol2.compute_stable_id(None);
+
+        assert_ne!(sid1, sid2);
+    }
+
+    #[test]
+    fn test_symbol_stable_id_signature_normalization() {
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+
+        let symbol1 = Symbol::new("func", SymbolKind::Function, loc.clone(), "rust")
+            .with_signature("fn func(x: i32)");
+        let symbol2 = Symbol::new("func", SymbolKind::Function, loc, "rust")
+            .with_signature("fn  func(x:  i32)"); // Extra whitespace
+
+        let sid1 = symbol1.compute_stable_id(None);
+        let sid2 = symbol2.compute_stable_id(None);
+
+        assert_eq!(sid1, sid2); // Should be equal after normalization
+    }
+
+    // === NextAction tests ===
+
+    #[test]
+    fn test_next_action_creation() {
+        let action = NextAction::new("search_symbols", serde_json::json!({"query": "test"}))
+            .with_hint("Search for related symbols");
+
+        assert_eq!(action.tool, "search_symbols");
+        assert_eq!(action.hint, Some("Search for related symbols".to_string()));
+    }
+
+    // === CountsInfo tests ===
+
+    #[test]
+    fn test_counts_info() {
+        let mut by_kind = std::collections::HashMap::new();
+        by_kind.insert("function".to_string(), 10);
+        by_kind.insert("struct".to_string(), 5);
+
+        let counts = CountsInfo::new(100, 15).with_by_kind(by_kind);
+
+        assert_eq!(counts.total, 100);
+        assert_eq!(counts.returned, 15);
+        assert_eq!(counts.by_kind.get("function"), Some(&10));
     }
 }

@@ -1,6 +1,7 @@
 //! Consolidated MCP Tool Parameters and Handlers
 //!
-//! This module contains the consolidated tool parameters for the 12 unified MCP tools.
+//! This module contains the consolidated tool parameters for the 12 unified MCP tools,
+//! plus the summary-first contract types (get_context_bundle).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,9 @@ pub struct ListSymbolsParams {
     /// Output format: "full", "compact", "minimal" (default: "full")
     #[serde(default)]
     pub format: Option<String>,
+    /// Wrap response in ResponseEnvelope (default: false for backward compatibility)
+    #[serde(default)]
+    pub envelope: Option<bool>,
 }
 
 // === 4. search_symbols ===
@@ -97,6 +101,9 @@ pub struct SearchSymbolsParams {
     /// Output format: "full", "compact", "minimal"
     #[serde(default)]
     pub format: Option<String>,
+    /// Wrap response in ResponseEnvelope (default: false for backward compatibility)
+    #[serde(default)]
+    pub envelope: Option<bool>,
 }
 
 // === 5. get_symbol ===
@@ -158,6 +165,9 @@ pub struct ConsolidatedFindReferencesParams {
     /// Maximum number of results
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Wrap response in ResponseEnvelope (default: false)
+    #[serde(default)]
+    pub envelope: Option<bool>,
 }
 
 // === 8. analyze_call_graph ===
@@ -242,5 +252,190 @@ pub struct GetStatsParams {
     /// Include architecture summary
     #[serde(default)]
     pub include_architecture: Option<bool>,
+}
+
+// =====================================================
+// Summary-First Contract: get_context_bundle
+// =====================================================
+
+/// Parameters for get_context_bundle - the primary AI-agent entry point
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GetContextBundleParams {
+    /// Input specifying what context to retrieve
+    #[serde(default)]
+    pub input: Option<ContextInput>,
+    /// Budget constraints for the response
+    #[serde(default)]
+    pub budget: Option<ContextBudget>,
+    /// Output format: "full", "compact", "minimal" (default: "minimal")
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Whether to wrap response in envelope (default: true for this tool)
+    #[serde(default)]
+    pub envelope: Option<bool>,
+}
+
+/// Input specification for context retrieval
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextInput {
+    /// Search query for finding symbols
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Current file path (for locality-aware results)
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Current position in file (line, column)
+    #[serde(default)]
+    pub position: Option<ContextPosition>,
+    /// Specific symbol IDs to retrieve (batch lookup)
+    #[serde(default)]
+    pub symbol_ids: Option<Vec<String>>,
+    /// Hint about the task (helps prioritize results)
+    /// Examples: "refactoring", "debugging", "understanding", "implementing"
+    #[serde(default)]
+    pub task_hint: Option<String>,
+}
+
+/// Position in a file
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextPosition {
+    /// Line number (1-based)
+    pub line: u32,
+    /// Column number (1-based, optional)
+    #[serde(default)]
+    pub column: Option<u32>,
+}
+
+/// Budget constraints for context response
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextBudget {
+    /// Maximum number of items to return (default: 20)
+    #[serde(default)]
+    pub max_items: Option<usize>,
+    /// Maximum response size in bytes
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    /// Approximate token budget (for AI context windows)
+    #[serde(default)]
+    pub approx_tokens: Option<usize>,
+    /// Number of snippet lines to include (0 = no snippets, default: 3)
+    #[serde(default)]
+    pub snippet_lines: Option<usize>,
+    /// Include code snippets in response
+    #[serde(default)]
+    pub include_snippets: Option<bool>,
+    /// Sample size when truncating (default: 5)
+    #[serde(default)]
+    pub sample_k: Option<usize>,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            max_items: Some(20),
+            max_bytes: None,
+            approx_tokens: None,
+            snippet_lines: Some(3),
+            include_snippets: Some(false),
+            sample_k: Some(5),
+        }
+    }
+}
+
+// === Context Bundle Output Types ===
+
+/// A symbol card for compact representation
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SymbolCard {
+    /// Stable identifier
+    pub id: String,
+    /// Fully qualified domain name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fqdn: Option<String>,
+    /// Symbol kind
+    pub kind: String,
+    /// Signature (for functions/methods)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+    /// Location (file:line)
+    pub loc: String,
+    /// Relevance rank (1 = most relevant)
+    pub rank: u32,
+    /// Code snippet (if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// A usage reference (diversified: 1-2 per file/scope)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UsageRef {
+    /// File path
+    pub file: String,
+    /// Line number
+    pub line: u32,
+    /// Context snippet
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Reference kind
+    pub kind: String,
+}
+
+/// Call neighborhood (incoming/outgoing calls)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallNeighborhood {
+    /// Incoming calls (who calls this)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callers: Vec<CallRef>,
+    /// Outgoing calls (what this calls)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callees: Vec<CallRef>,
+}
+
+/// A call reference
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallRef {
+    /// Symbol name
+    pub name: String,
+    /// Symbol ID (if resolved)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Location
+    pub loc: String,
+    /// Confidence: "certain" or "possible"
+    #[serde(default = "default_confidence_str")]
+    pub confidence: String,
+}
+
+fn default_confidence_str() -> String {
+    "certain".to_string()
+}
+
+/// Relevant import
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RelevantImport {
+    /// Imported path/module
+    pub path: String,
+    /// Specific symbol (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Source file
+    pub from_file: String,
+}
+
+/// Full context bundle response
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextBundle {
+    /// Symbol cards (primary results)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbol_cards: Vec<SymbolCard>,
+    /// Top usages (diversified)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_usages: Vec<UsageRef>,
+    /// Call neighborhood
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_neighborhood: Option<CallNeighborhood>,
+    /// Relevant imports
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports_relevant: Vec<RelevantImport>,
 }
 
