@@ -59,6 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
 regex = "1.11"
+strsim = "0.11"
 
 # Performance
 rayon = "1.10"
@@ -69,6 +70,17 @@ tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-cpp = "0.23"
+
+# New language parsers
+tree-sitter-sequel = "0.3"
+tree-sitter-bash = "0.23"
+tree-sitter-lua = "0.4"
+tree-sitter-swift = "0.7"
+tree-sitter-haskell = "0.23"
+tree-sitter-elixir = "0.3"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-hcl = "1.1"
 
 [dev-dependencies]
 tempfile = "3.14"

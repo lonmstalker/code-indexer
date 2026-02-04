@@ -8,6 +8,17 @@ pub mod go;
 pub mod csharp;
 pub mod cpp;
 
+// New language modules
+pub mod sql;
+pub mod bash;
+pub mod lua;
+pub mod swift;
+pub mod haskell;
+pub mod elixir;
+pub mod yaml;
+pub mod toml_lang;
+pub mod hcl;
+
 pub use cross_language::{CrossLanguageAnalyzer, CrossLanguageRef, CrossRefType};
 
 use std::collections::HashMap;
@@ -70,6 +81,17 @@ impl LanguageRegistry {
         registry.register(Arc::new(go::GoGrammar));
         registry.register(Arc::new(csharp::CSharpGrammar));
         registry.register(Arc::new(cpp::CppGrammar));
+
+        // New languages
+        registry.register(Arc::new(sql::SqlGrammar));
+        registry.register(Arc::new(bash::BashGrammar));
+        registry.register(Arc::new(lua::LuaGrammar));
+        registry.register(Arc::new(swift::SwiftGrammar));
+        registry.register(Arc::new(haskell::HaskellGrammar));
+        registry.register(Arc::new(elixir::ElixirGrammar));
+        registry.register(Arc::new(yaml::YamlGrammar));
+        registry.register(Arc::new(toml_lang::TomlGrammar));
+        registry.register(Arc::new(hcl::HclGrammar));
 
         registry
     }
@@ -343,7 +365,16 @@ mod tests {
         assert!(langs.contains(&"go"));
         assert!(langs.contains(&"csharp"));
         assert!(langs.contains(&"cpp"));
-        assert_eq!(langs.len(), 8);
+        assert!(langs.contains(&"sql"));
+        assert!(langs.contains(&"bash"));
+        assert!(langs.contains(&"lua"));
+        assert!(langs.contains(&"swift"));
+        assert!(langs.contains(&"haskell"));
+        assert!(langs.contains(&"elixir"));
+        assert!(langs.contains(&"yaml"));
+        assert!(langs.contains(&"toml"));
+        assert!(langs.contains(&"hcl"));
+        assert_eq!(langs.len(), 17);
     }
 
     #[test]

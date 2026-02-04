@@ -172,7 +172,7 @@ mod tests {
     fn test_walk_directory_with_only_unsupported_files() {
         let temp_dir = TempDir::new().unwrap();
         create_file(temp_dir.path(), "README.md", "# Test");
-        create_file(temp_dir.path(), "config.yaml", "key: value");
+        create_file(temp_dir.path(), "data.json", r#"{"key": "value"}"#);
 
         let walker = create_walker();
         let files = walker.walk(temp_dir.path()).unwrap();
@@ -209,7 +209,66 @@ mod tests {
         assert!(!walker.is_supported(Path::new("file.txt")));
         assert!(!walker.is_supported(Path::new("Makefile")));
         assert!(!walker.is_supported(Path::new("data.json")));
-        assert!(!walker.is_supported(Path::new("config.yaml")));
+        assert!(!walker.is_supported(Path::new("image.png")));
+    }
+
+    #[test]
+    fn test_is_supported_yaml() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("config.yaml")));
+        assert!(walker.is_supported(Path::new("config.yml")));
+    }
+
+    #[test]
+    fn test_is_supported_toml() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("config.toml")));
+    }
+
+    #[test]
+    fn test_is_supported_hcl() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("main.tf")));
+        assert!(walker.is_supported(Path::new("config.hcl")));
+    }
+
+    #[test]
+    fn test_is_supported_sql() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("schema.sql")));
+    }
+
+    #[test]
+    fn test_is_supported_bash() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("script.sh")));
+        assert!(walker.is_supported(Path::new("script.bash")));
+    }
+
+    #[test]
+    fn test_is_supported_lua() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("config.lua")));
+    }
+
+    #[test]
+    fn test_is_supported_swift() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("main.swift")));
+    }
+
+    #[test]
+    fn test_is_supported_haskell() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("main.hs")));
+        assert!(walker.is_supported(Path::new("main.lhs")));
+    }
+
+    #[test]
+    fn test_is_supported_elixir() {
+        let walker = create_walker();
+        assert!(walker.is_supported(Path::new("main.ex")));
+        assert!(walker.is_supported(Path::new("test.exs")));
     }
 
     #[test]
