@@ -1132,6 +1132,10 @@ impl SqliteIndex {
             parent: row.get(12)?,
             scope_id: None, // Not loaded from basic queries
             fqdn: None,     // Not loaded from basic queries
+            // P2 fields - not stored in DB yet, need migration to enable
+            generic_params: Vec::new(),
+            params: Vec::new(),
+            return_type: None,
         })
     }
 
@@ -1159,6 +1163,10 @@ impl SqliteIndex {
             parent: row.get(12)?,
             scope_id: row.get(13).ok(),
             fqdn: row.get(14).ok(),
+            // P2 fields - not stored in DB yet, need migration to enable
+            generic_params: Vec::new(),
+            params: Vec::new(),
+            return_type: None,
         })
     }
 
@@ -1618,6 +1626,52 @@ impl SqliteIndex {
         )?;
         Ok(())
     }
+
+    /// Finds the type of a receiver expression by looking up symbol definitions.
+    /// Returns the parent type name if found.
+    /// This is used for type-aware method resolution.
+    pub fn infer_receiver_type(&self, receiver: &str, file_path: &str) -> Option<String> {
+        // Check if receiver is a known symbol in the same file
+        let conn = self.conn.lock().unwrap();
+
+        // First, try to find a variable or field with this name in the same file
+        let result: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT parent FROM symbols
+                WHERE name = ?1 AND file_path = ?2
+                      AND kind IN ('variable', 'field', 'constant')
+                LIMIT 1
+                "#,
+                params![receiver, file_path],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        if result.is_some() {
+            return result;
+        }
+
+        // Check if receiver is a type name itself (static method call)
+        let type_exists: bool = conn
+            .query_row(
+                r#"
+                SELECT 1 FROM symbols
+                WHERE name = ?1 AND kind IN ('struct', 'class', 'interface', 'trait', 'enum')
+                LIMIT 1
+                "#,
+                params![receiver],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if type_exists {
+            return Some(receiver.to_string());
+        }
+
+        None
+    }
 }
 
 impl CodeIndex for SqliteIndex {
@@ -1964,6 +2018,89 @@ impl CodeIndex for SqliteIndex {
 
         let symbols = stmt
             .query_map(params![name], Self::symbol_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(symbols)
+    }
+
+    /// Finds symbol definitions by name with optional parent type filter.
+    /// This enables type-aware resolution: foo.bar() can be resolved to Type::bar
+    /// instead of finding all methods named "bar".
+    ///
+    /// # Arguments
+    /// * `name` - Symbol name to find
+    /// * `parent_type` - Optional parent type name (e.g., "MyStruct" for methods)
+    /// * `language` - Optional language filter
+    fn find_definition_by_parent(
+        &self,
+        name: &str,
+        parent_type: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<Vec<Symbol>> {
+        let conn = self.conn.lock().unwrap();
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (parent_type, language) {
+            (Some(parent), Some(lang)) => (
+                r#"
+                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                       language, visibility, signature, doc_comment, parent
+                FROM symbols
+                WHERE name = ?1 AND parent = ?2 AND language = ?3
+                      AND kind NOT IN ('import', 'variable')
+                ORDER BY file_path, start_line
+                "#
+                .to_string(),
+                vec![
+                    Box::new(name.to_string()),
+                    Box::new(parent.to_string()),
+                    Box::new(lang.to_string()),
+                ],
+            ),
+            (Some(parent), None) => (
+                r#"
+                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                       language, visibility, signature, doc_comment, parent
+                FROM symbols
+                WHERE name = ?1 AND parent = ?2 AND kind NOT IN ('import', 'variable')
+                ORDER BY file_path, start_line
+                "#
+                .to_string(),
+                vec![
+                    Box::new(name.to_string()),
+                    Box::new(parent.to_string()),
+                ],
+            ),
+            (None, Some(lang)) => (
+                r#"
+                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                       language, visibility, signature, doc_comment, parent
+                FROM symbols
+                WHERE name = ?1 AND language = ?2 AND kind NOT IN ('import', 'variable')
+                ORDER BY file_path, start_line
+                "#
+                .to_string(),
+                vec![
+                    Box::new(name.to_string()),
+                    Box::new(lang.to_string()),
+                ],
+            ),
+            (None, None) => (
+                r#"
+                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                       language, visibility, signature, doc_comment, parent
+                FROM symbols
+                WHERE name = ?1 AND kind NOT IN ('import', 'variable')
+                ORDER BY file_path, start_line
+                "#
+                .to_string(),
+                vec![Box::new(name.to_string())],
+            ),
+        };
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let symbols = stmt
+            .query_map(params_refs.as_slice(), Self::symbol_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(symbols)

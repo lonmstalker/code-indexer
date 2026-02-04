@@ -481,6 +481,99 @@ impl Location {
     }
 }
 
+/// Generic type parameter (e.g., T in `fn foo<T: Clone>()`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenericParam {
+    /// Parameter name (e.g., "T")
+    pub name: String,
+    /// Bounds/constraints (e.g., ["Clone", "Send"])
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounds: Vec<String>,
+    /// Default type if any (e.g., "i32" in `T = i32`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+impl GenericParam {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            bounds: Vec::new(),
+            default: None,
+        }
+    }
+
+    pub fn with_bounds(mut self, bounds: Vec<String>) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    pub fn with_default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+}
+
+/// Structured function parameter
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionParam {
+    /// Parameter name (may be empty for unnamed params like in C)
+    pub name: String,
+    /// Type annotation (e.g., "String", "&mut Vec<i32>")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_annotation: Option<String>,
+    /// Whether parameter is mutable (Rust)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_mutable: bool,
+    /// Whether parameter is self/this
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
+    /// Whether parameter is variadic (...)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_variadic: bool,
+    /// Default value expression if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+}
+
+impl FunctionParam {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            type_annotation: None,
+            is_mutable: false,
+            is_self: false,
+            is_variadic: false,
+            default_value: None,
+        }
+    }
+
+    pub fn with_type(mut self, type_annotation: impl Into<String>) -> Self {
+        self.type_annotation = Some(type_annotation.into());
+        self
+    }
+
+    pub fn mutable(mut self) -> Self {
+        self.is_mutable = true;
+        self
+    }
+
+    pub fn is_self_param(mut self) -> Self {
+        self.is_self = true;
+        self
+    }
+
+    pub fn variadic(mut self) -> Self {
+        self.is_variadic = true;
+        self
+    }
+
+    pub fn with_default(mut self, value: impl Into<String>) -> Self {
+        self.default_value = Some(value.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     /// Internal UUID - skipped in JSON output to save tokens (use stable_id for references)
@@ -504,6 +597,15 @@ pub struct Symbol {
     /// Fully Qualified Domain Name (e.g., "crate::module::Type::method")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fqdn: Option<String>,
+    /// Generic type parameters (e.g., T, E in `Result<T, E>`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generic_params: Vec<GenericParam>,
+    /// Structured function parameters (for functions/methods)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<FunctionParam>,
+    /// Return type for functions/methods
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
 }
 
 impl Symbol {
@@ -525,6 +627,9 @@ impl Symbol {
             parent: None,
             scope_id: None,
             fqdn: None,
+            generic_params: Vec::new(),
+            params: Vec::new(),
+            return_type: None,
         }
     }
 
@@ -540,6 +645,24 @@ impl Symbol {
 
     pub fn with_doc_comment(mut self, doc: impl Into<String>) -> Self {
         self.doc_comment = Some(doc.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_generic_params(mut self, params: Vec<GenericParam>) -> Self {
+        self.generic_params = params;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_params(mut self, params: Vec<FunctionParam>) -> Self {
+        self.params = params;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_return_type(mut self, return_type: impl Into<String>) -> Self {
+        self.return_type = Some(return_type.into());
         self
     }
 
@@ -1334,6 +1457,134 @@ mod tests {
 
         // Minimal JSON should be significantly smaller
         assert!(json_minimal.len() < json_full.len());
+    }
+
+    // === GenericParam tests ===
+
+    #[test]
+    fn test_generic_param_new() {
+        let param = GenericParam::new("T");
+        assert_eq!(param.name, "T");
+        assert!(param.bounds.is_empty());
+        assert!(param.default.is_none());
+    }
+
+    #[test]
+    fn test_generic_param_with_bounds() {
+        let param = GenericParam::new("T")
+            .with_bounds(vec!["Clone".to_string(), "Send".to_string()]);
+        assert_eq!(param.bounds.len(), 2);
+        assert_eq!(param.bounds[0], "Clone");
+    }
+
+    #[test]
+    fn test_generic_param_with_default() {
+        let param = GenericParam::new("T").with_default("i32");
+        assert_eq!(param.default, Some("i32".to_string()));
+    }
+
+    #[test]
+    fn test_generic_param_serialization() {
+        let param = GenericParam::new("T")
+            .with_bounds(vec!["Clone".to_string()])
+            .with_default("String");
+        let json = serde_json::to_string(&param).unwrap();
+        assert!(json.contains("\"name\":\"T\""));
+        assert!(json.contains("\"bounds\""));
+        assert!(json.contains("\"default\""));
+    }
+
+    // === FunctionParam tests ===
+
+    #[test]
+    fn test_function_param_new() {
+        let param = FunctionParam::new("x");
+        assert_eq!(param.name, "x");
+        assert!(param.type_annotation.is_none());
+        assert!(!param.is_mutable);
+        assert!(!param.is_self);
+    }
+
+    #[test]
+    fn test_function_param_with_type() {
+        let param = FunctionParam::new("items")
+            .with_type("Vec<String>");
+        assert_eq!(param.type_annotation, Some("Vec<String>".to_string()));
+    }
+
+    #[test]
+    fn test_function_param_self() {
+        let param = FunctionParam::new("self")
+            .is_self_param()
+            .mutable();
+        assert!(param.is_self);
+        assert!(param.is_mutable);
+    }
+
+    #[test]
+    fn test_function_param_variadic() {
+        let param = FunctionParam::new("args").variadic();
+        assert!(param.is_variadic);
+    }
+
+    #[test]
+    fn test_function_param_with_default() {
+        let param = FunctionParam::new("limit")
+            .with_type("usize")
+            .with_default("100");
+        assert_eq!(param.default_value, Some("100".to_string()));
+    }
+
+    #[test]
+    fn test_function_param_serialization_skips_false_bools() {
+        let param = FunctionParam::new("x").with_type("i32");
+        let json = serde_json::to_string(&param).unwrap();
+        // False booleans should be skipped
+        assert!(!json.contains("is_mutable"));
+        assert!(!json.contains("is_self"));
+        assert!(!json.contains("is_variadic"));
+    }
+
+    // === Symbol with P2 fields tests ===
+
+    #[test]
+    fn test_symbol_with_generic_params() {
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+        let symbol = Symbol::new("Result", SymbolKind::Enum, loc, "rust")
+            .with_generic_params(vec![
+                GenericParam::new("T"),
+                GenericParam::new("E").with_bounds(vec!["Error".to_string()]),
+            ]);
+
+        assert_eq!(symbol.generic_params.len(), 2);
+        assert_eq!(symbol.generic_params[0].name, "T");
+        assert_eq!(symbol.generic_params[1].name, "E");
+    }
+
+    #[test]
+    fn test_symbol_with_params() {
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+        let symbol = Symbol::new("process", SymbolKind::Function, loc, "rust")
+            .with_params(vec![
+                FunctionParam::new("data").with_type("&[u8]"),
+                FunctionParam::new("callback").with_type("impl Fn(u8)"),
+            ])
+            .with_return_type("Result<(), Error>");
+
+        assert_eq!(symbol.params.len(), 2);
+        assert_eq!(symbol.return_type, Some("Result<(), Error>".to_string()));
+    }
+
+    #[test]
+    fn test_symbol_p2_fields_skipped_when_empty() {
+        let loc = Location::new("test.rs", 1, 0, 5, 10);
+        let symbol = Symbol::new("simple", SymbolKind::Function, loc, "rust");
+        let json = serde_json::to_string(&symbol).unwrap();
+
+        // P2 fields should be skipped when empty
+        assert!(!json.contains("generic_params"));
+        assert!(!json.contains("\"params\""));
+        assert!(!json.contains("return_type"));
     }
 
     // === ResponseEnvelope tests ===

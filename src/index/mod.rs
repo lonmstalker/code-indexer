@@ -16,6 +16,15 @@ pub trait CodeIndex: Send + Sync {
     /// Fuzzy search with typo tolerance using Jaro-Winkler similarity
     fn search_fuzzy(&self, query: &str, options: &SearchOptions) -> Result<Vec<SearchResult>>;
     fn find_definition(&self, name: &str) -> Result<Vec<Symbol>>;
+    /// Find definitions with optional parent type filter for type-aware resolution.
+    /// This allows resolving `obj.method()` to the correct `Type::method` instead of
+    /// finding all methods named "method".
+    fn find_definition_by_parent(
+        &self,
+        name: &str,
+        parent_type: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<Vec<Symbol>>;
     fn list_functions(&self, options: &SearchOptions) -> Result<Vec<Symbol>>;
     fn list_types(&self, options: &SearchOptions) -> Result<Vec<Symbol>>;
     fn get_file_symbols(&self, file_path: &str) -> Result<Vec<Symbol>>;
