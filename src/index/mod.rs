@@ -63,4 +63,7 @@ pub trait CodeIndex: Send + Sync {
     // Documentation and configuration digest methods
     /// Get all configuration digests (package.json, Cargo.toml, etc.)
     fn get_all_config_digests(&self) -> Result<Vec<crate::docs::ConfigDigest>>;
+
+    /// Get list of all indexed file paths
+    fn get_indexed_files(&self) -> Result<Vec<String>>;
 }

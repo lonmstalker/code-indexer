@@ -2167,6 +2167,15 @@ impl CodeIndex for SqliteIndex {
         Ok(())
     }
 
+    fn get_indexed_files(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT file_path FROM symbols ORDER BY file_path")?;
+        let files = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(files)
+    }
+
     fn add_references(&self, references: Vec<SymbolReference>) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;

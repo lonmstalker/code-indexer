@@ -4,7 +4,7 @@ mod mcp;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::cli::{Cli, Commands, DepsCommands, QueryCommands};
+use crate::cli::{Cli, Commands, DepsCommands, QueryCommands, TagsCommands};
 
 // Re-export from lib for internal use
 use code_indexer::{error, index, indexer, languages};
@@ -120,6 +120,26 @@ async fn main() -> anyhow::Result<()> {
             }
             DepsCommands::Info { name, path } => {
                 cli::show_dependency_info(&path, &cli.db, &name)?;
+            }
+        },
+        Commands::Tags { command } => match command {
+            TagsCommands::AddRule { tag, pattern, confidence, path } => {
+                cli::add_tag_rule(&path, &tag, &pattern, confidence)?;
+            }
+            TagsCommands::RemoveRule { pattern, path } => {
+                cli::remove_tag_rule(&path, &pattern)?;
+            }
+            TagsCommands::ListRules { path, format } => {
+                cli::list_tag_rules(&path, &format)?;
+            }
+            TagsCommands::Preview { file, path } => {
+                cli::preview_tags(&file, &path)?;
+            }
+            TagsCommands::Apply { path, db } => {
+                cli::apply_tags(&path, &db)?;
+            }
+            TagsCommands::Stats { db } => {
+                cli::show_tag_stats(&db)?;
             }
         },
         // === Legacy commands (deprecated) ===

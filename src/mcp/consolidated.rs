@@ -116,6 +116,9 @@ pub struct SearchSymbolsParams {
     /// Include file metadata (doc1, tags, stability) in results
     #[serde(default)]
     pub include_file_meta: Option<bool>,
+    /// Maximum results per directory for diversification
+    #[serde(default)]
+    pub max_per_directory: Option<usize>,
 }
 
 // === 5. get_symbol ===
@@ -872,5 +875,85 @@ pub struct CloseSessionParams {
 pub struct CloseSessionResponse {
     /// Whether the session was successfully closed
     pub closed: bool,
+}
+
+// =====================================================
+// Tag Management Types
+// =====================================================
+
+/// Parameters for manage_tags tool
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ManageTagsParams {
+    /// Action to perform: "add_rule", "remove_rule", "list_rules", "preview", "apply", "stats"
+    pub action: String,
+    /// Glob pattern (for add_rule/remove_rule)
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Tags to add (for add_rule)
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Confidence score (for add_rule, default: 0.7)
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// File path (for preview action)
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Project path (defaults to current working directory)
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Response for manage_tags
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ManageTagsResponse {
+    /// Whether the action was successful
+    pub success: bool,
+    /// Message describing the result
+    pub message: String,
+    /// List of rules (for list_rules action)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<TagRuleInfo>,
+    /// Preview results (for preview action)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview: Vec<TagPreviewResult>,
+    /// Stats (for stats action)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats: Vec<TagStatInfo>,
+    /// Warnings (e.g., unknown tags)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Information about a tag rule
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TagRuleInfo {
+    /// Glob pattern
+    pub pattern: String,
+    /// Tags that will be applied
+    pub tags: Vec<String>,
+    /// Confidence score
+    pub confidence: f64,
+}
+
+/// Preview result for a single matching rule
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TagPreviewResult {
+    /// Pattern that matched
+    pub pattern: String,
+    /// Tags that would be applied
+    pub tags: Vec<String>,
+    /// Confidence score
+    pub confidence: f64,
+}
+
+/// Tag statistics entry
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TagStatInfo {
+    /// Tag category
+    pub category: String,
+    /// Tag name
+    pub tag: String,
+    /// Number of files with this tag
+    pub count: usize,
 }
 

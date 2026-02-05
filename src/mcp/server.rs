@@ -15,8 +15,33 @@ use tracing::warn;
 
 use crate::index::overlay::DocumentOverlay;
 use crate::index::sqlite::SqliteIndex;
-use crate::index::{CodeIndex, SearchOptions, SymbolKind};
+use crate::index::{CodeIndex, SearchOptions, SearchResult, SymbolKind};
 use crate::mcp::consolidated::*;
+
+/// Diversifies search results by limiting the number of results per directory.
+/// Preserves ordering (results are kept in their original order, just capped per directory).
+fn diversify_by_directory(results: Vec<SearchResult>, max_per_dir: usize) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    let mut dir_counts: HashMap<String, usize> = HashMap::new();
+    let mut diversified = Vec::new();
+
+    for result in results {
+        let dir = Path::new(&result.symbol.location.file_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let count = dir_counts.entry(dir.clone()).or_insert(0);
+        if *count < max_per_dir {
+            *count += 1;
+            diversified.push(result);
+        }
+    }
+
+    diversified
+}
 
 #[derive(Clone)]
 pub struct McpServer {
@@ -217,6 +242,273 @@ impl McpServer {
         let context = ArchitectureAnalyzer::analyze(path, self.index.as_ref())?;
 
         Ok(serde_json::to_string_pretty(&context.architecture).unwrap_or_default())
+    }
+
+    // === Tag Management ===
+
+    fn handle_manage_tags(&self, params: ManageTagsParams) -> Result<ManageTagsResponse, McpError> {
+        use code_indexer::indexer::{
+            apply_tag_rules, preview_tag_rules, resolve_inferred_tags, RootSidecarData, TagRule,
+            SIDECAR_FILENAME,
+        };
+
+        let project_path = params.path.as_deref().unwrap_or(".");
+        let path = Path::new(project_path);
+        let sidecar_path = path.join(SIDECAR_FILENAME);
+
+        match params.action.as_str() {
+            "add_rule" => {
+                let pattern = params.pattern.ok_or_else(|| {
+                    McpError::invalid_params("pattern is required for add_rule", None)
+                })?;
+                let tags = params.tags.ok_or_else(|| {
+                    McpError::invalid_params("tags is required for add_rule", None)
+                })?;
+                let confidence = params.confidence.unwrap_or(0.7);
+
+                // Load or create sidecar
+                let mut data = if sidecar_path.exists() {
+                    let content = fs::read_to_string(&sidecar_path)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    RootSidecarData::parse(&content)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                } else {
+                    RootSidecarData::default()
+                };
+
+                // Check for existing rule
+                if let Some(existing) = data.tag_rules.iter_mut().find(|r| r.pattern == pattern) {
+                    for tag in &tags {
+                        if !existing.tags.contains(tag) {
+                            existing.tags.push(tag.clone());
+                        }
+                    }
+                    existing.confidence = confidence;
+                } else {
+                    data.tag_rules.push(TagRule {
+                        pattern: pattern.clone(),
+                        tags: tags.clone(),
+                        confidence,
+                    });
+                }
+
+                // Save
+                let content = serde_yaml::to_string(&data)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                fs::write(&sidecar_path, content)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(ManageTagsResponse {
+                    success: true,
+                    message: format!("Added rule: {} -> {:?}", pattern, tags),
+                    ..Default::default()
+                })
+            }
+
+            "remove_rule" => {
+                let pattern = params.pattern.ok_or_else(|| {
+                    McpError::invalid_params("pattern is required for remove_rule", None)
+                })?;
+
+                if !sidecar_path.exists() {
+                    return Ok(ManageTagsResponse {
+                        success: false,
+                        message: "No .code-indexer.yml found".to_string(),
+                        ..Default::default()
+                    });
+                }
+
+                let content = fs::read_to_string(&sidecar_path)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let mut data = RootSidecarData::parse(&content)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                let original_len = data.tag_rules.len();
+                data.tag_rules.retain(|r| r.pattern != pattern);
+
+                if data.tag_rules.len() < original_len {
+                    let content = serde_yaml::to_string(&data)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    fs::write(&sidecar_path, content)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                    Ok(ManageTagsResponse {
+                        success: true,
+                        message: format!("Removed rule with pattern '{}'", pattern),
+                        ..Default::default()
+                    })
+                } else {
+                    Ok(ManageTagsResponse {
+                        success: false,
+                        message: format!("No rule found with pattern '{}'", pattern),
+                        ..Default::default()
+                    })
+                }
+            }
+
+            "list_rules" => {
+                if !sidecar_path.exists() {
+                    return Ok(ManageTagsResponse {
+                        success: true,
+                        message: "No .code-indexer.yml found".to_string(),
+                        rules: vec![],
+                        ..Default::default()
+                    });
+                }
+
+                let content = fs::read_to_string(&sidecar_path)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let data = RootSidecarData::parse(&content)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                let rules: Vec<TagRuleInfo> = data
+                    .tag_rules
+                    .iter()
+                    .map(|r| TagRuleInfo {
+                        pattern: r.pattern.clone(),
+                        tags: r.tags.clone(),
+                        confidence: r.confidence,
+                    })
+                    .collect();
+
+                Ok(ManageTagsResponse {
+                    success: true,
+                    message: format!("{} rules found", rules.len()),
+                    rules,
+                    ..Default::default()
+                })
+            }
+
+            "preview" => {
+                let file = params.file.ok_or_else(|| {
+                    McpError::invalid_params("file is required for preview", None)
+                })?;
+
+                if !sidecar_path.exists() {
+                    return Ok(ManageTagsResponse {
+                        success: true,
+                        message: "No tag rules defined".to_string(),
+                        ..Default::default()
+                    });
+                }
+
+                let content = fs::read_to_string(&sidecar_path)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let data = RootSidecarData::parse(&content)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                // Get relative path
+                let file_path = Path::new(&file);
+                let relative_path = file_path
+                    .strip_prefix(path)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                let matches = preview_tag_rules(&relative_path, &data.tag_rules);
+
+                let preview: Vec<TagPreviewResult> = matches
+                    .iter()
+                    .map(|m| TagPreviewResult {
+                        pattern: m.pattern.clone(),
+                        tags: m.tags.clone(),
+                        confidence: m.confidence,
+                    })
+                    .collect();
+
+                Ok(ManageTagsResponse {
+                    success: true,
+                    message: format!("{} rules matched", preview.len()),
+                    preview,
+                    ..Default::default()
+                })
+            }
+
+            "apply" => {
+                if !sidecar_path.exists() {
+                    return Ok(ManageTagsResponse {
+                        success: true,
+                        message: "No tag rules to apply".to_string(),
+                        ..Default::default()
+                    });
+                }
+
+                let content = fs::read_to_string(&sidecar_path)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let data = RootSidecarData::parse(&content)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                if data.tag_rules.is_empty() {
+                    return Ok(ManageTagsResponse {
+                        success: true,
+                        message: "No tag rules defined".to_string(),
+                        ..Default::default()
+                    });
+                }
+
+                let tag_dict = self.index.get_tag_dictionary().unwrap_or_default();
+                let files = self.index.get_indexed_files()
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                let mut applied_count = 0;
+                let mut warnings = Vec::new();
+
+                for file_path in &files {
+                    let relative_path = Path::new(file_path)
+                        .strip_prefix(path)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| file_path.clone());
+
+                    let inferred = apply_tag_rules(&relative_path, &data.tag_rules);
+                    if !inferred.is_empty() {
+                        let result = resolve_inferred_tags(file_path, &inferred, &tag_dict);
+
+                        if !result.tags.is_empty() {
+                            if let Err(e) = self.index.add_file_tags(file_path, &result.tags) {
+                                warnings.push(format!("Failed to add tags to {}: {}", file_path, e));
+                            } else {
+                                applied_count += result.tags.len();
+                            }
+                        }
+
+                        for unknown in result.unknown_tags {
+                            warnings.push(format!("Unknown tag '{}' for file {}", unknown, file_path));
+                        }
+                    }
+                }
+
+                Ok(ManageTagsResponse {
+                    success: true,
+                    message: format!("Applied {} tags to files", applied_count),
+                    warnings,
+                    ..Default::default()
+                })
+            }
+
+            "stats" => {
+                let stats = self.index.get_tag_stats()
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                let tag_stats: Vec<TagStatInfo> = stats
+                    .into_iter()
+                    .map(|(category, tag, count)| TagStatInfo { category, tag, count })
+                    .collect();
+
+                let total: usize = tag_stats.iter().map(|s| s.count).sum();
+
+                Ok(ManageTagsResponse {
+                    success: true,
+                    message: format!("{} total tag assignments", total),
+                    stats: tag_stats,
+                    ..Default::default()
+                })
+            }
+
+            _ => Err(McpError::invalid_params(
+                format!("Unknown action: {}. Valid actions: add_rule, remove_rule, list_rules, preview, apply, stats", params.action),
+                None,
+            )),
+        }
     }
 
     // === Cross-language methods ===
@@ -1493,6 +1785,22 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
+            // 22. manage_tags - Manage tag inference rules
+            Tool {
+                name: "manage_tags".into(),
+                title: Some("Manage Tags".to_string()),
+                description: Some(
+                    "Manage tag inference rules in .code-indexer.yml. Actions: add_rule, remove_rule, \
+                     list_rules, preview (what tags would be inferred for a file), apply (apply rules to index), \
+                     stats (show tag statistics). Rules use glob patterns to match file paths."
+                        .into(),
+                ),
+                input_schema: schema_for::<ManageTagsParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
         ];
 
         Ok(ListToolsResult {
@@ -1899,6 +2207,11 @@ impl ServerHandler for McpServer {
                         // Apply tag filter if specified
                         if let Some(ref allowed_files) = tag_filtered_files {
                             results.retain(|r| allowed_files.contains(&r.symbol.location.file_path));
+                        }
+
+                        // Apply max_per_directory diversification if specified
+                        if let Some(max_per_dir) = params.max_per_directory {
+                            results = diversify_by_directory(results, max_per_dir);
                         }
 
                         let output = if include_file_meta {
@@ -3369,6 +3682,19 @@ impl ServerHandler for McpServer {
                 let closed = self.session_manager.close_session(&params.session_id);
 
                 let response = CloseSessionResponse { closed };
+
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )])
+            }
+
+            "manage_tags" => {
+                let params: ManageTagsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let response = self.handle_manage_tags(params)?;
 
                 CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&response).unwrap_or_default(),

@@ -23,6 +23,7 @@
 //!       - pattern:idempotency
 //! ```
 
+use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,6 +33,78 @@ use crate::index::{FileMeta, FileTag, MetaSource, Stability, TagDictionary};
 
 /// Name of the sidecar file
 pub const SIDECAR_FILENAME: &str = ".code-indexer.yml";
+
+/// Tag inference rule from root .code-indexer.yml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagRule {
+    /// Glob pattern to match file paths (e.g., "**/auth/**", "**/*_test.*")
+    pub pattern: String,
+    /// Tags to apply when pattern matches
+    pub tags: Vec<String>,
+    /// Confidence score (0.0-1.0), default: 0.7
+    #[serde(default = "default_rule_confidence")]
+    pub confidence: f64,
+}
+
+fn default_rule_confidence() -> f64 {
+    0.7
+}
+
+impl TagRule {
+    pub fn new(pattern: &str, tags: Vec<String>) -> Self {
+        Self {
+            pattern: pattern.to_string(),
+            tags,
+            confidence: default_rule_confidence(),
+        }
+    }
+
+    pub fn with_confidence(mut self, confidence: f64) -> Self {
+        self.confidence = confidence.clamp(0.0, 1.0);
+        self
+    }
+}
+
+/// Inferred tag with confidence score
+#[derive(Debug, Clone)]
+pub struct InferredTag {
+    pub tag: String,
+    pub confidence: f64,
+    pub source_pattern: String,
+}
+
+/// Root sidecar data with tag rules (for project root .code-indexer.yml)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RootSidecarData {
+    /// Global tag inference rules
+    #[serde(default)]
+    pub tag_rules: Vec<TagRule>,
+
+    /// Directory-level tags (same as regular sidecar)
+    #[serde(default)]
+    pub directory_tags: Vec<String>,
+
+    /// Per-file metadata (same as regular sidecar)
+    #[serde(default)]
+    pub files: HashMap<String, FileMetadata>,
+}
+
+impl RootSidecarData {
+    /// Parse root sidecar content
+    pub fn parse(content: &str) -> Result<Self> {
+        let data: RootSidecarData = serde_yaml::from_str(content)
+            .map_err(|e| crate::error::IndexerError::Parse(format!("Invalid root sidecar YAML: {}", e)))?;
+        Ok(data)
+    }
+
+    /// Convert to regular SidecarData (for backward compatibility)
+    pub fn to_sidecar_data(&self) -> SidecarData {
+        SidecarData {
+            directory_tags: self.directory_tags.clone(),
+            files: self.files.clone(),
+        }
+    }
+}
 
 /// Parsed sidecar file data
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -309,6 +382,156 @@ pub fn check_staleness(
     };
 
     (is_stale, current_hash)
+}
+
+/// Applies tag inference rules to a file path.
+///
+/// Returns a list of inferred tags with their confidence scores and source patterns.
+/// Multiple rules can match the same file, and tags are deduplicated (highest confidence wins).
+pub fn apply_tag_rules(file_path: &str, rules: &[TagRule]) -> Vec<InferredTag> {
+    let mut result: HashMap<String, InferredTag> = HashMap::new();
+
+    // Normalize path separators for cross-platform matching
+    let normalized_path = file_path.replace('\\', "/");
+
+    for rule in rules {
+        // Try to parse the glob pattern
+        let pattern = match Pattern::new(&rule.pattern) {
+            Ok(p) => p,
+            Err(_) => {
+                // Invalid pattern, skip
+                continue;
+            }
+        };
+
+        // Match against the file path
+        if pattern.matches(&normalized_path) {
+            for tag in &rule.tags {
+                // Keep the tag with highest confidence if duplicate
+                let entry = result.entry(tag.clone()).or_insert_with(|| InferredTag {
+                    tag: tag.clone(),
+                    confidence: 0.0,
+                    source_pattern: String::new(),
+                });
+
+                if rule.confidence > entry.confidence {
+                    entry.confidence = rule.confidence;
+                    entry.source_pattern = rule.pattern.clone();
+                }
+            }
+        }
+    }
+
+    result.into_values().collect()
+}
+
+/// Previews what tags would be inferred for a file path without applying them.
+///
+/// Returns details about which rules matched and what tags they would produce.
+pub fn preview_tag_rules(file_path: &str, rules: &[TagRule]) -> Vec<TagRuleMatch> {
+    let mut matches = Vec::new();
+    let normalized_path = file_path.replace('\\', "/");
+
+    for rule in rules {
+        let pattern = match Pattern::new(&rule.pattern) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        if pattern.matches(&normalized_path) {
+            matches.push(TagRuleMatch {
+                pattern: rule.pattern.clone(),
+                tags: rule.tags.clone(),
+                confidence: rule.confidence,
+            });
+        }
+    }
+
+    matches
+}
+
+/// Details about a matching tag rule
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagRuleMatch {
+    pub pattern: String,
+    pub tags: Vec<String>,
+    pub confidence: f64,
+}
+
+/// Result of tag resolution including any warnings for unknown tags
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedTagsResult {
+    /// Successfully resolved tags
+    pub tags: Vec<FileTag>,
+    /// Unknown tags that couldn't be resolved
+    pub unknown_tags: Vec<String>,
+}
+
+/// Resolves tag strings to FileTag structs, tracking unknown tags.
+pub fn resolve_tags_with_warnings(
+    file_path: &str,
+    tag_strings: &[String],
+    tag_dict: &[TagDictionary],
+) -> ResolvedTagsResult {
+    let mut result = ResolvedTagsResult::default();
+
+    for tag_str in tag_strings {
+        let (category, name) = parse_tag(tag_str);
+
+        // Find matching tag in dictionary
+        let dict_entry = tag_dict.iter().find(|t| {
+            let name_matches = t.canonical_name == name || t.matches(name);
+            let category_matches = category.map(|c| t.category == c).unwrap_or(true);
+            name_matches && category_matches
+        });
+
+        if let Some(entry) = dict_entry {
+            result.tags.push(
+                FileTag::new(file_path, entry.id)
+                    .with_source(MetaSource::Sidecar)
+                    .with_confidence(1.0)
+                    .with_tag_name(&entry.canonical_name)
+                    .with_tag_category(&entry.category),
+            );
+        } else {
+            result.unknown_tags.push(tag_str.clone());
+        }
+    }
+
+    result
+}
+
+/// Resolves inferred tags to FileTag structs.
+pub fn resolve_inferred_tags(
+    file_path: &str,
+    inferred: &[InferredTag],
+    tag_dict: &[TagDictionary],
+) -> ResolvedTagsResult {
+    let mut result = ResolvedTagsResult::default();
+
+    for inf in inferred {
+        let (category, name) = parse_tag(&inf.tag);
+
+        let dict_entry = tag_dict.iter().find(|t| {
+            let name_matches = t.canonical_name == name || t.matches(name);
+            let category_matches = category.map(|c| t.category == c).unwrap_or(true);
+            name_matches && category_matches
+        });
+
+        if let Some(entry) = dict_entry {
+            result.tags.push(
+                FileTag::new(file_path, entry.id)
+                    .with_source(MetaSource::Inferred)
+                    .with_confidence(inf.confidence)
+                    .with_tag_name(&entry.canonical_name)
+                    .with_tag_category(&entry.category),
+            );
+        } else {
+            result.unknown_tags.push(inf.tag.clone());
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -629,5 +852,149 @@ use crate::something;
         // No stored hash: not stale (can't determine)
         let (is_stale, _) = check_staleness(&symbols, None);
         assert!(!is_stale);
+    }
+
+    // === TagRule tests ===
+
+    #[test]
+    fn test_tag_rule_basic() {
+        let rule = TagRule::new("**/auth/**", vec!["domain:auth".to_string()]);
+        assert_eq!(rule.pattern, "**/auth/**");
+        assert_eq!(rule.tags.len(), 1);
+        assert_eq!(rule.confidence, 0.7); // default
+    }
+
+    #[test]
+    fn test_tag_rule_with_confidence() {
+        let rule = TagRule::new("**/test/**", vec!["infra:test".to_string()])
+            .with_confidence(0.9);
+        assert_eq!(rule.confidence, 0.9);
+    }
+
+    #[test]
+    fn test_apply_tag_rules_basic() {
+        let rules = vec![
+            TagRule::new("**/auth/**", vec!["domain:auth".to_string()]),
+            TagRule::new("**/service/**", vec!["layer:service".to_string()]),
+        ];
+
+        let inferred = apply_tag_rules("src/auth/service.rs", &rules);
+        assert_eq!(inferred.len(), 1); // Only auth matches
+        assert!(inferred.iter().any(|t| t.tag == "domain:auth"));
+    }
+
+    #[test]
+    fn test_apply_tag_rules_multiple_matches() {
+        let rules = vec![
+            TagRule::new("src/**", vec!["layer:src".to_string()]),
+            TagRule::new("**/auth/**", vec!["domain:auth".to_string()]),
+        ];
+
+        let inferred = apply_tag_rules("src/auth/handler.rs", &rules);
+        assert_eq!(inferred.len(), 2);
+        assert!(inferred.iter().any(|t| t.tag == "layer:src"));
+        assert!(inferred.iter().any(|t| t.tag == "domain:auth"));
+    }
+
+    #[test]
+    fn test_apply_tag_rules_dedup_highest_confidence() {
+        let rules = vec![
+            TagRule::new("**/auth/**", vec!["domain:auth".to_string()])
+                .with_confidence(0.5),
+            TagRule::new("**/*.rs", vec!["domain:auth".to_string()])
+                .with_confidence(0.9),
+        ];
+
+        let inferred = apply_tag_rules("src/auth/service.rs", &rules);
+        assert_eq!(inferred.len(), 1);
+        // Should have higher confidence
+        assert_eq!(inferred[0].confidence, 0.9);
+    }
+
+    #[test]
+    fn test_apply_tag_rules_test_file() {
+        let rules = vec![
+            TagRule::new("**/*_test.*", vec!["infra:test".to_string()])
+                .with_confidence(0.9),
+        ];
+
+        let inferred = apply_tag_rules("src/auth/service_test.rs", &rules);
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].tag, "infra:test");
+    }
+
+    #[test]
+    fn test_apply_tag_rules_no_match() {
+        let rules = vec![
+            TagRule::new("**/auth/**", vec!["domain:auth".to_string()]),
+        ];
+
+        let inferred = apply_tag_rules("src/database/pool.rs", &rules);
+        assert!(inferred.is_empty());
+    }
+
+    #[test]
+    fn test_preview_tag_rules() {
+        let rules = vec![
+            TagRule::new("**/auth/**", vec!["domain:auth".to_string()])
+                .with_confidence(0.8),
+            TagRule::new("**/*.rs", vec!["lang:rust".to_string()])
+                .with_confidence(0.7),
+        ];
+
+        let matches = preview_tag_rules("src/auth/service.rs", &rules);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].pattern, "**/auth/**");
+        assert_eq!(matches[1].pattern, "**/*.rs");
+    }
+
+    #[test]
+    fn test_root_sidecar_data_parse() {
+        let content = r#"
+tag_rules:
+  - pattern: "**/auth/**"
+    tags:
+      - domain:auth
+    confidence: 0.8
+  - pattern: "**/*_test.*"
+    tags:
+      - infra:test
+
+directory_tags:
+  - global:tag
+
+files:
+  main.rs:
+    doc1: "Entry point"
+"#;
+
+        let data = RootSidecarData::parse(content).unwrap();
+        assert_eq!(data.tag_rules.len(), 2);
+        assert_eq!(data.tag_rules[0].pattern, "**/auth/**");
+        assert_eq!(data.tag_rules[0].confidence, 0.8);
+        assert_eq!(data.tag_rules[1].confidence, 0.7); // default
+        assert_eq!(data.directory_tags.len(), 1);
+        assert!(data.files.contains_key("main.rs"));
+    }
+
+    #[test]
+    fn test_resolve_tags_with_warnings_unknown() {
+        let dict = vec![TagDictionary {
+            id: 1,
+            canonical_name: "auth".to_string(),
+            category: "domain".to_string(),
+            display_name: None,
+            synonyms: None,
+        }];
+
+        let tag_strings = vec![
+            "domain:auth".to_string(),
+            "unknown:tag".to_string(),
+        ];
+        let result = resolve_tags_with_warnings("test.rs", &tag_strings, &dict);
+
+        assert_eq!(result.tags.len(), 1);
+        assert_eq!(result.unknown_tags.len(), 1);
+        assert_eq!(result.unknown_tags[0], "unknown:tag");
     }
 }

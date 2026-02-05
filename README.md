@@ -130,6 +130,7 @@ code-indexer serve
 | `stats` | Статистика индекса | — |
 | `clear` | Очистка индекса | — |
 | `deps <subcmd>` | Работа с зависимостями | `list`, `index`, `find`, `info` |
+| `tags <subcmd>` | Управление тегами | `add-rule`, `remove-rule`, `list-rules`, `preview`, `apply`, `stats` |
 
 ### Глобальные опции
 
@@ -312,6 +313,7 @@ UserService:cls@src/UserService.java:10
 | 10 | `get_imports` | Импорты файла | `file`, `resolve` |
 | 11 | `get_diagnostics` | Dead code, метрики | `kind`, `file`, `include_metrics`, `target` |
 | 12 | `get_stats` | Статистика индекса | `detailed`, `include_workspace`, `include_deps` |
+| 22 | `manage_tags` | Управление tag inference | `action`, `pattern`, `tags`, `confidence`, `file`, `path` |
 
 ### Backward Compatibility
 
@@ -447,6 +449,96 @@ files:
 - **Staleness detection**: предупреждение при изменении публичного API
 - **Tag dictionary**: нормализация через синонимы (authn → auth)
 
+### Tag Inference Rules
+
+Автоматический вывод тегов на основе путей файлов через glob-паттерны.
+
+**Формат в корневом `.code-indexer.yml`:**
+
+```yaml
+tag_rules:
+  - pattern: "**/auth/**"
+    tags: [domain:auth]
+    confidence: 0.8
+
+  - pattern: "**/service/**"
+    tags: [layer:service]
+
+  - pattern: "**/*_test.*"
+    tags: [infra:test]
+    confidence: 0.9
+
+  - pattern: "**/api/**/*.ts"
+    tags: [layer:api, lang:typescript]
+
+# Остальные поля sidecar
+directory_tags: []
+files: {}
+```
+
+**CLI команды:**
+
+```bash
+# Добавить правило
+code-indexer tags add-rule "domain:auth" --pattern "**/auth/**" --confidence 0.8
+
+# Удалить правило
+code-indexer tags remove-rule --pattern "**/auth/**"
+
+# Список всех правил
+code-indexer tags list-rules
+
+# Preview: какие теги будут применены к файлу
+code-indexer tags preview ./src/auth/service.rs
+
+# Применить правила к индексу
+code-indexer tags apply
+
+# Статистика тегов
+code-indexer tags stats
+```
+
+**MCP tool `manage_tags`:**
+
+```json
+{
+  "action": "add_rule",
+  "pattern": "**/auth/**",
+  "tags": ["domain:auth"],
+  "confidence": 0.8,
+  "path": "."
+}
+
+{
+  "action": "preview",
+  "file": "src/auth/service.rs"
+}
+
+{
+  "action": "apply"
+}
+
+{
+  "action": "stats"
+}
+```
+
+**Поддерживаемые actions**: `add_rule`, `remove_rule`, `list_rules`, `preview`, `apply`, `stats`
+
+### Search Diversification
+
+Параметр `max_per_directory` ограничивает число результатов из одной директории для разнообразия:
+
+```json
+{
+  "query": "handler",
+  "max_per_directory": 2,
+  "limit": 20
+}
+```
+
+Результаты будут включать максимум 2 символа из каждой директории.
+
 ### SQLite схема (12 таблиц)
 
 - `symbols` — символы + FTS5 индекс
@@ -464,11 +556,15 @@ files:
 
 ## Текущие ограничения
 
-1. **Нет type inference** — для Python/JS вызовы часто Possible
-2. **Нет межпроектных ссылок** — только внутри workspace
-3. **Ограниченная поддержка generics** — template instantiation не отслеживается
-4. **Нет инкрементального парсинга** — весь файл перепарсивается
-5. **SQLite single-writer** — нет параллельной записи
+1. **Нет type inference** — для Python/JS вызовы часто Possible (планируется: парсинг type hints)
+2. **Нет межпроектных ссылок** — только внутри workspace (планируется: cross-project links)
+3. **Ограниченная поддержка generics** — template instantiation не отслеживается (планируется: generic resolver)
+4. **SQLite single-writer** — нет параллельной записи (используется batch inserts для ускорения)
+
+### Улучшения производительности
+
+- **Batch writes** — все символы, ссылки и импорты вставляются в одной транзакции (2-3x ускорение)
+- **Incremental parsing** — `ParseCache` переиспользует старые деревья tree-sitter (30-50% ускорение для watch mode)
 
 ## Лицензия
 

@@ -229,6 +229,12 @@ pub enum Commands {
         command: DepsCommands,
     },
 
+    /// Manage tag inference rules
+    Tags {
+        #[command(subcommand)]
+        command: TagsCommands,
+    },
+
     // === Legacy commands (deprecated, hidden) ===
     /// Query the index (deprecated: use symbols, definition, references instead)
     #[command(hide = true)]
@@ -368,6 +374,77 @@ pub enum DepsCommands {
         /// Path to the project directory
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TagsCommands {
+    /// Add a tag inference rule
+    AddRule {
+        /// Tag to add (e.g., "domain:auth")
+        tag: String,
+
+        /// Glob pattern to match files (e.g., "**/auth/**")
+        #[arg(long)]
+        pattern: String,
+
+        /// Confidence score (0.0-1.0)
+        #[arg(long, default_value = "0.7")]
+        confidence: f64,
+
+        /// Path to project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Remove a tag inference rule
+    RemoveRule {
+        /// Glob pattern of the rule to remove
+        #[arg(long)]
+        pattern: String,
+
+        /// Path to project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// List all tag inference rules
+    ListRules {
+        /// Path to project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output format (text or json)
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// Preview what tags would be inferred for a file
+    Preview {
+        /// File path to preview
+        file: PathBuf,
+
+        /// Path to project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+
+    /// Apply tag rules to the index
+    Apply {
+        /// Path to project root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Database path
+        #[arg(long, default_value = ".code-index.db")]
+        db: PathBuf,
+    },
+
+    /// Show tag statistics
+    Stats {
+        /// Database path
+        #[arg(long, default_value = ".code-index.db")]
+        db: PathBuf,
     },
 }
 
@@ -1628,6 +1705,271 @@ pub fn get_changed_symbols(
                 })
                 .collect();
             println!("{}", lines.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+// === Tags Commands Implementation ===
+
+use crate::indexer::{TagRule, RootSidecarData, apply_tag_rules, preview_tag_rules, resolve_inferred_tags};
+
+/// Adds a tag inference rule to the root .code-indexer.yml
+pub fn add_tag_rule(
+    path: &Path,
+    tag: &str,
+    pattern: &str,
+    confidence: f64,
+) -> Result<()> {
+    let sidecar_path = path.join(SIDECAR_FILENAME);
+
+    // Load existing or create new
+    let mut data = if sidecar_path.exists() {
+        let content = fs::read_to_string(&sidecar_path)?;
+        RootSidecarData::parse(&content)?
+    } else {
+        RootSidecarData::default()
+    };
+
+    // Check if pattern already exists
+    if let Some(existing) = data.tag_rules.iter_mut().find(|r| r.pattern == pattern) {
+        // Update existing rule - add tag if not present
+        if !existing.tags.contains(&tag.to_string()) {
+            existing.tags.push(tag.to_string());
+        }
+        existing.confidence = confidence;
+        println!("Updated existing rule for pattern '{}'", pattern);
+    } else {
+        // Add new rule
+        data.tag_rules.push(TagRule {
+            pattern: pattern.to_string(),
+            tags: vec![tag.to_string()],
+            confidence,
+        });
+        println!("Added new tag rule: {} -> {} (confidence: {})", pattern, tag, confidence);
+    }
+
+    // Write back
+    let content = serde_yaml::to_string(&data)
+        .map_err(|e| crate::error::IndexerError::Parse(format!("Failed to serialize YAML: {}", e)))?;
+    fs::write(&sidecar_path, content)?;
+
+    println!("Saved to {}", sidecar_path.display());
+    Ok(())
+}
+
+/// Removes a tag inference rule from the root .code-indexer.yml
+pub fn remove_tag_rule(path: &Path, pattern: &str) -> Result<()> {
+    let sidecar_path = path.join(SIDECAR_FILENAME);
+
+    if !sidecar_path.exists() {
+        println!("No .code-indexer.yml found");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&sidecar_path)?;
+    let mut data = RootSidecarData::parse(&content)?;
+
+    let original_len = data.tag_rules.len();
+    data.tag_rules.retain(|r| r.pattern != pattern);
+
+    if data.tag_rules.len() < original_len {
+        let content = serde_yaml::to_string(&data)
+            .map_err(|e| crate::error::IndexerError::Parse(format!("Failed to serialize YAML: {}", e)))?;
+        fs::write(&sidecar_path, content)?;
+        println!("Removed rule with pattern '{}'", pattern);
+    } else {
+        println!("No rule found with pattern '{}'", pattern);
+    }
+
+    Ok(())
+}
+
+/// Lists all tag inference rules
+pub fn list_tag_rules(path: &Path, format: &str) -> Result<()> {
+    let sidecar_path = path.join(SIDECAR_FILENAME);
+
+    if !sidecar_path.exists() {
+        println!("No .code-indexer.yml found");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&sidecar_path)?;
+    let data = RootSidecarData::parse(&content)?;
+
+    if data.tag_rules.is_empty() {
+        println!("No tag rules defined");
+        return Ok(());
+    }
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&data.tag_rules).unwrap_or_default());
+    } else {
+        println!("Tag Rules ({}):\n", data.tag_rules.len());
+        for rule in &data.tag_rules {
+            println!("  Pattern: {}", rule.pattern);
+            println!("  Tags: {}", rule.tags.join(", "));
+            println!("  Confidence: {}", rule.confidence);
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Previews what tags would be inferred for a file
+pub fn preview_tags(file: &Path, project_path: &Path) -> Result<()> {
+    let sidecar_path = project_path.join(SIDECAR_FILENAME);
+
+    if !sidecar_path.exists() {
+        println!("No .code-indexer.yml found - no tag rules to apply");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&sidecar_path)?;
+    let data = RootSidecarData::parse(&content)?;
+
+    if data.tag_rules.is_empty() {
+        println!("No tag rules defined");
+        return Ok(());
+    }
+
+    // Get relative path from project root
+    let file_path = file.strip_prefix(project_path)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string();
+
+    let matches = preview_tag_rules(&file_path, &data.tag_rules);
+
+    if matches.is_empty() {
+        println!("No rules match file: {}", file_path);
+        return Ok(());
+    }
+
+    println!("Tags that would be inferred for '{}':\n", file_path);
+    for m in &matches {
+        println!("  Rule: {}", m.pattern);
+        println!("    Tags: {}", m.tags.join(", "));
+        println!("    Confidence: {}", m.confidence);
+        println!();
+    }
+
+    // Show consolidated tags
+    let inferred = apply_tag_rules(&file_path, &data.tag_rules);
+    println!("Consolidated tags (with highest confidence):");
+    for tag in &inferred {
+        println!("  {} (confidence: {}, from: {})", tag.tag, tag.confidence, tag.source_pattern);
+    }
+
+    Ok(())
+}
+
+/// Applies tag rules to all indexed files
+pub fn apply_tags(project_path: &Path, db_path: &Path) -> Result<()> {
+    let sidecar_path = project_path.join(SIDECAR_FILENAME);
+
+    if !sidecar_path.exists() {
+        println!("No .code-indexer.yml found - no tag rules to apply");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&sidecar_path)?;
+    let data = RootSidecarData::parse(&content)?;
+
+    if data.tag_rules.is_empty() {
+        println!("No tag rules defined");
+        return Ok(());
+    }
+
+    // Resolve effective db path
+    let effective_db = if db_path == Path::new(".code-index.db") {
+        project_path.join(".code-index.db")
+    } else {
+        db_path.to_path_buf()
+    };
+
+    let index = SqliteIndex::new(&effective_db)?;
+    let tag_dict = index.get_tag_dictionary().unwrap_or_default();
+
+    // Get all indexed files
+    let stats = index.get_stats()?;
+    println!("Applying {} tag rules to {} files...", data.tag_rules.len(), stats.total_files);
+
+    // Get file list from symbols (unique files)
+    let files = index.get_indexed_files()?;
+    let mut applied_count = 0;
+    let mut warning_count = 0;
+
+    for file_path in &files {
+        // Get relative path from project root if absolute
+        let relative_path = if Path::new(file_path).is_absolute() {
+            Path::new(file_path)
+                .strip_prefix(project_path)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| file_path.clone())
+        } else {
+            file_path.clone()
+        };
+
+        let inferred = apply_tag_rules(&relative_path, &data.tag_rules);
+        if !inferred.is_empty() {
+            let result = resolve_inferred_tags(file_path, &inferred, &tag_dict);
+
+            if !result.tags.is_empty() {
+                if let Err(e) = index.add_file_tags(file_path, &result.tags) {
+                    eprintln!("Warning: Failed to add tags to {}: {}", file_path, e);
+                    warning_count += 1;
+                } else {
+                    applied_count += result.tags.len();
+                }
+            }
+
+            for unknown in &result.unknown_tags {
+                eprintln!("Warning: Unknown tag '{}' for file {}", unknown, file_path);
+                warning_count += 1;
+            }
+        }
+    }
+
+    println!("Applied {} tags to files", applied_count);
+    if warning_count > 0 {
+        println!("Warnings: {}", warning_count);
+    }
+
+    Ok(())
+}
+
+/// Shows tag statistics from the index
+pub fn show_tag_stats(db_path: &Path) -> Result<()> {
+    let index = SqliteIndex::new(db_path)?;
+
+    match index.get_tag_stats() {
+        Ok(stats) => {
+            println!("Tag Statistics:\n");
+            // stats is Vec<(category, tag_name, count)>
+            println!("Total tags: {}", stats.iter().map(|(_, _, count)| count).sum::<usize>());
+            println!();
+
+            // Group by category
+            let mut by_category: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+            for (category, tag_name, count) in stats {
+                by_category.entry(category)
+                    .or_default()
+                    .push((tag_name, count));
+            }
+
+            for (category, tags) in by_category {
+                println!("{}:", category);
+                for (tag, count) in tags {
+                    println!("  {}: {} files", tag, count);
+                }
+                println!();
+            }
+        }
+        Err(e) => {
+            println!("Could not get tag stats: {}", e);
         }
     }
 
