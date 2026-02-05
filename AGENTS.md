@@ -20,12 +20,17 @@
 - `src/workspace` и `src/dependencies` — workspace и deps indexing.
 - `tests/` — интеграционные тесты и сценарии MCP/CLI.
   - `file_tags_integration.rs` — тесты File Tags и Intent Layer.
+  - `quality_benchmarks.rs` — 99 quality-тестов на 7 open-source репо (API coverage, языковые фичи, сравнение с rg).
+- `benches/` — Criterion performance бенчмарки (indexing, search) + `download_repos.sh`.
+- `.github/workflows/benchmarks.yml` — CI для бенчмарков (quality + performance).
 - `examples/*` — учебные проекты разных экосистем.
 - `.code-indexer.yml` — sidecar-файлы с метаданными (doc1, purpose, tags).
 
 ## Команды (базовые)
 - Сборка: `cargo build --release`
 - Тесты: `cargo test`
+- Quality benchmarks: `cargo test --test quality_benchmarks -- --ignored`
+- Performance benchmarks: `cargo bench`
 
 ## Принципы работы
 - Сначала изучить `.memory-bank/index.md`.

@@ -1306,6 +1306,9 @@ pub fn index_dependencies(
     let lang_registry = LanguageRegistry::new();
     let walker = FileWalker::new(lang_registry);
 
+    // Collect dep_ids for batch marking at the end
+    let mut indexed_dep_ids: Vec<i64> = Vec::new();
+
     for dep in deps_to_index {
         // Safe: deps_to_index is filtered to only include deps with source_path
         let Some(source_path) = dep.source_path.as_ref() else {
@@ -1350,8 +1353,13 @@ pub fn index_dependencies(
             }
         }
 
-        index.mark_dependency_indexed(dep_id)?;
+        indexed_dep_ids.push(dep_id);
         println!(" {} symbols from {} files", total_symbols, files.len());
+    }
+
+    // Batch mark all successfully indexed dependencies
+    if !indexed_dep_ids.is_empty() {
+        index.mark_dependencies_indexed_batch(&indexed_dep_ids)?;
     }
 
     Ok(())

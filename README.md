@@ -595,6 +595,53 @@ code-indexer tags stats
 
 Generic параметры сохраняются в поле `generic_params` символа и хранятся в БД как JSON в колонке `generic_params_json`.
 
+## Бенчмарки на open-source проектах
+
+Для оценки производительности на реальных кодовых базах доступны бенчмарки с использованием [Criterion](https://bheisler.github.io/criterion.rs/book/).
+
+### Подготовка
+
+```bash
+# Загрузка тестовых репозиториев (~2 ГБ)
+./benches/download_repos.sh
+```
+
+Загружаются: ripgrep (Rust), tokio (Rust), excalidraw (TypeScript), guava (Java), prometheus (Go), django (Python), kotlin (Kotlin).
+
+### Запуск бенчмарков
+
+```bash
+# Индексация (полный пайплайн: walk → parse → extract → insert)
+cargo bench --bench indexing
+
+# Поиск (exact, fuzzy, find_definition, limits, filters)
+cargo bench --bench search
+```
+
+### Тесты качества извлечения (99 тестов)
+
+```bash
+# Проверка корректности на реальных проектах (требуются загруженные репо)
+cargo test --test quality_benchmarks -- --ignored
+
+# С подробным выводом (comparison metrics)
+cargo test --test quality_benchmarks -- --ignored --nocapture
+```
+
+Покрытие: 7 языков, 22 API-метода CodeIndex, 14 SymbolKind, 6 ReferenceKind, 4 Visibility, 15 сравнений с rg/grep.
+
+### CI
+
+Бенчмарки автоматизированы через GitHub Actions (`.github/workflows/benchmarks.yml`):
+
+- **Quality benchmarks** — еженедельно + ручной запуск
+- **Performance benchmarks (Criterion)** — ручной запуск с сохранением baseline
+
+```bash
+# Ручной запуск через gh CLI
+gh workflow run benchmarks.yml -f run_quality=true -f run_performance=true
+```
+
 ## Лицензия
 
 MIT License
