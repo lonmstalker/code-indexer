@@ -1,5 +1,5 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -eu
 
 REPOS_DIR="benches/repos"
 mkdir -p "$REPOS_DIR"

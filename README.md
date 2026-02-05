@@ -603,52 +603,26 @@ code-indexer tags stats
 
 Generic параметры сохраняются в поле `generic_params` символа и хранятся в БД как JSON в колонке `generic_params_json`.
 
-## Бенчмарки на open-source проектах
+## Сравнение с CLI-инструментами
 
-Для оценки производительности на реальных кодовых базах доступны бенчмарки с использованием [Criterion](https://bheisler.github.io/criterion.rs/book/).
+Детальные сравнения code-indexer с rg, grep, wc, find на 7 open-source проектах:
 
-### Подготовка
+| Репо | Язык | Результаты |
+|------|------|-----------|
+| ripgrep | Rust | [benches/results/ripgrep.md](benches/results/ripgrep.md) |
+| tokio | Rust | [benches/results/tokio.md](benches/results/tokio.md) |
+| excalidraw | TypeScript | [benches/results/excalidraw.md](benches/results/excalidraw.md) |
+| guava | Java | [benches/results/guava.md](benches/results/guava.md) |
+| prometheus | Go | [benches/results/prometheus.md](benches/results/prometheus.md) |
+| django | Python | [benches/results/django.md](benches/results/django.md) |
+| kotlin | Kotlin | [benches/results/kotlin.md](benches/results/kotlin.md) |
 
 ```bash
-# Загрузка тестовых репозиториев (~2 ГБ)
+# Загрузка тестовых репозиториев и запуск замеров
 ./benches/download_repos.sh
 ```
 
-Загружаются: ripgrep (Rust), tokio (Rust), excalidraw (TypeScript), guava (Java), prometheus (Go), django (Python), kotlin (Kotlin).
-
-### Запуск бенчмарков
-
-```bash
-# Индексация (полный пайплайн: walk → parse → extract → insert)
-cargo bench --bench indexing
-
-# Поиск (exact, fuzzy, find_definition, limits, filters)
-cargo bench --bench search
-```
-
-### Тесты качества извлечения (99 тестов)
-
-```bash
-# Проверка корректности на реальных проектах (требуются загруженные репо)
-cargo test --test quality_benchmarks -- --ignored
-
-# С подробным выводом (comparison metrics)
-cargo test --test quality_benchmarks -- --ignored --nocapture
-```
-
-Покрытие: 7 языков, 22 API-метода CodeIndex, 14 SymbolKind, 6 ReferenceKind, 4 Visibility, 15 сравнений с rg/grep.
-
-### CI
-
-Бенчмарки автоматизированы через GitHub Actions (`.github/workflows/benchmarks.yml`):
-
-- **Quality benchmarks** — еженедельно + ручной запуск
-- **Performance benchmarks (Criterion)** — ручной запуск с сохранением baseline
-
-```bash
-# Ручной запуск через gh CLI
-gh workflow run benchmarks.yml -f run_quality=true -f run_performance=true
-```
+Подробнее: [benches/README.md](benches/README.md)
 
 ## Лицензия
 
