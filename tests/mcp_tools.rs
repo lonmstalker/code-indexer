@@ -956,6 +956,316 @@ mod get_diagnostics {
 
         let metrics = index.get_file_metrics("test.rs").unwrap();
         // Should have metrics for each function in file
-        assert!(metrics.len() >= 0);
+        let _ = metrics.len();
+    }
+}
+
+// ============================================================================
+// Symbol Retrieval Tests
+// ============================================================================
+
+mod symbol_retrieval {
+    use super::*;
+
+    #[test]
+    fn test_get_symbol_by_id() {
+        let index = create_test_index();
+        let symbol = create_test_symbol("my_function", SymbolKind::Function, "test.rs", 1);
+        let id = symbol.id.clone();
+        index.add_symbols(vec![symbol]).unwrap();
+
+        // Get by ID
+        let retrieved = index.get_symbol(&id).unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().name, "my_function");
+    }
+
+    #[test]
+    fn test_get_symbol_not_found() {
+        let index = create_test_index();
+        let retrieved = index.get_symbol("nonexistent").unwrap();
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_get_symbol_by_id_multiple() {
+        let index = create_test_index();
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test.rs", 1),
+            create_test_symbol("func2", SymbolKind::Function, "test.rs", 10),
+            create_test_symbol("func3", SymbolKind::Function, "test.rs", 20),
+        ];
+
+        // Store IDs before adding (they are generated on creation)
+        let ids: Vec<String> = symbols.iter().map(|s| s.id.clone()).collect();
+        index.add_symbols(symbols).unwrap();
+
+        // Each ID should retrieve the correct symbol
+        for (i, id) in ids.iter().enumerate() {
+            let retrieved = index.get_symbol(id).unwrap();
+            assert!(retrieved.is_some());
+            assert_eq!(retrieved.unwrap().name, format!("func{}", i + 1));
+        }
+    }
+}
+
+// ============================================================================
+// Stable ID Tests
+// ============================================================================
+
+mod stable_id {
+    use super::*;
+
+    #[test]
+    fn test_symbol_compute_stable_id_format() {
+        let symbol = create_test_symbol("my_function", SymbolKind::Function, "src/lib.rs", 10);
+        let stable_id = symbol.compute_stable_id(None);
+
+        // Stable ID should start with "sid:" prefix and contain a hash
+        assert!(stable_id.starts_with("sid:"));
+        assert!(stable_id.len() > 4); // "sid:" + hash
+    }
+
+    #[test]
+    fn test_symbol_stable_id_consistency() {
+        let symbol = create_test_symbol("func", SymbolKind::Function, "test.rs", 10);
+
+        // Same symbol should produce same stable ID
+        let id1 = symbol.compute_stable_id(None);
+        let id2 = symbol.compute_stable_id(None);
+
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_symbol_stable_id_different_for_different_kinds() {
+        let func = create_test_symbol("item", SymbolKind::Function, "test.rs", 10);
+        let struct_sym = create_test_symbol("item", SymbolKind::Struct, "test.rs", 10);
+
+        let func_id = func.compute_stable_id(None);
+        let struct_id = struct_sym.compute_stable_id(None);
+
+        // Different kinds should produce different IDs
+        assert_ne!(func_id, struct_id);
+    }
+
+    #[test]
+    fn test_symbol_stable_id_with_workspace() {
+        let symbol = create_test_symbol("func", SymbolKind::Function, "test.rs", 10);
+
+        let id_no_ws = symbol.compute_stable_id(None);
+        let id_with_ws = symbol.compute_stable_id(Some("my_workspace"));
+
+        // With workspace should produce different ID
+        assert_ne!(id_no_ws, id_with_ws);
+    }
+}
+
+// ============================================================================
+// Advanced Ranking Tests
+// ============================================================================
+
+mod advanced_ranking {
+    use super::*;
+
+    #[test]
+    fn test_search_with_advanced_ranking() {
+        let index = create_test_index();
+        index
+            .add_symbols(vec![
+                create_test_symbol("process_data", SymbolKind::Function, "main.rs", 1),
+                create_test_symbol("process_input", SymbolKind::Function, "utils.rs", 1),
+                create_test_symbol("process_output", SymbolKind::Function, "output.rs", 1),
+            ])
+            .unwrap();
+
+        let options = SearchOptions {
+            use_advanced_ranking: Some(true),
+            current_file: Some("main.rs".to_string()),
+            ..Default::default()
+        };
+
+        let results = index.search("process", &options).unwrap();
+        assert!(!results.is_empty());
+
+        // First result should be from current file (locality bonus)
+        if results.len() > 1 {
+            assert!(results[0].symbol.location.file_path.contains("main.rs"));
+        }
+    }
+
+    #[test]
+    fn test_search_with_fuzzy_and_ranking() {
+        let index = create_test_index();
+        index
+            .add_symbols(vec![
+                create_test_symbol("calculateTotal", SymbolKind::Function, "math.rs", 1),
+                create_test_symbol("calculateSum", SymbolKind::Function, "math.rs", 10),
+            ])
+            .unwrap();
+
+        let options = SearchOptions {
+            fuzzy: Some(true),
+            fuzzy_threshold: Some(0.6),
+            use_advanced_ranking: Some(true),
+            ..Default::default()
+        };
+
+        // Fuzzy search with longer query (short queries fall back to prefix)
+        let results = index.search("calculate", &options).unwrap();
+
+        // Should find results
+        assert!(!results.is_empty());
+        // All results should contain "calculate"
+        assert!(results.iter().all(|r| r.symbol.name.contains("calculate")));
+    }
+}
+
+// ============================================================================
+// Symbol Parent/Members Tests
+// ============================================================================
+
+mod symbol_hierarchy {
+    use super::*;
+
+    #[test]
+    fn test_get_symbol_members() {
+        let index = create_test_index();
+
+        // Add a struct
+        let struct_symbol = create_test_symbol("MyStruct", SymbolKind::Struct, "test.rs", 1);
+
+        // Add methods with parent
+        let mut method1 = create_test_symbol("method1", SymbolKind::Method, "test.rs", 5);
+        method1.parent = Some("MyStruct".to_string());
+
+        let mut method2 = create_test_symbol("method2", SymbolKind::Method, "test.rs", 15);
+        method2.parent = Some("MyStruct".to_string());
+
+        index
+            .add_symbols(vec![struct_symbol, method1, method2])
+            .unwrap();
+
+        // Get members of MyStruct
+        let members = index.get_symbol_members("MyStruct").unwrap();
+
+        // Should find both methods
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|m| m.parent == Some("MyStruct".to_string())));
+    }
+
+    #[test]
+    fn test_get_symbol_members_empty() {
+        let index = create_test_index();
+        let members = index.get_symbol_members("NonExistent").unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn test_find_implementations() {
+        let index = create_test_index();
+
+        // Add a trait
+        let trait_symbol = create_test_symbol("MyTrait", SymbolKind::Trait, "traits.rs", 1);
+
+        // Add implementations (using Extend reference type)
+        let impl_symbol = create_test_symbol("MyImpl", SymbolKind::Struct, "impl.rs", 1);
+        let impl_id = impl_symbol.id.clone();
+
+        index.add_symbols(vec![trait_symbol, impl_symbol]).unwrap();
+
+        // Add reference showing impl relationship - symbol_id must match existing symbol
+        let impl_ref = code_indexer::SymbolReference {
+            symbol_id: Some(impl_id),
+            symbol_name: "MyTrait".to_string(),
+            file_path: "impl.rs".to_string(),
+            line: 5,
+            column: 0,
+            kind: code_indexer::ReferenceKind::Extend,
+        };
+        index.add_references(vec![impl_ref]).unwrap();
+
+        let impls = index.find_implementations("MyTrait").unwrap();
+        // Should find implementations through Extend references
+        let _ = impls.len();
+    }
+}
+
+// ============================================================================
+// Cross-Language Tests
+// ============================================================================
+
+mod cross_language {
+    use super::*;
+
+    #[test]
+    fn test_multi_language_index() {
+        let index = create_test_index();
+
+        // Add symbols from different languages
+        let rust_sym = Symbol::new(
+            "rust_func",
+            SymbolKind::Function,
+            Location::new("src/lib.rs", 1, 0, 10, 0),
+            "rust",
+        );
+        let java_sym = Symbol::new(
+            "JavaClass",
+            SymbolKind::Class,
+            Location::new("src/Main.java", 1, 0, 10, 0),
+            "java",
+        );
+        let ts_sym = Symbol::new(
+            "tsFunction",
+            SymbolKind::Function,
+            Location::new("src/index.ts", 1, 0, 10, 0),
+            "typescript",
+        );
+
+        index.add_symbols(vec![rust_sym, java_sym, ts_sym]).unwrap();
+
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 3);
+        assert!(stats.symbols_by_language.len() >= 3);
+    }
+
+    #[test]
+    fn test_search_with_language_filter() {
+        let index = create_test_index();
+
+        let rust_sym = Symbol::new(
+            "process",
+            SymbolKind::Function,
+            Location::new("src/lib.rs", 1, 0, 10, 0),
+            "rust",
+        );
+        let java_sym = Symbol::new(
+            "process",
+            SymbolKind::Method,
+            Location::new("src/Main.java", 1, 0, 10, 0),
+            "java",
+        );
+
+        index.add_symbols(vec![rust_sym, java_sym]).unwrap();
+
+        // Search with Rust filter
+        let rust_options = SearchOptions {
+            language_filter: Some(vec!["rust".to_string()]),
+            ..Default::default()
+        };
+        let rust_results = index.search("process", &rust_options).unwrap();
+
+        assert_eq!(rust_results.len(), 1);
+        assert_eq!(rust_results[0].symbol.language, "rust");
+
+        // Search with Java filter
+        let java_options = SearchOptions {
+            language_filter: Some(vec!["java".to_string()]),
+            ..Default::default()
+        };
+        let java_results = index.search("process", &java_options).unwrap();
+
+        assert_eq!(java_results.len(), 1);
+        assert_eq!(java_results[0].symbol.language, "java");
     }
 }

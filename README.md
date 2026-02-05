@@ -16,6 +16,7 @@ CLI-инструмент и MCP-сервер для индексации и се
 - **Workspace support** — мультимодульные проекты (Cargo, Maven, Gradle, npm)
 - **Dependency indexing** — индексация зависимостей
 - **Virtual documents** — поддержка несохранённых изменений (LSP overlay)
+- **File Tags & Intent Layer** — метаданные файлов через sidecar `.code-indexer.yml`
 
 ## Производительность (бенчмарк)
 
@@ -302,12 +303,12 @@ UserService:cls@src/UserService.java:10
 | 1 | `index_workspace` | Индексация проекта | `path`, `watch`, `include_deps` |
 | 2 | `update_files` | Virtual documents (LSP) | `files[]` с `path`, `content`, `version` |
 | 3 | `list_symbols` | Список символов | `kind`, `language`, `file`, `pattern`, `limit`, `format` |
-| 4 | `search_symbols` | Поиск с fuzzy/regex | `query`, `fuzzy`, `fuzzy_threshold`, `regex`, `module` |
+| 4 | `search_symbols` | Поиск с fuzzy/regex | `query`, `fuzzy`, `fuzzy_threshold`, `regex`, `module`, `tag`, `include_file_meta` |
 | 5 | `get_symbol` | Получить по ID/позиции | `id` или `ids[]` или `file`+`line`+`column` |
 | 6 | `find_definitions` | Найти определения | `name`, `include_deps`, `dependency` |
 | 7 | `find_references` | Найти использования | `name`, `include_callers`, `include_importers`, `kind`, `depth` |
 | 8 | `analyze_call_graph` | Граф вызовов | `function`, `direction`, `depth`, `confidence` |
-| 9 | `get_file_outline` | Структура файла | `file`, `start_line`, `end_line`, `include_scopes` |
+| 9 | `get_file_outline` | Структура файла | `file`, `start_line`, `end_line`, `include_scopes`, `include_file_meta` |
 | 10 | `get_imports` | Импорты файла | `file`, `resolve` |
 | 11 | `get_diagnostics` | Dead code, метрики | `kind`, `file`, `include_metrics`, `target` |
 | 12 | `get_stats` | Статистика индекса | `detailed`, `include_workspace`, `include_deps` |
@@ -382,6 +383,7 @@ src/
 │   ├── scope_builder.rs # Построение иерархии scopes
 │   ├── resolver.rs      # Разрешение идентификаторов
 │   ├── import_resolver.rs # Разрешение импортов
+│   ├── sidecar.rs       # Парсинг .code-indexer.yml и staleness detection
 │   ├── walker.rs        # Обход файлов
 │   └── watcher.rs       # File watching
 ├── languages/           # 17 языковых модулей
@@ -411,9 +413,41 @@ CallGraph {
     nodes: Vec<CallGraphNode>,
     edges: Vec<CallGraphEdge> // с confidence
 }
+
+FileMeta {
+    file_path, doc1, purpose, capabilities,
+    invariants, non_goals, security_notes,
+    owner, stability, exported_hash,
+    source (Sidecar|Explicit|Inferred), confidence
+}
 ```
 
-### SQLite схема (9 таблиц)
+### File Tags & Intent Layer
+
+Sidecar-файлы `.code-indexer.yml` позволяют добавлять метаданные к файлам:
+
+```yaml
+directory_tags:
+  - domain:auth
+  - layer:service
+
+files:
+  service.rs:
+    doc1: "Единая точка аутентификации с JWT и OAuth2"
+    purpose: "Централизует логику выдачи и валидации токенов"
+    capabilities: [jwt_generation, oauth2_flow]
+    invariants: ["refresh_token хранится как hash"]
+    stability: stable
+    tags: [pattern:idempotency]
+```
+
+**Возможности:**
+- **Tag search**: `search_symbols(tag=["domain:auth", "layer:service"])`
+- **File meta**: `get_file_outline(include_file_meta=true)` — doc1, purpose, tags
+- **Staleness detection**: предупреждение при изменении публичного API
+- **Tag dictionary**: нормализация через синонимы (authn → auth)
+
+### SQLite схема (12 таблиц)
 
 - `symbols` — символы + FTS5 индекс
 - `scopes` — иерархия областей видимости
@@ -424,6 +458,9 @@ CallGraph {
 - `dependencies` — зависимости
 - `dependency_symbols` — символы из зависимостей
 - `symbol_metrics` — метрики (PageRank, git recency)
+- `tag_dictionary` — словарь тегов с категориями и синонимами
+- `file_meta` — метаданные файлов (doc1, purpose, capabilities, invariants)
+- `file_tags` — связи файл-тег + FTS5 для поиска по doc1/purpose
 
 ## Текущие ограничения
 

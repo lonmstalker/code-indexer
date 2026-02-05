@@ -13,12 +13,15 @@
 ## Основные зоны кода
 - `src/cli` — CLI команды и аргументы.
 - `src/indexer` — индексирование и извлечение символов.
-- `src/index` — SQLite слой и схема.
-- `src/mcp` — MCP server и tools.
+  - `sidecar.rs` — парсинг `.code-indexer.yml`, staleness detection.
+- `src/index` — SQLite слой и схема (12 таблиц, включая tag_dictionary, file_meta, file_tags).
+- `src/mcp` — MCP server и tools (tag, include_file_meta параметры).
 - `src/languages` — registry и tree-sitter грамматики.
 - `src/workspace` и `src/dependencies` — workspace и deps indexing.
 - `tests/` — интеграционные тесты и сценарии MCP/CLI.
+  - `file_tags_integration.rs` — тесты File Tags и Intent Layer.
 - `examples/*` — учебные проекты разных экосистем.
+- `.code-indexer.yml` — sidecar-файлы с метаданными (doc1, purpose, tags).
 
 ## Команды (базовые)
 - Сборка: `cargo build --release`

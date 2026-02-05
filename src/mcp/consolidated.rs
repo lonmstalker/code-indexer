@@ -110,6 +110,12 @@ pub struct SearchSymbolsParams {
     /// Pagination cursor (base64-encoded, from previous response's next_cursor)
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Filter by tags (e.g., ["domain:auth", "layer:service"]) - requires ALL tags to match
+    #[serde(default)]
+    pub tag: Option<Vec<String>>,
+    /// Include file metadata (doc1, tags, stability) in results
+    #[serde(default)]
+    pub include_file_meta: Option<bool>,
 }
 
 // === 5. get_symbol ===
@@ -214,6 +220,9 @@ pub struct GetFileOutlineParams {
     /// Include nested scopes
     #[serde(default)]
     pub include_scopes: Option<bool>,
+    /// Include file metadata (doc1, purpose, tags, capabilities, staleness)
+    #[serde(default)]
+    pub include_file_meta: Option<bool>,
 }
 
 // === 10. get_imports ===

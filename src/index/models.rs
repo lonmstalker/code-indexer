@@ -1205,6 +1205,384 @@ impl DeadCodeReport {
     }
 }
 
+// =====================================================
+// File Tags and Intent Layer Models
+// =====================================================
+
+/// Source of metadata for a file
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetaSource {
+    /// From .code-indexer.yml sidecar file
+    Sidecar,
+    /// From @code-indexer front-matter in source file
+    Explicit,
+    /// Inferred from path/content analysis
+    #[default]
+    Inferred,
+}
+
+impl MetaSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MetaSource::Sidecar => "sidecar",
+            MetaSource::Explicit => "explicit",
+            MetaSource::Inferred => "inferred",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "sidecar" => Some(MetaSource::Sidecar),
+            "explicit" => Some(MetaSource::Explicit),
+            "inferred" => Some(MetaSource::Inferred),
+            _ => None,
+        }
+    }
+}
+
+/// Stability level for a file/module
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stability {
+    /// Stable API, safe to use
+    #[default]
+    Stable,
+    /// Experimental, may change
+    Experimental,
+    /// Deprecated, should not be used
+    Deprecated,
+}
+
+impl Stability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Stability::Stable => "stable",
+            Stability::Experimental => "experimental",
+            Stability::Deprecated => "deprecated",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "stable" => Some(Stability::Stable),
+            "experimental" => Some(Stability::Experimental),
+            "deprecated" => Some(Stability::Deprecated),
+            _ => None,
+        }
+    }
+}
+
+/// Tag dictionary entry for normalization and taxonomy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagDictionary {
+    /// Unique identifier
+    pub id: i64,
+    /// Canonical tag name (e.g., "auth")
+    pub canonical_name: String,
+    /// Tag category (e.g., "domain", "layer", "pattern")
+    pub category: String,
+    /// Human-readable display name (e.g., "Authentication")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// JSON array of synonyms (e.g., ["authn", "login", "sso"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synonyms: Option<Vec<String>>,
+}
+
+impl TagDictionary {
+    pub fn new(canonical_name: impl Into<String>, category: impl Into<String>) -> Self {
+        Self {
+            id: 0,
+            canonical_name: canonical_name.into(),
+            category: category.into(),
+            display_name: None,
+            synonyms: None,
+        }
+    }
+
+    pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn with_synonyms(mut self, synonyms: Vec<String>) -> Self {
+        self.synonyms = Some(synonyms);
+        self
+    }
+
+    /// Checks if a given string matches this tag (canonical name or synonym)
+    pub fn matches(&self, tag: &str) -> bool {
+        let lower = tag.to_lowercase();
+        if self.canonical_name.to_lowercase() == lower {
+            return true;
+        }
+        if let Some(ref syns) = self.synonyms {
+            if syns.iter().any(|s| s.to_lowercase() == lower) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// File-level metadata for Intent Layer
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileMeta {
+    /// File path
+    pub file_path: String,
+    /// One-line summary (~50 chars)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc1: Option<String>,
+    /// Purpose description (what this file does)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// Capabilities provided by this file
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Invariants that must be maintained
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invariants: Vec<String>,
+    /// Non-goals: what this file explicitly does NOT do
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_goals: Vec<String>,
+    /// Security-related notes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_notes: Option<String>,
+    /// Owner (team or person)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Stability level
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stability: Option<Stability>,
+    /// Hash of exported symbols for staleness detection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported_hash: Option<String>,
+    /// Unix timestamp of last extraction
+    pub last_extracted: i64,
+    /// Source of this metadata
+    #[serde(default)]
+    pub source: MetaSource,
+    /// Confidence level (1.0 for explicit, <1.0 for inferred)
+    #[serde(default = "default_meta_confidence")]
+    pub confidence: f64,
+    /// Whether documentation is stale (exported_hash mismatch)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
+    pub is_stale: bool,
+}
+
+fn default_meta_confidence() -> f64 {
+    1.0
+}
+
+impl FileMeta {
+    pub fn new(file_path: impl Into<String>) -> Self {
+        Self {
+            file_path: file_path.into(),
+            last_extracted: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            confidence: 1.0,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_doc1(mut self, doc1: impl Into<String>) -> Self {
+        self.doc1 = Some(doc1.into());
+        self
+    }
+
+    pub fn with_purpose(mut self, purpose: impl Into<String>) -> Self {
+        self.purpose = Some(purpose.into());
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_invariants(mut self, invariants: Vec<String>) -> Self {
+        self.invariants = invariants;
+        self
+    }
+
+    pub fn with_non_goals(mut self, non_goals: Vec<String>) -> Self {
+        self.non_goals = non_goals;
+        self
+    }
+
+    pub fn with_stability(mut self, stability: Stability) -> Self {
+        self.stability = Some(stability);
+        self
+    }
+
+    pub fn with_source(mut self, source: MetaSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub fn with_confidence(mut self, confidence: f64) -> Self {
+        self.confidence = confidence;
+        self
+    }
+
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    pub fn with_exported_hash(mut self, hash: impl Into<String>) -> Self {
+        self.exported_hash = Some(hash.into());
+        self
+    }
+}
+
+/// File tag association
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTag {
+    /// Unique identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    /// File path
+    pub file_path: String,
+    /// Tag dictionary ID
+    pub tag_id: i64,
+    /// Tag name (for convenience, not stored in DB)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_name: Option<String>,
+    /// Tag category (for convenience, not stored in DB)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_category: Option<String>,
+    /// Source of this tag
+    #[serde(default)]
+    pub source: MetaSource,
+    /// Confidence level
+    #[serde(default = "default_meta_confidence")]
+    pub confidence: f64,
+    /// Reason for inference (if source is inferred)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl FileTag {
+    pub fn new(file_path: impl Into<String>, tag_id: i64) -> Self {
+        Self {
+            id: None,
+            file_path: file_path.into(),
+            tag_id,
+            tag_name: None,
+            tag_category: None,
+            source: MetaSource::Inferred,
+            confidence: 1.0,
+            reason: None,
+        }
+    }
+
+    pub fn with_source(mut self, source: MetaSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub fn with_confidence(mut self, confidence: f64) -> Self {
+        self.confidence = confidence;
+        self
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn with_tag_name(mut self, name: impl Into<String>) -> Self {
+        self.tag_name = Some(name.into());
+        self
+    }
+
+    pub fn with_tag_category(mut self, category: impl Into<String>) -> Self {
+        self.tag_category = Some(category.into());
+        self
+    }
+}
+
+/// Compact file metadata for search results (token-efficient)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactFileMeta {
+    /// One-line summary
+    #[serde(rename = "d1", skip_serializing_if = "Option::is_none")]
+    pub doc1: Option<String>,
+    /// Tags as "category:name" strings
+    #[serde(rename = "t", default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Stability (abbreviated)
+    #[serde(rename = "st", skip_serializing_if = "Option::is_none")]
+    pub stability: Option<String>,
+    /// Staleness indicator
+    #[serde(rename = "stale", skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
+    pub is_stale: bool,
+}
+
+impl CompactFileMeta {
+    pub fn from_file_meta(meta: &FileMeta, tags: &[FileTag]) -> Self {
+        Self {
+            doc1: meta.doc1.clone(),
+            tags: tags
+                .iter()
+                .filter_map(|t| {
+                    t.tag_category.as_ref().and_then(|cat| {
+                        t.tag_name.as_ref().map(|name| format!("{}:{}", cat, name))
+                    })
+                })
+                .collect(),
+            stability: meta.stability.map(|s| s.as_str().to_string()),
+            is_stale: meta.is_stale,
+        }
+    }
+}
+
+/// Staleness information for file metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StalenessInfo {
+    /// Whether the documentation is stale
+    pub is_stale: bool,
+    /// Current exported hash
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported_hash: Option<String>,
+    /// Stored hash in metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_hash: Option<String>,
+}
+
+impl StalenessInfo {
+    pub fn fresh(hash: impl Into<String>) -> Self {
+        let h = hash.into();
+        Self {
+            is_stale: false,
+            exported_hash: Some(h.clone()),
+            stored_hash: Some(h),
+        }
+    }
+
+    pub fn stale(current_hash: impl Into<String>, stored_hash: Option<String>) -> Self {
+        Self {
+            is_stale: true,
+            exported_hash: Some(current_hash.into()),
+            stored_hash,
+        }
+    }
+
+    pub fn unknown() -> Self {
+        Self {
+            is_stale: false,
+            exported_hash: None,
+            stored_hash: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,5 +2137,116 @@ mod tests {
         assert_eq!(counts.total, 100);
         assert_eq!(counts.returned, 15);
         assert_eq!(counts.by_kind.get("function"), Some(&10));
+    }
+
+    // === File Tags and Intent Layer tests ===
+
+    #[test]
+    fn test_meta_source_roundtrip() {
+        let sources = [MetaSource::Sidecar, MetaSource::Explicit, MetaSource::Inferred];
+        for source in sources {
+            let s = source.as_str();
+            let parsed = MetaSource::from_str(s).unwrap();
+            assert_eq!(source, parsed);
+        }
+    }
+
+    #[test]
+    fn test_stability_roundtrip() {
+        let stabilities = [Stability::Stable, Stability::Experimental, Stability::Deprecated];
+        for stability in stabilities {
+            let s = stability.as_str();
+            let parsed = Stability::from_str(s).unwrap();
+            assert_eq!(stability, parsed);
+        }
+    }
+
+    #[test]
+    fn test_tag_dictionary_matches() {
+        let tag = TagDictionary::new("auth", "domain")
+            .with_display_name("Authentication")
+            .with_synonyms(vec!["authn".to_string(), "login".to_string()]);
+
+        assert!(tag.matches("auth"));
+        assert!(tag.matches("Auth")); // case insensitive
+        assert!(tag.matches("authn")); // synonym
+        assert!(tag.matches("LOGIN")); // synonym case insensitive
+        assert!(!tag.matches("payment"));
+    }
+
+    #[test]
+    fn test_file_meta_builder() {
+        let meta = FileMeta::new("src/auth/service.rs")
+            .with_doc1("Authentication service")
+            .with_purpose("Handles JWT and OAuth2")
+            .with_capabilities(vec!["jwt_gen".to_string(), "oauth2".to_string()])
+            .with_stability(Stability::Stable)
+            .with_source(MetaSource::Sidecar)
+            .with_owner("team-security");
+
+        assert_eq!(meta.file_path, "src/auth/service.rs");
+        assert_eq!(meta.doc1, Some("Authentication service".to_string()));
+        assert_eq!(meta.capabilities.len(), 2);
+        assert_eq!(meta.stability, Some(Stability::Stable));
+        assert_eq!(meta.source, MetaSource::Sidecar);
+        assert_eq!(meta.owner, Some("team-security".to_string()));
+    }
+
+    #[test]
+    fn test_file_meta_serialization_skips_empty() {
+        let meta = FileMeta::new("test.rs");
+        let json = serde_json::to_string(&meta).unwrap();
+
+        // Empty optional fields should be skipped
+        assert!(!json.contains("\"doc1\""));
+        assert!(!json.contains("\"purpose\""));
+        assert!(!json.contains("\"capabilities\""));
+        assert!(!json.contains("\"invariants\""));
+        assert!(!json.contains("\"is_stale\""));
+    }
+
+    #[test]
+    fn test_file_tag_builder() {
+        let tag = FileTag::new("src/auth.rs", 1)
+            .with_source(MetaSource::Sidecar)
+            .with_confidence(1.0)
+            .with_tag_name("auth")
+            .with_tag_category("domain");
+
+        assert_eq!(tag.file_path, "src/auth.rs");
+        assert_eq!(tag.tag_id, 1);
+        assert_eq!(tag.source, MetaSource::Sidecar);
+        assert_eq!(tag.tag_name, Some("auth".to_string()));
+    }
+
+    #[test]
+    fn test_compact_file_meta() {
+        let meta = FileMeta::new("test.rs")
+            .with_doc1("Test file")
+            .with_stability(Stability::Experimental);
+
+        let tags = vec![
+            FileTag::new("test.rs", 1)
+                .with_tag_name("test")
+                .with_tag_category("infra"),
+        ];
+
+        let compact = CompactFileMeta::from_file_meta(&meta, &tags);
+
+        assert_eq!(compact.doc1, Some("Test file".to_string()));
+        assert_eq!(compact.tags, vec!["infra:test"]);
+        assert_eq!(compact.stability, Some("experimental".to_string()));
+        assert!(!compact.is_stale);
+    }
+
+    #[test]
+    fn test_staleness_info() {
+        let fresh = StalenessInfo::fresh("abc123");
+        assert!(!fresh.is_stale);
+        assert_eq!(fresh.exported_hash, fresh.stored_hash);
+
+        let stale = StalenessInfo::stale("new_hash", Some("old_hash".to_string()));
+        assert!(stale.is_stale);
+        assert_ne!(stale.exported_hash, stale.stored_hash);
     }
 }

@@ -1831,7 +1831,7 @@ impl ServerHandler for McpServer {
 
             // === 4. search_symbols ===
             "search_symbols" => {
-                use crate::index::{CompactSymbol, OutputFormat};
+                use crate::index::{CompactSymbol, CompactFileMeta, OutputFormat};
 
                 let params: SearchSymbolsParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -1849,6 +1849,22 @@ impl ServerHandler for McpServer {
                 let fuzzy = params.fuzzy.unwrap_or(false);
                 let use_regex = params.regex.unwrap_or(false);
                 let file_filter = params.file.clone();
+                let include_file_meta = params.include_file_meta.unwrap_or(false);
+                let tag_filter = params.tag.clone();
+
+                // If tags are specified, first get files matching those tags
+                let tag_filtered_files: Option<std::collections::HashSet<String>> = if let Some(ref tags) = tag_filter {
+                    if !tags.is_empty() {
+                        match self.index.search_files_by_tags(tags) {
+                            Ok(files) => Some(files.into_iter().collect()),
+                            Err(_) => None, // Ignore tag filter errors
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 let options = SearchOptions {
                     limit: params.limit.or(Some(20)),
@@ -1879,26 +1895,76 @@ impl ServerHandler for McpServer {
                 };
 
                 match search_result {
-                    Ok(results) => {
-                        let output = match output_format {
-                            OutputFormat::Full => {
-                                serde_json::to_string_pretty(&results).unwrap_or_default()
+                    Ok(mut results) => {
+                        // Apply tag filter if specified
+                        if let Some(ref allowed_files) = tag_filtered_files {
+                            results.retain(|r| allowed_files.contains(&r.symbol.location.file_path));
+                        }
+
+                        let output = if include_file_meta {
+                            // Build results with file metadata
+                            let mut items: Vec<serde_json::Value> = Vec::new();
+                            let mut file_meta_cache: std::collections::HashMap<String, Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>> = std::collections::HashMap::new();
+
+                            for r in &results {
+                                let file_path = &r.symbol.location.file_path;
+
+                                // Get cached or fetch file metadata
+                                let meta_tags = file_meta_cache.entry(file_path.clone()).or_insert_with(|| {
+                                    self.index.get_file_meta_with_tags(file_path).ok().flatten()
+                                });
+
+                                match output_format {
+                                    OutputFormat::Full => {
+                                        let mut item = serde_json::to_value(&r).unwrap_or_default();
+                                        if let Some((ref meta, ref tags)) = meta_tags {
+                                            let fm = CompactFileMeta::from_file_meta(meta, tags);
+                                            if let serde_json::Value::Object(ref mut map) = item {
+                                                map.insert("fm".to_string(), serde_json::to_value(&fm).unwrap_or_default());
+                                            }
+                                        }
+                                        items.push(item);
+                                    }
+                                    OutputFormat::Compact => {
+                                        let mut compact = serde_json::to_value(CompactSymbol::from_symbol(&r.symbol, Some(r.score))).unwrap_or_default();
+                                        if let Some((ref meta, ref tags)) = meta_tags {
+                                            let fm = CompactFileMeta::from_file_meta(meta, tags);
+                                            if let serde_json::Value::Object(ref mut map) = compact {
+                                                map.insert("fm".to_string(), serde_json::to_value(&fm).unwrap_or_default());
+                                            }
+                                        }
+                                        items.push(compact);
+                                    }
+                                    OutputFormat::Minimal => {
+                                        let minimal = CompactSymbol::from_symbol(&r.symbol, Some(r.score)).to_minimal_string();
+                                        items.push(serde_json::Value::String(minimal));
+                                    }
+                                }
                             }
-                            OutputFormat::Compact => {
-                                let compact: Vec<CompactSymbol> = results
+
+                            serde_json::to_string_pretty(&items).unwrap_or_default()
+                        } else {
+                            // Original behavior without file metadata
+                            match output_format {
+                                OutputFormat::Full => {
+                                    serde_json::to_string_pretty(&results).unwrap_or_default()
+                                }
+                                OutputFormat::Compact => {
+                                    let compact: Vec<CompactSymbol> = results
+                                        .iter()
+                                        .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)))
+                                        .collect();
+                                    serde_json::to_string(&compact).unwrap_or_default()
+                                }
+                                OutputFormat::Minimal => results
                                     .iter()
-                                    .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)))
-                                    .collect();
-                                serde_json::to_string(&compact).unwrap_or_default()
+                                    .map(|r| {
+                                        CompactSymbol::from_symbol(&r.symbol, Some(r.score))
+                                            .to_minimal_string()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                             }
-                            OutputFormat::Minimal => results
-                                .iter()
-                                .map(|r| {
-                                    CompactSymbol::from_symbol(&r.symbol, Some(r.score))
-                                        .to_minimal_string()
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", "),
                         };
                         CallToolResult::success(vec![Content::text(output)])
                     }
@@ -2154,6 +2220,54 @@ impl ServerHandler for McpServer {
                                     "scopes".to_string(),
                                     serde_json::to_value(&scopes).unwrap_or_default(),
                                 );
+                            }
+                        }
+
+                        // Include file metadata (Intent Layer) if requested
+                        if params.include_file_meta.unwrap_or(false) {
+                            if let Ok(Some((meta, tags))) = self.index.get_file_meta_with_tags(&params.file) {
+                                // Build compact file_meta object
+                                let mut file_meta = serde_json::Map::new();
+                                if let Some(ref d1) = meta.doc1 {
+                                    file_meta.insert("doc1".to_string(), serde_json::Value::String(d1.clone()));
+                                }
+                                if let Some(ref purpose) = meta.purpose {
+                                    file_meta.insert("purpose".to_string(), serde_json::Value::String(purpose.clone()));
+                                }
+                                if !meta.capabilities.is_empty() {
+                                    file_meta.insert("capabilities".to_string(), serde_json::to_value(&meta.capabilities).unwrap_or_default());
+                                }
+                                if !meta.invariants.is_empty() {
+                                    file_meta.insert("invariants".to_string(), serde_json::to_value(&meta.invariants).unwrap_or_default());
+                                }
+                                if let Some(stability) = meta.stability {
+                                    file_meta.insert("stability".to_string(), serde_json::Value::String(stability.as_str().to_string()));
+                                }
+                                if let Some(ref owner) = meta.owner {
+                                    file_meta.insert("owner".to_string(), serde_json::Value::String(owner.clone()));
+                                }
+
+                                // Add tags as category:name format
+                                let tag_strs: Vec<String> = tags.iter()
+                                    .filter_map(|t| {
+                                        t.tag_category.as_ref().and_then(|cat| {
+                                            t.tag_name.as_ref().map(|name| format!("{}:{}", cat, name))
+                                        })
+                                    })
+                                    .collect();
+                                if !tag_strs.is_empty() {
+                                    file_meta.insert("tags".to_string(), serde_json::to_value(&tag_strs).unwrap_or_default());
+                                }
+
+                                // Add staleness info
+                                if meta.is_stale {
+                                    file_meta.insert("is_stale".to_string(), serde_json::Value::Bool(true));
+                                }
+                                if let Some(ref hash) = meta.exported_hash {
+                                    file_meta.insert("exported_hash".to_string(), serde_json::Value::String(hash.clone()));
+                                }
+
+                                output.insert("file_meta".to_string(), serde_json::Value::Object(file_meta));
                             }
                         }
 
