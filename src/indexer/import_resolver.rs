@@ -489,6 +489,11 @@ impl ImportResolverRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{Location, SymbolKind};
+
+    // ============================================================================
+    // Rust Import Resolver Tests
+    // ============================================================================
 
     #[test]
     fn test_rust_file_to_module_path() {
@@ -497,16 +502,72 @@ mod tests {
             resolver.file_to_module_path("src/index/models.rs"),
             "index::models"
         );
-        assert_eq!(
-            resolver.file_to_module_path("src/lib.rs"),
-            ""
-        );
+        assert_eq!(resolver.file_to_module_path("src/lib.rs"), "");
     }
 
     #[test]
-    fn test_java_fqdn() {
-        use crate::index::{Location, SymbolKind};
+    fn test_rust_normalize_crate_path() {
+        let resolver = RustImportResolver;
+        let normalized = resolver.normalize_rust_path("crate::index::Symbol", "src/main.rs");
+        assert_eq!(normalized, "crate::index::Symbol");
+    }
 
+    #[test]
+    fn test_rust_normalize_self_path() {
+        let resolver = RustImportResolver;
+        let normalized = resolver.normalize_rust_path("self::submodule::Item", "src/index/mod.rs");
+        assert_eq!(normalized, "index::submodule::Item");
+    }
+
+    #[test]
+    fn test_rust_normalize_super_path() {
+        let resolver = RustImportResolver;
+        let normalized =
+            resolver.normalize_rust_path("super::sibling::func", "src/index/models.rs");
+        assert_eq!(normalized, "index::sibling::func");
+    }
+
+    #[test]
+    fn test_rust_fqdn_function() {
+        let resolver = RustImportResolver;
+        let symbol = Symbol::new(
+            "parse",
+            SymbolKind::Function,
+            Location::new("src/parser/mod.rs", 10, 0, 20, 1),
+            "rust",
+        );
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/parser/mod.rs");
+        assert_eq!(fqdn, "parser::parse");
+    }
+
+    #[test]
+    fn test_rust_fqdn_struct_method() {
+        let resolver = RustImportResolver;
+        let mut symbol = Symbol::new(
+            "new",
+            SymbolKind::Method,
+            Location::new("src/models.rs", 10, 0, 15, 1),
+            "rust",
+        );
+        symbol.parent = Some("Config".to_string());
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/models.rs");
+        assert_eq!(fqdn, "models::Config::new");
+    }
+
+    #[test]
+    fn test_rust_language() {
+        let resolver = RustImportResolver;
+        assert_eq!(resolver.language(), "rust");
+    }
+
+    // ============================================================================
+    // Java Import Resolver Tests
+    // ============================================================================
+
+    #[test]
+    fn test_java_fqdn() {
         let resolver = JavaImportResolver;
         let symbol = Symbol::new(
             "MyClass",
@@ -517,5 +578,208 @@ mod tests {
 
         let fqdn = resolver.compute_fqdn(&symbol, "src/main/java/com/example/MyClass.java");
         assert_eq!(fqdn, "com.example.MyClass");
+    }
+
+    #[test]
+    fn test_java_fqdn_nested_class() {
+        let resolver = JavaImportResolver;
+        let mut symbol = Symbol::new(
+            "Builder",
+            SymbolKind::Class,
+            Location::new("src/main/java/com/example/Config.java", 20, 0, 40, 1),
+            "java",
+        );
+        symbol.parent = Some("Config".to_string());
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/main/java/com/example/Config.java");
+        assert_eq!(fqdn, "com.example.Config.Builder");
+    }
+
+    #[test]
+    fn test_java_language() {
+        let resolver = JavaImportResolver;
+        assert_eq!(resolver.language(), "java");
+    }
+
+    // ============================================================================
+    // TypeScript Import Resolver Tests
+    // ============================================================================
+
+    #[test]
+    fn test_typescript_resolve_relative_path() {
+        let resolver = TypeScriptImportResolver;
+        let resolved = resolver.resolve_import_path("./utils", "src/components/Button.tsx");
+        assert!(resolved.contains("components"));
+    }
+
+    #[test]
+    fn test_typescript_resolve_package_import() {
+        let resolver = TypeScriptImportResolver;
+        let resolved = resolver.resolve_import_path("react", "src/components/Button.tsx");
+        assert_eq!(resolved, "react");
+    }
+
+    #[test]
+    fn test_typescript_fqdn() {
+        let resolver = TypeScriptImportResolver;
+        let symbol = Symbol::new(
+            "Button",
+            SymbolKind::Function,
+            Location::new("src/components/Button.tsx", 1, 0, 50, 1),
+            "typescript",
+        );
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/components/Button.tsx");
+        assert_eq!(fqdn, "components.Button.Button");
+    }
+
+    #[test]
+    fn test_typescript_fqdn_class_method() {
+        let resolver = TypeScriptImportResolver;
+        let mut symbol = Symbol::new(
+            "render",
+            SymbolKind::Method,
+            Location::new("src/components/Widget.tsx", 10, 0, 20, 1),
+            "typescript",
+        );
+        symbol.parent = Some("Widget".to_string());
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/components/Widget.tsx");
+        assert_eq!(fqdn, "components.Widget.Widget.render");
+    }
+
+    #[test]
+    fn test_typescript_language() {
+        let resolver = TypeScriptImportResolver;
+        assert_eq!(resolver.language(), "typescript");
+    }
+
+    // ============================================================================
+    // Python Import Resolver Tests
+    // ============================================================================
+
+    #[test]
+    fn test_python_fqdn() {
+        let resolver = PythonImportResolver;
+        let symbol = Symbol::new(
+            "MyClass",
+            SymbolKind::Class,
+            Location::new("src/models/user.py", 1, 0, 20, 1),
+            "python",
+        );
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/models/user.py");
+        assert!(fqdn.ends_with("user.MyClass"));
+    }
+
+    #[test]
+    fn test_python_fqdn_init_file() {
+        let resolver = PythonImportResolver;
+        let symbol = Symbol::new(
+            "initialize",
+            SymbolKind::Function,
+            Location::new("src/models/__init__.py", 1, 0, 10, 1),
+            "python",
+        );
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/models/__init__.py");
+        // Should not include __init__ in path
+        assert!(fqdn.ends_with("initialize"));
+        assert!(!fqdn.contains("__init__"));
+    }
+
+    #[test]
+    fn test_python_fqdn_class_method() {
+        let resolver = PythonImportResolver;
+        let mut symbol = Symbol::new(
+            "save",
+            SymbolKind::Method,
+            Location::new("src/models/user.py", 10, 0, 15, 1),
+            "python",
+        );
+        symbol.parent = Some("User".to_string());
+
+        let fqdn = resolver.compute_fqdn(&symbol, "src/models/user.py");
+        assert!(fqdn.ends_with("User.save"));
+    }
+
+    #[test]
+    fn test_python_language() {
+        let resolver = PythonImportResolver;
+        assert_eq!(resolver.language(), "python");
+    }
+
+    // ============================================================================
+    // Go Import Resolver Tests
+    // ============================================================================
+
+    #[test]
+    fn test_go_fqdn_function() {
+        let resolver = GoImportResolver;
+        let symbol = Symbol::new(
+            "ParseConfig",
+            SymbolKind::Function,
+            Location::new("pkg/config/parser.go", 10, 0, 30, 1),
+            "go",
+        );
+
+        let fqdn = resolver.compute_fqdn(&symbol, "pkg/config/parser.go");
+        assert_eq!(fqdn, "ParseConfig");
+    }
+
+    #[test]
+    fn test_go_fqdn_method() {
+        let resolver = GoImportResolver;
+        let mut symbol = Symbol::new(
+            "Parse",
+            SymbolKind::Method,
+            Location::new("pkg/config/parser.go", 10, 0, 30, 1),
+            "go",
+        );
+        symbol.parent = Some("Parser".to_string());
+
+        let fqdn = resolver.compute_fqdn(&symbol, "pkg/config/parser.go");
+        assert_eq!(fqdn, "Parser.Parse");
+    }
+
+    #[test]
+    fn test_go_language() {
+        let resolver = GoImportResolver;
+        assert_eq!(resolver.language(), "go");
+    }
+
+    // ============================================================================
+    // Registry Tests
+    // ============================================================================
+
+    #[test]
+    fn test_registry_default() {
+        let registry = ImportResolverRegistry::default();
+        assert!(registry.get("rust").is_some());
+        assert!(registry.get("java").is_some());
+        assert!(registry.get("typescript").is_some());
+        assert!(registry.get("python").is_some());
+        assert!(registry.get("go").is_some());
+    }
+
+    #[test]
+    fn test_registry_unknown_language() {
+        let registry = ImportResolverRegistry::new();
+        assert!(registry.get("unknown").is_none());
+    }
+
+    #[test]
+    fn test_registry_compute_fqdn_fallback() {
+        let registry = ImportResolverRegistry::new();
+        let symbol = Symbol::new(
+            "test",
+            SymbolKind::Function,
+            Location::new("test.xyz", 1, 0, 5, 1),
+            "unknown",
+        );
+
+        // Unknown language returns symbol name
+        let fqdn = registry.compute_fqdn(&symbol, "test.xyz", "unknown");
+        assert_eq!(fqdn, "test");
     }
 }

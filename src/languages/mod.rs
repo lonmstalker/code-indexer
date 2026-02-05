@@ -21,11 +21,16 @@ pub mod hcl;
 
 pub use cross_language::{CrossLanguageAnalyzer, CrossLanguageRef, CrossRefType};
 
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use tree_sitter::Query;
+
+/// Global singleton LanguageRegistry for shared access across threads.
+/// This avoids repeatedly creating new registries and re-initializing grammars.
+static GLOBAL_REGISTRY: Lazy<LanguageRegistry> = Lazy::new(LanguageRegistry::new);
 
 pub trait LanguageGrammar: Send + Sync {
     fn name(&self) -> &'static str;
@@ -130,6 +135,12 @@ impl LanguageRegistry {
     #[allow(dead_code)]
     pub fn supported_languages(&self) -> Vec<&str> {
         self.languages.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Returns a reference to the global singleton LanguageRegistry.
+    /// Use this instead of creating new instances to avoid repeated initialization.
+    pub fn global() -> &'static LanguageRegistry {
+        &GLOBAL_REGISTRY
     }
 }
 

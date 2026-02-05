@@ -9,6 +9,9 @@ pub enum IndexerError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[error("Connection pool error: {0}")]
+    Pool(#[from] r2d2::Error),
+
     #[error("Parse error: {0}")]
     Parse(String),
 
