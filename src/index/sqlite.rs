@@ -47,6 +47,14 @@ impl SqliteIndex {
     /// Default pool size for concurrent connections.
     const DEFAULT_POOL_SIZE: u32 = 4;
 
+    /// Generates SQL placeholders for IN clause: "?, ?, ?"
+    fn generate_placeholders(count: usize) -> String {
+        std::iter::repeat("?")
+            .take(count)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         Self::with_pool_size(db_path, Self::DEFAULT_POOL_SIZE)
     }
@@ -75,6 +83,41 @@ impl SqliteIndex {
         let index = Self { pool };
         index.init_schema()?;
         Ok(index)
+    }
+
+    /// Creates a new SqliteIndex with a write queue for serialized writes.
+    /// Returns the index wrapped in Arc and a handle to the write queue.
+    ///
+    /// The write queue serializes all write operations to prevent SQLITE_BUSY
+    /// errors in concurrent scenarios. Read operations bypass the queue and
+    /// use connection pooling directly.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (index, write_queue) = SqliteIndex::with_write_queue("index.db")?;
+    /// // Read operations use index directly
+    /// let symbols = index.find_definition("foo")?;
+    /// // Write operations go through the queue
+    /// write_queue.add_symbols(vec![symbol]).await?;
+    /// ```
+    pub fn with_write_queue(
+        db_path: impl AsRef<Path>,
+    ) -> Result<(std::sync::Arc<Self>, crate::index::write_queue::WriteQueueHandle)> {
+        let index = std::sync::Arc::new(Self::new(db_path)?);
+        let write_queue = crate::index::write_queue::WriteQueueHandle::new(index.clone());
+        Ok((index, write_queue))
+    }
+
+    /// Creates a new SqliteIndex with a write queue and custom pool/buffer sizes.
+    pub fn with_write_queue_sized(
+        db_path: impl AsRef<Path>,
+        pool_size: u32,
+        queue_buffer_size: usize,
+    ) -> Result<(std::sync::Arc<Self>, crate::index::write_queue::WriteQueueHandle)> {
+        let index = std::sync::Arc::new(Self::with_pool_size(db_path, pool_size)?);
+        let write_queue =
+            crate::index::write_queue::WriteQueueHandle::with_buffer_size(index.clone(), queue_buffer_size);
+        Ok((index, write_queue))
     }
 
     /// Gets a connection from the pool.
@@ -336,6 +379,23 @@ impl SqliteIndex {
         conn.execute(
             "UPDATE dependencies SET is_indexed = 1 WHERE id = ?1",
             params![dep_id],
+        )?;
+        Ok(())
+    }
+
+    /// Marks multiple dependencies as indexed in a single query.
+    /// More efficient than calling mark_dependency_indexed() in a loop.
+    pub fn mark_dependencies_indexed_batch(&self, dep_ids: &[i64]) -> Result<()> {
+        if dep_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn()?;
+        let placeholders = Self::generate_placeholders(dep_ids.len());
+        let params: Vec<&dyn rusqlite::ToSql> =
+            dep_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        conn.execute(
+            &format!("UPDATE dependencies SET is_indexed = 1 WHERE id IN ({})", placeholders),
+            params.as_slice(),
         )?;
         Ok(())
     }
@@ -1574,19 +1634,34 @@ impl CodeIndex for SqliteIndex {
             ids
         };
 
-        // 2. Delete data referencing these symbols
-        for symbol_id in &symbol_ids {
+        // 2. Delete data referencing these symbols (batch with IN clause)
+        if !symbol_ids.is_empty() {
+            let placeholders = Self::generate_placeholders(symbol_ids.len());
+            let params: Vec<&dyn rusqlite::ToSql> =
+                symbol_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
             tx.execute(
-                "DELETE FROM symbol_references WHERE symbol_id = ?1",
-                params![symbol_id],
+                &format!("DELETE FROM symbol_references WHERE symbol_id IN ({})", placeholders),
+                params.as_slice(),
             )?;
             tx.execute(
-                "DELETE FROM call_edges WHERE caller_symbol_id = ?1 OR callee_symbol_id = ?1",
-                params![symbol_id],
+                &format!("DELETE FROM symbol_metrics WHERE symbol_id IN ({})", placeholders),
+                params.as_slice(),
             )?;
+
+            // For call_edges, need double params for caller OR callee
+            let double_params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+                .iter()
+                .chain(symbol_ids.iter())
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            let double_placeholders = Self::generate_placeholders(symbol_ids.len());
             tx.execute(
-                "DELETE FROM symbol_metrics WHERE symbol_id = ?1",
-                params![symbol_id],
+                &format!(
+                    "DELETE FROM call_edges WHERE caller_symbol_id IN ({}) OR callee_symbol_id IN ({})",
+                    double_placeholders, double_placeholders
+                ),
+                double_params.as_slice(),
             )?;
         }
 
@@ -2736,6 +2811,108 @@ impl CodeIndex for SqliteIndex {
 }
 
 impl SqliteIndex {
+    /// Removes multiple files from the index in a single transaction.
+    /// More efficient than calling remove_file() in a loop.
+    pub fn remove_files_batch(&self, file_paths: &[&str]) -> Result<()> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        // 1. Collect all symbol IDs for all files
+        let file_placeholders = Self::generate_placeholders(file_paths.len());
+        let file_params: Vec<&dyn rusqlite::ToSql> = file_paths
+            .iter()
+            .map(|p| p as &dyn rusqlite::ToSql)
+            .collect();
+
+        let symbol_ids: Vec<String> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id FROM symbols WHERE file_path IN ({})",
+                file_placeholders
+            ))?;
+            let ids = stmt
+                .query_map(rusqlite::params_from_iter(file_params.iter().copied()), |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+
+        // 2. Delete data referencing these symbols (batch with IN clause)
+        if !symbol_ids.is_empty() {
+            let placeholders = Self::generate_placeholders(symbol_ids.len());
+            let params: Vec<&dyn rusqlite::ToSql> =
+                symbol_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+            tx.execute(
+                &format!("DELETE FROM symbol_references WHERE symbol_id IN ({})", placeholders),
+                params.as_slice(),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM symbol_metrics WHERE symbol_id IN ({})", placeholders),
+                params.as_slice(),
+            )?;
+
+            let double_params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+                .iter()
+                .chain(symbol_ids.iter())
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            let double_placeholders = Self::generate_placeholders(symbol_ids.len());
+            tx.execute(
+                &format!(
+                    "DELETE FROM call_edges WHERE caller_symbol_id IN ({}) OR callee_symbol_id IN ({})",
+                    double_placeholders, double_placeholders
+                ),
+                double_params.as_slice(),
+            )?;
+        }
+
+        // 3. Delete data referencing these file paths (batch)
+        let file_params: Vec<&dyn rusqlite::ToSql> = file_paths
+            .iter()
+            .map(|p| p as &dyn rusqlite::ToSql)
+            .collect();
+
+        tx.execute(
+            &format!("DELETE FROM symbol_references WHERE referenced_in_file IN ({})", file_placeholders),
+            file_params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM file_imports WHERE file_path IN ({})", file_placeholders),
+            file_params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM scopes WHERE file_path IN ({})", file_placeholders),
+            file_params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM call_edges WHERE file_path IN ({})", file_placeholders),
+            file_params.as_slice(),
+        )?;
+
+        // 4. Delete symbols and file entries
+        tx.execute(
+            &format!("DELETE FROM symbols WHERE file_path IN ({})", file_placeholders),
+            file_params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM files WHERE path IN ({})", file_placeholders),
+            file_params.as_slice(),
+        )?;
+
+        // 5. Increment db revision (only once for the batch)
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Count parameters in a function signature
     fn count_parameters(signature: &str) -> u32 {
         // Find the parameters section (between first ( and matching ))
@@ -2793,6 +2970,47 @@ impl SqliteIndex {
                 now,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Adds or updates multiple documentation digests in a single transaction.
+    /// More efficient than calling add_doc_digest() in a loop.
+    pub fn add_doc_digests_batch(&self, digests: &[crate::docs::DocDigest]) -> Result<()> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        for digest in digests {
+            let headings_json = serde_json::to_string(&digest.headings).unwrap_or_default();
+            let command_blocks_json = serde_json::to_string(&digest.command_blocks).unwrap_or_default();
+            let key_sections_json = serde_json::to_string(&digest.key_sections).unwrap_or_default();
+
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO doc_digests
+                (file_path, doc_type, title, headings, command_blocks, key_sections, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    digest.file_path,
+                    digest.doc_type.as_str(),
+                    digest.title,
+                    headings_json,
+                    command_blocks_json,
+                    key_sections_json,
+                    now,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -4924,5 +5142,167 @@ mod tests {
         let service_stat = stats.iter().find(|(_, name, _)| name == "service");
         assert!(service_stat.is_some());
         assert_eq!(service_stat.unwrap().2, 1);
+    }
+
+    #[test]
+    fn test_remove_files_batch() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Add multiple files with symbols
+        let symbols = vec![
+            create_test_symbol("func1", SymbolKind::Function, "test1.rs", "rust"),
+            create_test_symbol("func2", SymbolKind::Function, "test1.rs", "rust"),
+            create_test_symbol("func3", SymbolKind::Function, "test2.rs", "rust"),
+            create_test_symbol("func4", SymbolKind::Function, "test3.rs", "rust"),
+        ];
+        index.add_symbols(symbols).unwrap();
+
+        // Verify all files exist
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 4);
+
+        // Remove two files in batch
+        index.remove_files_batch(&["test1.rs", "test2.rs"]).unwrap();
+
+        // Verify only test3.rs symbols remain
+        let stats = index.get_stats().unwrap();
+        assert_eq!(stats.total_symbols, 1);
+
+        // Verify the remaining symbol is from test3.rs
+        let results = index.search("func4", &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol.name, "func4");
+    }
+
+    #[test]
+    fn test_remove_files_batch_empty() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Should not fail with empty input
+        let result = index.remove_files_batch(&[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mark_dependencies_indexed_batch() {
+        use crate::dependencies::{Dependency, Ecosystem, ProjectInfo};
+
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Add a project using the constructor
+        let project = ProjectInfo::new("test-project", Ecosystem::Cargo, "/test/Cargo.toml");
+        let project_id = index.add_project(&project).unwrap();
+
+        // Add dependencies using the constructor
+        let deps = vec![
+            Dependency::new("dep1", "1.0", Ecosystem::Cargo),
+            Dependency::new("dep2", "2.0", Ecosystem::Cargo),
+            Dependency::new("dep3", "3.0", Ecosystem::Cargo),
+        ];
+        index.add_dependencies(project_id, &deps).unwrap();
+
+        // Get dep IDs
+        let dep1_id = index.get_dependency_id(project_id, "dep1").unwrap().unwrap();
+        let _dep2_id = index.get_dependency_id(project_id, "dep2").unwrap().unwrap();
+        let dep3_id = index.get_dependency_id(project_id, "dep3").unwrap().unwrap();
+
+        // Mark two dependencies as indexed in batch
+        index.mark_dependencies_indexed_batch(&[dep1_id, dep3_id]).unwrap();
+
+        // Verify: dep1 and dep3 should be indexed, dep2 should not
+        let all_deps = index.get_dependencies(project_id, false).unwrap();
+        let dep1 = all_deps.iter().find(|d| d.name == "dep1").unwrap();
+        let dep2 = all_deps.iter().find(|d| d.name == "dep2").unwrap();
+        let dep3 = all_deps.iter().find(|d| d.name == "dep3").unwrap();
+
+        assert!(dep1.is_indexed);
+        assert!(!dep2.is_indexed);
+        assert!(dep3.is_indexed);
+    }
+
+    #[test]
+    fn test_mark_dependencies_indexed_batch_empty() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Should not fail with empty input
+        let result = index.mark_dependencies_indexed_batch(&[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_add_doc_digests_batch() {
+        use crate::docs::{DocDigest, DocType, Heading};
+
+        let index = SqliteIndex::in_memory().unwrap();
+
+        let digests = vec![
+            DocDigest {
+                file_path: "README.md".to_string(),
+                doc_type: DocType::Readme,
+                title: Some("Project README".to_string()),
+                headings: vec![Heading {
+                    level: 1,
+                    text: "Welcome".to_string(),
+                    line: 1,
+                }],
+                command_blocks: vec![],
+                key_sections: vec![],
+            },
+            DocDigest {
+                file_path: "CONTRIBUTING.md".to_string(),
+                doc_type: DocType::Contributing,
+                title: Some("Contributing Guide".to_string()),
+                headings: vec![Heading {
+                    level: 1,
+                    text: "How to Contribute".to_string(),
+                    line: 1,
+                }],
+                command_blocks: vec![],
+                key_sections: vec![],
+            },
+            DocDigest {
+                file_path: "CHANGELOG.md".to_string(),
+                doc_type: DocType::Changelog,
+                title: None,
+                headings: vec![],
+                command_blocks: vec![],
+                key_sections: vec![],
+            },
+        ];
+
+        // Add all digests in batch
+        index.add_doc_digests_batch(&digests).unwrap();
+
+        // Verify all were added
+        let readme = index.get_doc_digest("README.md").unwrap().unwrap();
+        assert_eq!(readme.title, Some("Project README".to_string()));
+        assert_eq!(readme.doc_type, DocType::Readme);
+
+        let contributing = index.get_doc_digest("CONTRIBUTING.md").unwrap().unwrap();
+        assert_eq!(contributing.title, Some("Contributing Guide".to_string()));
+
+        let changelog = index.get_doc_digest("CHANGELOG.md").unwrap().unwrap();
+        assert_eq!(changelog.doc_type, DocType::Changelog);
+
+        // Verify total count
+        let all_digests = index.get_all_doc_digests().unwrap();
+        assert_eq!(all_digests.len(), 3);
+    }
+
+    #[test]
+    fn test_add_doc_digests_batch_empty() {
+        let index = SqliteIndex::in_memory().unwrap();
+
+        // Should not fail with empty input
+        let result = index.add_doc_digests_batch(&[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_generate_placeholders() {
+        assert_eq!(SqliteIndex::generate_placeholders(0), "");
+        assert_eq!(SqliteIndex::generate_placeholders(1), "?");
+        assert_eq!(SqliteIndex::generate_placeholders(3), "?,?,?");
+        assert_eq!(SqliteIndex::generate_placeholders(5), "?,?,?,?,?");
     }
 }

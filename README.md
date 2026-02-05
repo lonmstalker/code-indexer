@@ -556,16 +556,31 @@ code-indexer tags stats
 
 ## Текущие ограничения
 
-1. **Частичный type inference** — парсинг type hints для Python, TypeScript, Rust, Java, Go. Для кода без аннотаций вызовы остаются Possible
-2. **Нет межпроектных ссылок** — только внутри workspace (планируется: cross-project links)
-3. **Ограниченная поддержка generics** — template instantiation не отслеживается (планируется: generic resolver)
-4. **SQLite single-writer** — нет параллельной записи (используется batch inserts для ускорения)
+1. **Нет межпроектных ссылок** — только внутри workspace (планируется: cross-project links)
+2. **Ограниченная поддержка generics** — template instantiation не отслеживается (планируется: generic resolver)
 
 ### Улучшения производительности
 
+- **WriteQueue для SQLite** — сериализация записей через tokio mpsc channel, предотвращает SQLITE_BUSY ошибки при concurrent writes
 - **Batch writes** — все символы, ссылки и импорты вставляются в одной транзакции (2-3x ускорение)
+- **Batch deletes** — `remove_file()` использует IN clause (3 запроса вместо 3N), `remove_files_batch()` удаляет несколько файлов в одной транзакции
+- **Batch updates** — `mark_dependencies_indexed_batch()` и `add_doc_digests_batch()` для групповых операций
 - **Incremental parsing** — `ParseCache` переиспользует старые деревья tree-sitter (30-50% ускорение для watch mode)
 - **Type-aware call resolution** — `filter_by_type()` использует аннотации типов для disambiguation вызовов методов
+
+### Извлечение типов параметров (9 языков)
+
+| Язык | Поддержка | Примечания |
+|------|:---------:|-----------|
+| Python | ✅ | typed_parameter, typed_default_parameter |
+| TypeScript | ✅ | required_parameter, type_annotation |
+| Rust | ✅ | self_parameter, parameter with type |
+| Java | ✅ | formal_parameter, spread_parameter |
+| Go | ✅ | parameter_declaration, variadic_parameter_declaration |
+| C++ | ✅ | parameter_declaration, pointer_declarator |
+| C# | ✅ | parameter, predefined_type, nullable_type |
+| Swift | ✅ | parameter (direct children), user_type |
+| Kotlin | ✅ | function_value_parameter, parameter |
 
 ## Лицензия
 

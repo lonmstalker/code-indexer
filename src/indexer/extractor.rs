@@ -141,8 +141,18 @@ impl SymbolExtractor {
                         "rust" => self.extract_rust_params(parsed, &pnode),
                         "java" => self.extract_java_params(parsed, &pnode),
                         "go" => self.extract_go_params(parsed, &pnode),
+                        "cpp" => self.extract_cpp_params(parsed, &pnode),
+                        "csharp" => self.extract_csharp_params(parsed, &pnode),
+                        "swift" => self.extract_swift_params(parsed, &pnode),
+                        "kotlin" => self.extract_kotlin_params(parsed, &pnode),
                         _ => Vec::new(),
                     };
+                    if !structured_params.is_empty() {
+                        symbol.params = structured_params;
+                    }
+                } else if parsed.language == "swift" {
+                    // Swift: parameters are direct children of function_declaration, not wrapped in parameter_list
+                    let structured_params = self.extract_swift_params_from_func(parsed, &node);
                     if !structured_params.is_empty() {
                         symbol.params = structured_params;
                     }
@@ -860,6 +870,339 @@ impl SymbolExtractor {
                             param = param.with_type(format!("...{}", t));
                         }
                         param = param.variadic();
+                        params.push(param);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a C++ function/method node
+    fn extract_cpp_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "parameter_declaration" | "optional_parameter_declaration" => {
+                    // C++ parameter: [type] [*&] declarator
+                    // Examples: int x, const std::string& name, int* ptr
+                    let mut name = "";
+                    let mut type_parts: Vec<&str> = Vec::new();
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" => {
+                                // Could be type or name, last identifier is usually the name
+                                if !name.is_empty() {
+                                    // Previous identifier was type
+                                    type_parts.push(name);
+                                }
+                                name = parsed.node_text(&c);
+                            }
+                            "pointer_declarator" | "reference_declarator" => {
+                                // Get the actual identifier from inside
+                                if let Some(inner) = c.child_by_field_name("declarator") {
+                                    name = parsed.node_text(&inner);
+                                } else {
+                                    // Try to find identifier child
+                                    let mut inner_cursor = c.walk();
+                                    for inner_child in c.children(&mut inner_cursor) {
+                                        if inner_child.kind() == "identifier" {
+                                            name = parsed.node_text(&inner_child);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            "type_identifier" | "primitive_type" | "sized_type_specifier" => {
+                                type_parts.push(parsed.node_text(&c));
+                            }
+                            "template_type" | "qualified_identifier" => {
+                                type_parts.push(parsed.node_text(&c));
+                            }
+                            "type_qualifier" => {
+                                // const, volatile, etc.
+                                type_parts.push(parsed.node_text(&c));
+                            }
+                            "*" | "&" | "&&" => {
+                                // Pointer or reference modifiers
+                                type_parts.push(parsed.node_text(&c));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = crate::index::FunctionParam::new(name);
+                        if !type_parts.is_empty() {
+                            param = param.with_type(type_parts.join(" "));
+                        }
+                        params.push(param);
+                    }
+                }
+                "variadic_parameter" => {
+                    // C++ variadic: ... (usually just ellipsis)
+                    params.push(crate::index::FunctionParam::new("...").variadic());
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a C# method/constructor node
+    fn extract_csharp_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            if child.kind() == "parameter" {
+                // C# parameter: [modifiers] type name [= default]
+                // Examples: int x, string? name, ref int value, params string[] args
+                let mut name = "";
+                let mut type_ann: Option<String> = None;
+                let mut is_params = false;
+
+                let mut child_cursor = child.walk();
+                for c in child.children(&mut child_cursor) {
+                    match c.kind() {
+                        "identifier" => {
+                            // Last identifier is the parameter name
+                            name = parsed.node_text(&c);
+                        }
+                        "predefined_type" | "nullable_type" | "array_type" | "generic_name"
+                        | "qualified_name" => {
+                            type_ann = Some(parsed.node_text(&c).to_string());
+                        }
+                        "parameter_modifier" => {
+                            let mod_text = parsed.node_text(&c);
+                            if mod_text == "params" {
+                                is_params = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(t) = type_ann {
+                        param = param.with_type(t);
+                    }
+                    if is_params {
+                        param = param.variadic();
+                    }
+                    params.push(param);
+                }
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a Swift function/method node
+    fn extract_swift_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            if child.kind() == "parameter" {
+                // Swift parameter: [external_name] local_name: Type [= default]
+                // Examples: x: Int, named label: String, _ value: Bool
+                let mut name = "";
+                let mut type_ann: Option<String> = None;
+                let mut is_variadic = false;
+
+                let mut child_cursor = child.walk();
+                for c in child.children(&mut child_cursor) {
+                    match c.kind() {
+                        "simple_identifier" => {
+                            // First identifier might be external name, last is local name
+                            name = parsed.node_text(&c);
+                        }
+                        "type_annotation" => {
+                            // Get the actual type from inside type_annotation
+                            let mut ta_cursor = c.walk();
+                            for tc in c.children(&mut ta_cursor) {
+                                match tc.kind() {
+                                    "user_type" | "array_type" | "dictionary_type"
+                                    | "optional_type" | "metatype" | "function_type"
+                                    | "tuple_type" => {
+                                        type_ann = Some(parsed.node_text(&tc).to_string());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // If we couldn't find a specific type, use the whole annotation minus ":"
+                            if type_ann.is_none() {
+                                let full = parsed.node_text(&c);
+                                if full.starts_with(": ") {
+                                    type_ann = Some(full[2..].to_string());
+                                } else if full.starts_with(':') {
+                                    type_ann = Some(full[1..].trim().to_string());
+                                }
+                            }
+                        }
+                        "..." => {
+                            is_variadic = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(t) = type_ann {
+                        param = param.with_type(t);
+                    }
+                    if is_variadic {
+                        param = param.variadic();
+                    }
+                    params.push(param);
+                }
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a Swift function_declaration node directly.
+    /// Swift doesn't wrap parameters in a parameter_list - they are direct children of function_declaration.
+    fn extract_swift_params_from_func(
+        &self,
+        parsed: &ParsedFile,
+        func_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = func_node.walk();
+
+        // Iterate over direct children of function_declaration looking for parameter nodes
+        for child in func_node.children(&mut cursor) {
+            if child.kind() == "parameter" {
+                // Swift parameter structure:
+                // parameter
+                //   simple_identifier = "a"    <- parameter name
+                //   :
+                //   user_type
+                //     type_identifier = "Int"  <- type
+                let mut name = "";
+                let mut type_ann: Option<String> = None;
+                let mut is_variadic = false;
+
+                let mut child_cursor = child.walk();
+                for c in child.children(&mut child_cursor) {
+                    match c.kind() {
+                        "simple_identifier" => {
+                            // The last simple_identifier is the local parameter name
+                            name = parsed.node_text(&c);
+                        }
+                        "user_type" => {
+                            // Get the type identifier
+                            let mut type_cursor = c.walk();
+                            for tc in c.children(&mut type_cursor) {
+                                if tc.kind() == "type_identifier" {
+                                    type_ann = Some(parsed.node_text(&tc).to_string());
+                                    break;
+                                }
+                            }
+                            // Fallback: use full user_type text
+                            if type_ann.is_none() {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                        }
+                        "array_type" | "dictionary_type" | "optional_type"
+                        | "function_type" | "tuple_type" => {
+                            type_ann = Some(parsed.node_text(&c).to_string());
+                        }
+                        "..." => {
+                            is_variadic = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(t) = type_ann {
+                        param = param.with_type(t);
+                    }
+                    if is_variadic {
+                        param = param.variadic();
+                    }
+                    params.push(param);
+                }
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a Kotlin function/method node
+    fn extract_kotlin_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "parameter" | "function_value_parameter" => {
+                    // Kotlin parameter: [vararg] name: Type [= default]
+                    // Examples: x: Int, name: String = "", vararg items: Any
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+                    let mut is_vararg = false;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "simple_identifier" | "identifier" => {
+                                name = parsed.node_text(&c);
+                            }
+                            "user_type" | "nullable_type" | "function_type" => {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            "parameter_modifiers" | "parameter_modifier" => {
+                                let mod_text = parsed.node_text(&c);
+                                if mod_text.contains("vararg") {
+                                    is_vararg = true;
+                                }
+                            }
+                            "vararg" => {
+                                is_vararg = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = crate::index::FunctionParam::new(name);
+                        if let Some(t) = type_ann {
+                            param = param.with_type(t);
+                        }
+                        if is_vararg {
+                            param = param.variadic();
+                        }
                         params.push(param);
                     }
                 }
@@ -1693,5 +2036,151 @@ func process(data []byte, ptr *int) *string {
         assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("[]byte")));
         assert_eq!(func.params[1].name, "ptr");
         assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("*int")));
+    }
+
+    // C++ type extraction tests
+    #[test]
+    fn test_extract_cpp_function_params() {
+        let source = r#"
+int add(int a, int b) {
+    return a + b;
+}
+"#;
+        let symbols = parse_and_extract(source, "cpp", "test.cpp");
+
+        let func = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "a");
+        assert_eq!(func.params[1].name, "b");
+    }
+
+    #[test]
+    fn test_extract_cpp_const_ref_params() {
+        let source = r#"
+void process(const std::string& name, int* ptr) {
+}
+"#;
+        let symbols = parse_and_extract(source, "cpp", "test.cpp");
+
+        let func = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "name");
+        assert_eq!(func.params[1].name, "ptr");
+    }
+
+    // C# type extraction tests
+    #[test]
+    fn test_extract_csharp_method_params() {
+        let source = r#"
+public class Calculator {
+    public int Add(int a, int b) {
+        return a + b;
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "csharp", "Calculator.cs");
+
+        let method = symbols.iter().find(|s| s.name == "Add").unwrap();
+        assert_eq!(method.params.len(), 2);
+        assert_eq!(method.params[0].name, "a");
+        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("int")));
+        assert_eq!(method.params[1].name, "b");
+    }
+
+    #[test]
+    fn test_extract_csharp_nullable_params() {
+        let source = r#"
+public class Service {
+    public void Process(string? name, int count) {
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "csharp", "Service.cs");
+
+        let method = symbols.iter().find(|s| s.name == "Process").unwrap();
+        assert_eq!(method.params.len(), 2);
+        assert_eq!(method.params[0].name, "name");
+        assert_eq!(method.params[1].name, "count");
+    }
+
+    // Swift type extraction tests
+    #[test]
+    fn test_extract_swift_function_params() {
+        let source = r#"
+func add(a: Int, b: Int) -> Int {
+    return a + b
+}
+"#;
+        let symbols = parse_and_extract(source, "swift", "test.swift");
+
+        let func = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(func.kind, SymbolKind::Function);
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "a");
+        assert_eq!(func.params[0].type_annotation, Some("Int".to_string()));
+        assert_eq!(func.params[1].name, "b");
+        assert_eq!(func.params[1].type_annotation, Some("Int".to_string()));
+    }
+
+    #[test]
+    fn test_extract_swift_optional_params() {
+        let source = r#"
+func process(name: String, count: Int) {
+}
+"#;
+        let symbols = parse_and_extract(source, "swift", "test.swift");
+
+        let func = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(func.kind, SymbolKind::Function);
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "name");
+        assert_eq!(func.params[1].name, "count");
+    }
+
+    // Kotlin type extraction tests
+    #[test]
+    fn test_extract_kotlin_function_params() {
+        let source = r#"
+fun add(a: Int, b: Int): Int {
+    return a + b
+}
+"#;
+        let symbols = parse_and_extract(source, "kotlin", "test.kt");
+
+        let func = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "a");
+        assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("Int")));
+        assert_eq!(func.params[1].name, "b");
+    }
+
+    #[test]
+    fn test_extract_kotlin_nullable_params() {
+        let source = r#"
+fun process(name: String?, count: Int) {
+}
+"#;
+        let symbols = parse_and_extract(source, "kotlin", "test.kt");
+
+        let func = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "name");
+        assert_eq!(func.params[1].name, "count");
+    }
+
+    #[test]
+    fn test_extract_kotlin_vararg_params() {
+        let source = r#"
+fun printf(format: String, vararg args: Any) {
+}
+"#;
+        let symbols = parse_and_extract(source, "kotlin", "test.kt");
+
+        let func = symbols.iter().find(|s| s.name == "printf").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "format");
+        assert_eq!(func.params[1].name, "args");
+        // Note: vararg detection requires grammar query to capture modifiers
+        // Future improvement: detect "vararg" in parameter_modifiers node
     }
 }

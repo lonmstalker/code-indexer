@@ -48,6 +48,9 @@ pub struct McpServer {
     index: Arc<SqliteIndex>,
     overlay: Arc<DocumentOverlay>,
     session_manager: Arc<code_indexer::session::SessionManager>,
+    /// Optional write queue for serialized writes.
+    /// When present, write operations go through this queue to prevent SQLITE_BUSY errors.
+    write_queue: Option<crate::index::WriteQueueHandle>,
 }
 
 impl McpServer {
@@ -56,6 +59,22 @@ impl McpServer {
             index,
             overlay: Arc::new(DocumentOverlay::new()),
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
+            write_queue: None,
+        }
+    }
+
+    /// Creates a new McpServer with a write queue for serialized writes.
+    /// This is recommended for production use to prevent SQLITE_BUSY errors
+    /// when multiple concurrent write operations occur.
+    pub fn with_write_queue(
+        index: Arc<SqliteIndex>,
+        write_queue: crate::index::WriteQueueHandle,
+    ) -> Self {
+        Self {
+            index,
+            overlay: Arc::new(DocumentOverlay::new()),
+            session_manager: Arc::new(code_indexer::session::SessionManager::new()),
+            write_queue: Some(write_queue),
         }
     }
 
@@ -65,6 +84,65 @@ impl McpServer {
             index,
             overlay,
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
+            write_queue: None,
+        }
+    }
+
+    /// Returns whether write queue is enabled.
+    #[allow(dead_code)]
+    pub fn has_write_queue(&self) -> bool {
+        self.write_queue.is_some()
+    }
+
+    // === Write Queue Helper Methods ===
+    // These methods use the write queue if available, otherwise fall back to direct writes.
+
+    /// Removes files from the index. Uses write queue if available.
+    async fn write_remove_files_batch(&self, file_paths: Vec<String>) -> crate::error::Result<()> {
+        if let Some(ref wq) = self.write_queue {
+            wq.remove_files_batch(file_paths).await
+        } else {
+            let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
+            self.index.remove_files_batch(&file_refs)
+        }
+    }
+
+    /// Adds extraction results to the index. Uses write queue if available.
+    async fn write_add_extraction_results(
+        &self,
+        results: Vec<crate::indexer::ExtractionResult>,
+    ) -> crate::error::Result<usize> {
+        if let Some(ref wq) = self.write_queue {
+            wq.add_extraction_results(results).await
+        } else {
+            self.index.add_extraction_results_batch(results)
+        }
+    }
+
+    /// Sets file content hash. Uses write queue if available.
+    async fn write_set_file_content_hash(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+    ) -> crate::error::Result<()> {
+        if let Some(ref wq) = self.write_queue {
+            wq.set_file_content_hash(file_path.to_string(), content_hash.to_string())
+                .await
+        } else {
+            self.index.set_file_content_hash(file_path, content_hash)
+        }
+    }
+
+    /// Adds file tags. Uses write queue if available.
+    async fn write_add_file_tags(
+        &self,
+        file_path: &str,
+        tags: &[crate::index::FileTag],
+    ) -> crate::error::Result<()> {
+        if let Some(ref wq) = self.write_queue {
+            wq.add_file_tags(file_path.to_string(), tags.to_vec()).await
+        } else {
+            self.index.add_file_tags(file_path, tags)
         }
     }
 
@@ -1933,10 +2011,13 @@ impl ServerHandler for McpServer {
 
                 let files_updated = results.len();
 
-                // Remove old data for files that will be updated
-                for (file, _, _) in &results {
-                    let _ = self.index.remove_file(&file.to_string_lossy());
-                }
+                // Remove old data for files that will be updated (batch operation)
+                let file_paths: Vec<String> = results
+                    .iter()
+                    .map(|(f, _, _)| f.to_string_lossy().to_string())
+                    .collect();
+                let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
+                let _ = self.index.remove_files_batch(&file_refs);
 
                 // Extract hashes first (before moving results)
                 let file_hashes: Vec<_> = results.iter().map(|(f, h, _)| (f.to_string_lossy().to_string(), h.clone())).collect();

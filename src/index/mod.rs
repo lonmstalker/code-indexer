@@ -2,10 +2,12 @@ pub mod migrations;
 pub mod models;
 pub mod overlay;
 pub mod sqlite;
+pub mod write_queue;
 
 use crate::error::Result;
 pub use models::*;
 pub use overlay::DocumentOverlay;
+pub use write_queue::WriteQueueHandle;
 
 pub trait CodeIndex: Send + Sync {
     #[allow(dead_code)]
