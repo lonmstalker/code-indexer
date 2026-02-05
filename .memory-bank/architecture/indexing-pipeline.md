@@ -8,9 +8,13 @@ description: "Пайплайн индексирования: от FileWalker д�
 
 ## Основная цепочка
 1. File discovery: `FileWalker::new(LanguageRegistry)` собирает поддерживаемые файлы.
-2. Parsing: `Parser::parse_file` строит AST через tree-sitter.
-3. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports.
-4. Persist: `SqliteIndex::add_extraction_results_batch` сохраняет данные в SQLite.
+2. Progress init: `IndexingProgress::start(files.len())` — shared atomic state для tracking.
+3. Parsing: `Parser::parse_file` строит AST через tree-sitter (rayon par_iter).
+4. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports. `progress.inc()` на каждый файл.
+5. Persist: `SqliteIndex::add_extraction_results_batch` сохраняет данные в SQLite.
+6. Finish: `progress.finish()` — финализация прогресса.
+
+CLI использует `indicatif::ProgressBar` для визуализации. MCP предоставляет `get_indexing_status` tool для polling.
 
 ## Watch mode
 - `FileWatcher` отслеживает изменения.

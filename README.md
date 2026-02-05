@@ -4,7 +4,7 @@ CLI-инструмент и MCP-сервер для индексации и се
 
 ## Возможности
 
-- **12 консолидированных MCP tools** для AI-агентов (Claude, GPT и др.)
+- **23 MCP tools** для AI-агентов (Claude, GPT и др.)
 - **17 языков программирования** с полной поддержкой синтаксиса
 - **Semantic analysis** — scope resolution, import resolution, FQDN computation
 - **Call graph с confidence** — различие между certain и possible вызовами
@@ -69,6 +69,12 @@ cargo install --path .
 ```
 
 ### Индексация проекта
+
+CLI показывает реалтайм progress bar с ETA:
+
+```
+⠋ [################>-----------------------] 847/2160 (39%) | 00:01:23 ETA 00:02:05 | indexing...
+```
 
 ```bash
 # Индексация текущей директории
@@ -297,7 +303,7 @@ JSON для программной обработки:
 UserService:cls@src/UserService.java:10
 ```
 
-## MCP Tools (12 консолидированных)
+## MCP Tools (23)
 
 | # | Tool | Описание | Ключевые параметры |
 |---|------|----------|-------------------|
@@ -314,6 +320,7 @@ UserService:cls@src/UserService.java:10
 | 11 | `get_diagnostics` | Dead code, метрики | `kind`, `file`, `include_metrics`, `target` |
 | 12 | `get_stats` | Статистика индекса | `detailed`, `include_workspace`, `include_deps` |
 | 22 | `manage_tags` | Управление tag inference | `action`, `pattern`, `tags`, `confidence`, `file`, `path` |
+| 23 | `get_indexing_status` | Прогресс индексации | — (без параметров) |
 
 ### Backward Compatibility
 
@@ -373,8 +380,8 @@ UserService:cls@src/UserService.java:10
 src/
 ├── cli/commands.rs      # CLI команды
 ├── mcp/
-│   ├── server.rs        # MCP сервер (12 tools)
-│   └── consolidated.rs  # Консолидированные ответы
+│   ├── server.rs        # MCP сервер (23 tools)
+│   └── consolidated.rs  # Консолидированные параметры tools
 ├── index/
 │   ├── models.rs        # Symbol, Scope, Reference, CallGraph
 │   ├── sqlite.rs        # SQLite хранилище + FTS5
@@ -386,6 +393,7 @@ src/
 │   ├── resolver.rs      # Разрешение идентификаторов
 │   ├── import_resolver.rs # Разрешение импортов
 │   ├── sidecar.rs       # Парсинг .code-indexer.yml и staleness detection
+│   ├── progress.rs      # Shared progress state (atomic counters)
 │   ├── walker.rs        # Обход файлов
 │   └── watcher.rs       # File watching
 ├── languages/           # 17 языковых модулей

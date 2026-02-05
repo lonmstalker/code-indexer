@@ -14,6 +14,7 @@
 - `src/cli` — CLI команды и аргументы.
 - `src/indexer` — индексирование и извлечение символов.
   - `sidecar.rs` — парсинг `.code-indexer.yml`, staleness detection.
+  - `progress.rs` — shared progress state (atomic counters) для CLI progress bar и MCP `get_indexing_status`.
 - `src/index` — SQLite слой и схема (12 таблиц, включая tag_dictionary, file_meta, file_tags).
 - `src/mcp` — MCP server и tools (tag, include_file_meta параметры).
 - `src/languages` — registry и tree-sitter грамматики.

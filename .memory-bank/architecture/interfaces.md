@@ -19,7 +19,7 @@ description: "Поверхности CLI и MCP tools, их назначение
 - `deps` — операции с зависимостями.
 - `query` — legacy namespace (deprecated).
 
-## MCP Surface (12 consolidated tools)
+## MCP Surface (23 tools)
 - `index_workspace` — индексация проекта. Params: `path`, `watch`, `include_deps`.
 - `update_files` — virtual documents. Params: `files[]` с `path`, `content`, `version`.
 - `list_symbols` — список символов. Params: `kind`, `language`, `file`, `pattern`, `limit`, `format`.
@@ -32,6 +32,8 @@ description: "Поверхности CLI и MCP tools, их назначение
 - `get_imports` — импорты файла. Params: `file`, `resolve`.
 - `get_diagnostics` — dead code и метрики. Params: `kind`, `file`, `include_metrics`, `target`.
 - `get_stats` — статистика индекса. Params: `detailed`, `include_workspace`, `include_deps`.
+- `manage_tags` — управление tag inference rules. Params: `action`, `pattern`, `tags`, `confidence`, `file`, `path`.
+- `get_indexing_status` — прогресс текущей индексации (files_processed, progress_pct, eta_ms). Без параметров.
 
 ## Связанные материалы
 [.memory-bank/guides/interfaces.md](../guides/interfaces.md): практическое использование CLI и MCP.

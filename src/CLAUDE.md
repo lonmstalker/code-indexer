@@ -10,5 +10,6 @@
 
 Важные подмодули:
 - `indexer/sidecar.rs` — парсинг `.code-indexer.yml`, extract_file_meta, extract_file_tags, staleness detection.
-- `index/migrations.rs` — миграции V1-V6, включая tag_dictionary, file_meta, file_tags.
+- `indexer/progress.rs` — `IndexingProgress` (Arc + atomics) для CLI progress bar и MCP `get_indexing_status`.
+- `index/migrations.rs` — миграции V1-V7, включая tag_dictionary, file_meta, file_tags, generic_params.
 - `index/models.rs` — FileMeta, FileTag, TagDictionary, Stability, MetaSource.
