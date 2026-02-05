@@ -25,6 +25,46 @@ impl CallAnalyzer {
         Self
     }
 
+    /// Filter candidates by receiver type.
+    /// If receiver_type matches a candidate's parent, that candidate is preferred.
+    /// Returns (best_match, is_certain) where is_certain is true if exactly one match found.
+    fn filter_by_type<'a>(
+        candidates: &'a [crate::index::Symbol],
+        receiver_type: Option<&str>,
+    ) -> (Option<&'a crate::index::Symbol>, bool) {
+        if candidates.is_empty() {
+            return (None, false);
+        }
+
+        if candidates.len() == 1 {
+            return (Some(&candidates[0]), true);
+        }
+
+        // If we have a receiver type, try to match it to parent
+        if let Some(rt) = receiver_type {
+            let rt_lower = rt.to_lowercase();
+            let matches: Vec<_> = candidates
+                .iter()
+                .filter(|s| {
+                    s.parent
+                        .as_ref()
+                        .map(|p| p.to_lowercase().contains(&rt_lower) || rt_lower.contains(&p.to_lowercase()))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if matches.len() == 1 {
+                return (Some(matches[0]), true);
+            } else if !matches.is_empty() {
+                // Multiple matches but at least filtered down
+                return (Some(matches[0]), false);
+            }
+        }
+
+        // No type filtering possible, return first with uncertainty
+        (Some(&candidates[0]), false)
+    }
+
     /// Analyzes a call expression and determines confidence level
     pub fn analyze_call(
         &self,
@@ -246,35 +286,39 @@ impl CallAnalyzer {
 
     fn resolve_java_method(
         &self,
-        _receiver: &str,
+        receiver: &str,
         method_name: &str,
         index: &dyn CodeIndex,
     ) -> Result<CallAnalysisResult> {
         let methods = index.find_definition(method_name)?;
 
-        match methods.len() {
-            0 => Ok(CallAnalysisResult {
+        if methods.is_empty() {
+            return Ok(CallAnalysisResult {
                 callee_name: method_name.to_string(),
                 callee_id: None,
                 confidence: CallConfidence::Possible,
                 reason: Some(UncertaintyReason::ExternalLibrary),
-            }),
-            1 => Ok(CallAnalysisResult {
-                callee_name: method_name.to_string(),
-                callee_id: Some(methods[0].id.clone()),
-                confidence: CallConfidence::Certain,
-                reason: None,
-            }),
-            _ => {
-                // Java can have overloaded methods - need type info to resolve
-                Ok(CallAnalysisResult {
-                    callee_name: method_name.to_string(),
-                    callee_id: Some(methods[0].id.clone()),
-                    confidence: CallConfidence::Possible,
-                    reason: Some(UncertaintyReason::MultipleCandidates),
-                })
-            }
+            });
         }
+
+        // Use type filtering for multiple candidates
+        let receiver_type = if receiver.is_empty() { None } else { Some(receiver) };
+        let (best_match, is_certain) = Self::filter_by_type(&methods, receiver_type);
+
+        Ok(CallAnalysisResult {
+            callee_name: method_name.to_string(),
+            callee_id: best_match.map(|s| s.id.clone()),
+            confidence: if is_certain {
+                CallConfidence::Certain
+            } else {
+                CallConfidence::Possible
+            },
+            reason: if !is_certain && methods.len() > 1 {
+                Some(UncertaintyReason::MultipleCandidates)
+            } else {
+                None
+            },
+        })
     }
 
     /// Analyzes a TypeScript/JavaScript call expression
@@ -294,13 +338,18 @@ impl CallAnalyzer {
 
                     // Check for member expression (obj.method())
                     if function.kind() == "member_expression" {
+                        // Extract receiver (object) for potential type matching
+                        let receiver_type = function
+                            .child_by_field_name("object")
+                            .map(|obj| &source[obj.byte_range()]);
+
                         if let Some(property) = function.child_by_field_name("property") {
                             let method_name = &source[property.byte_range()];
-                            return self.resolve_ts_function(method_name, index);
+                            return self.resolve_ts_method(method_name, receiver_type, index);
                         }
                     }
 
-                    return self.resolve_ts_function(func_text, index);
+                    return self.resolve_ts_method(func_text, None, index);
                 }
             }
             _ => {}
@@ -309,34 +358,40 @@ impl CallAnalyzer {
         Ok(CallAnalysisResult::unresolved("unknown"))
     }
 
-    fn resolve_ts_function(
+    fn resolve_ts_method(
         &self,
         func_name: &str,
+        receiver_type: Option<&str>,
         index: &dyn CodeIndex,
     ) -> Result<CallAnalysisResult> {
-        // TypeScript is dynamically typed, so most calls are potentially uncertain
         let functions = index.find_definition(func_name)?;
 
-        match functions.len() {
-            0 => Ok(CallAnalysisResult {
+        if functions.is_empty() {
+            return Ok(CallAnalysisResult {
                 callee_name: func_name.to_string(),
                 callee_id: None,
                 confidence: CallConfidence::Possible,
                 reason: Some(UncertaintyReason::DynamicReceiver),
-            }),
-            1 => Ok(CallAnalysisResult {
-                callee_name: func_name.to_string(),
-                callee_id: Some(functions[0].id.clone()),
-                confidence: CallConfidence::Certain,
-                reason: None,
-            }),
-            _ => Ok(CallAnalysisResult {
-                callee_name: func_name.to_string(),
-                callee_id: Some(functions[0].id.clone()),
-                confidence: CallConfidence::Possible,
-                reason: Some(UncertaintyReason::MultipleCandidates),
-            }),
+            });
         }
+
+        // Use type filtering for multiple candidates
+        let (best_match, is_certain) = Self::filter_by_type(&functions, receiver_type);
+
+        Ok(CallAnalysisResult {
+            callee_name: func_name.to_string(),
+            callee_id: best_match.map(|s| s.id.clone()),
+            confidence: if is_certain {
+                CallConfidence::Certain
+            } else {
+                CallConfidence::Possible
+            },
+            reason: if !is_certain && functions.len() > 1 {
+                Some(UncertaintyReason::MultipleCandidates)
+            } else {
+                None
+            },
+        })
     }
 
     /// Analyzes a Python call expression

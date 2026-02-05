@@ -60,7 +60,9 @@ impl SymbolExtractor {
             let mut name: Option<&str> = None;
             let mut kind = SymbolKind::Function;
             let mut node: Option<tree_sitter::Node> = None;
+            let mut params_node: Option<tree_sitter::Node> = None;
             let mut signature_parts: Vec<&str> = Vec::new();
+            let mut return_type_text: Option<&str> = None;
 
             for capture in m.captures {
                 let capture_name = query.capture_names()[capture.index as usize];
@@ -80,9 +82,11 @@ impl SymbolExtractor {
                         }
                     }
                     "params" | "method_params" => {
+                        params_node = Some(capture.node);
                         signature_parts.push(text);
                     }
                     "return_type" | "method_return_type" => {
+                        return_type_text = Some(text);
                         signature_parts.push(text);
                     }
                     _ => {}
@@ -112,7 +116,7 @@ impl SymbolExtractor {
                     node.end_position().column as u32,
                 );
 
-                let mut symbol = Symbol::new(name, kind, location, &parsed.language);
+                let mut symbol = Symbol::new(name, kind.clone(), location, &parsed.language);
 
                 let visibility = self.extract_visibility(parsed, &node);
                 if let Some(v) = visibility {
@@ -127,6 +131,23 @@ impl SymbolExtractor {
                 if !signature_parts.is_empty() {
                     symbol =
                         symbol.with_signature(format!("{}{}", name, signature_parts.join(" -> ")));
+                }
+
+                // Extract structured parameters for Python and TypeScript
+                if let Some(pnode) = params_node {
+                    let structured_params = match parsed.language.as_str() {
+                        "python" => self.extract_python_params(parsed, &pnode),
+                        "typescript" => self.extract_ts_params(parsed, &pnode),
+                        _ => Vec::new(),
+                    };
+                    if !structured_params.is_empty() {
+                        symbol.params = structured_params;
+                    }
+                }
+
+                // Extract return type
+                if let Some(rt) = return_type_text {
+                    symbol.return_type = Some(rt.to_string());
                 }
 
                 symbols.push(symbol);
@@ -406,6 +427,251 @@ impl SymbolExtractor {
         }
 
         Ok(())
+    }
+
+    /// Extract structured parameters from a Python function/method node
+    fn extract_python_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "identifier" => {
+                    // Simple untyped parameter
+                    let name = parsed.node_text(&child);
+                    if name != "self" && name != "cls" {
+                        params.push(crate::index::FunctionParam::new(name));
+                    } else {
+                        params.push(crate::index::FunctionParam::new(name).is_self_param());
+                    }
+                }
+                "typed_parameter" => {
+                    // Parameter with type hint: name: type
+                    // Structure: identifier, ":", type (which contains identifier)
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" if name.is_empty() => {
+                                name = parsed.node_text(&c);
+                            }
+                            "type" => {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(t) = type_ann {
+                        param = param.with_type(t);
+                    }
+                    if name == "self" || name == "cls" {
+                        param = param.is_self_param();
+                    }
+                    params.push(param);
+                }
+                "default_parameter" => {
+                    // Parameter with default: name = value
+                    // Structure: identifier, "=", value
+                    let mut name = "";
+                    let mut default: Option<String> = None;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" if name.is_empty() => {
+                                name = parsed.node_text(&c);
+                            }
+                            _ if c.kind() != "=" && !name.is_empty() && default.is_none() => {
+                                default = Some(parsed.node_text(&c).to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(d) = default {
+                        param = param.with_default(d);
+                    }
+                    params.push(param);
+                }
+                "typed_default_parameter" => {
+                    // Parameter with type and default: name: type = value
+                    // Structure: identifier, ":", type, "=", value
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+                    let mut default: Option<String> = None;
+                    let mut saw_equals = false;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" if name.is_empty() => {
+                                name = parsed.node_text(&c);
+                            }
+                            "type" => {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            "=" => {
+                                saw_equals = true;
+                            }
+                            _ if saw_equals && default.is_none() => {
+                                default = Some(parsed.node_text(&c).to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(t) = type_ann {
+                        param = param.with_type(t);
+                    }
+                    if let Some(d) = default {
+                        param = param.with_default(d);
+                    }
+                    params.push(param);
+                }
+                "list_splat_pattern" => {
+                    // *args - structure contains identifier
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        if c.kind() == "identifier" {
+                            params.push(
+                                crate::index::FunctionParam::new(parsed.node_text(&c))
+                                    .variadic()
+                            );
+                            break;
+                        }
+                    }
+                }
+                "dictionary_splat_pattern" => {
+                    // **kwargs - structure contains identifier
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        if c.kind() == "identifier" {
+                            params.push(
+                                crate::index::FunctionParam::new(parsed.node_text(&c))
+                                    .variadic()
+                            );
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a TypeScript function/method node
+    fn extract_ts_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "required_parameter" | "optional_parameter" => {
+                    // Structure: identifier, type_annotation (contains ":" and type)
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" if name.is_empty() => {
+                                name = parsed.node_text(&c);
+                            }
+                            "type_annotation" => {
+                                // type_annotation contains ":" and the actual type
+                                // Extract just the type part (skip the colon)
+                                let mut type_cursor = c.walk();
+                                for tc in c.children(&mut type_cursor) {
+                                    if tc.kind() != ":" {
+                                        type_ann = Some(parsed.node_text(&tc).to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let mut param = crate::index::FunctionParam::new(name);
+                    if let Some(t) = type_ann {
+                        param = param.with_type(t);
+                    }
+                    if name == "this" {
+                        param = param.is_self_param();
+                    }
+                    params.push(param);
+                }
+                "identifier" => {
+                    // Simple parameter without type
+                    let name = parsed.node_text(&child);
+                    if name != "this" {
+                        params.push(crate::index::FunctionParam::new(name));
+                    } else {
+                        params.push(crate::index::FunctionParam::new(name).is_self_param());
+                    }
+                }
+                "rest_pattern" => {
+                    // ...args - structure contains identifier
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        if c.kind() == "identifier" {
+                            params.push(
+                                crate::index::FunctionParam::new(parsed.node_text(&c))
+                                    .variadic()
+                            );
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract return type from a function node
+    #[allow(dead_code)]
+    fn extract_return_type(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+        language: &str,
+    ) -> Option<String> {
+        match language {
+            "python" => {
+                // Look for return_type child
+                node.child_by_field_name("return_type")
+                    .map(|n| parsed.node_text(&n).to_string())
+            }
+            "typescript" => {
+                // Look for return_type or type_annotation
+                node.child_by_field_name("return_type")
+                    .map(|n| parsed.node_text(&n).to_string())
+            }
+            "rust" => {
+                // Look for return_type
+                node.child_by_field_name("return_type")
+                    .map(|n| parsed.node_text(&n).to_string())
+            }
+            _ => None,
+        }
     }
 
     /// Check if a type name is a built-in/primitive type
@@ -784,5 +1050,114 @@ fn func2() {}
         let ids: Vec<_> = symbols.iter().map(|s| &s.id).collect();
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), unique_ids.len());
+    }
+
+    // === Python Type Hints Tests ===
+
+    #[test]
+    fn test_extract_python_function_with_type_hints() {
+        let source = r#"
+def greet(name: str, age: int) -> str:
+    return f"Hello {name}, you are {age}"
+"#;
+        let symbols = parse_and_extract(source, "python", "test.py");
+
+        let func = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(func.kind, SymbolKind::Function);
+
+        // Check return type
+        assert_eq!(func.return_type, Some("str".to_string()));
+
+        // Check params have type annotations
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "name");
+        assert_eq!(func.params[0].type_annotation, Some("str".to_string()));
+        assert_eq!(func.params[1].name, "age");
+        assert_eq!(func.params[1].type_annotation, Some("int".to_string()));
+    }
+
+    #[test]
+    fn test_extract_python_method_with_self() {
+        let source = r#"
+class User:
+    def get_name(self, format: str) -> str:
+        return self.name
+"#;
+        let symbols = parse_and_extract(source, "python", "test.py");
+
+        let method = symbols.iter().find(|s| s.name == "get_name").unwrap();
+        assert_eq!(method.kind, SymbolKind::Method);
+
+        // self should be first param
+        assert!(!method.params.is_empty());
+        assert_eq!(method.params[0].name, "self");
+        assert!(method.params[0].is_self);
+    }
+
+    #[test]
+    fn test_extract_python_function_with_default_params() {
+        let source = r#"
+def connect(host: str, port: int = 8080) -> bool:
+    pass
+"#;
+        let symbols = parse_and_extract(source, "python", "test.py");
+
+        let func = symbols.iter().find(|s| s.name == "connect").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[1].name, "port");
+        assert_eq!(func.params[1].type_annotation, Some("int".to_string()));
+        assert_eq!(func.params[1].default_value, Some("8080".to_string()));
+    }
+
+    #[test]
+    fn test_extract_python_function_without_type_hints() {
+        let source = r#"
+def legacy_func(x, y):
+    return x + y
+"#;
+        let symbols = parse_and_extract(source, "python", "test.py");
+
+        let func = symbols.iter().find(|s| s.name == "legacy_func").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert!(func.params[0].type_annotation.is_none());
+        assert!(func.return_type.is_none());
+    }
+
+    #[test]
+    fn test_extract_python_variadic_params() {
+        let source = r#"
+def varargs(*args, **kwargs):
+    pass
+"#;
+        let symbols = parse_and_extract(source, "python", "test.py");
+
+        let func = symbols.iter().find(|s| s.name == "varargs").unwrap();
+        // Check variadic params are extracted
+        let variadic_params: Vec<_> = func.params.iter().filter(|p| p.is_variadic).collect();
+        assert_eq!(variadic_params.len(), 2);
+    }
+
+    // === TypeScript Type Tests ===
+
+    #[test]
+    fn test_extract_typescript_function_with_types() {
+        let source = r#"
+function add(a: number, b: number): number {
+    return a + b;
+}
+"#;
+        let symbols = parse_and_extract(source, "typescript", "test.ts");
+
+        let func = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(func.kind, SymbolKind::Function);
+        // Return type from query capture includes ": number"
+        assert!(func.return_type.as_ref().map_or(false, |t| t.contains("number")));
+
+        // Check params have correctly extracted types (without colon prefix)
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "a");
+        assert_eq!(func.params[0].type_annotation, Some("number".to_string()));
+        assert_eq!(func.params[1].name, "b");
+        assert_eq!(func.params[1].type_annotation, Some("number".to_string()));
     }
 }
