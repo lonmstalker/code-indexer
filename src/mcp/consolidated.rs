@@ -946,6 +946,14 @@ pub struct TagPreviewResult {
     pub confidence: f64,
 }
 
+// =====================================================
+// Indexing Progress Types
+// =====================================================
+
+/// Parameters for get_indexing_status (no parameters needed)
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GetIndexingStatusParams {}
+
 /// Tag statistics entry
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TagStatInfo {

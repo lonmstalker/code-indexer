@@ -51,6 +51,7 @@ pub struct McpServer {
     /// Optional write queue for serialized writes.
     /// When present, write operations go through this queue to prevent SQLITE_BUSY errors.
     write_queue: Option<crate::index::WriteQueueHandle>,
+    indexing_progress: crate::indexer::IndexingProgress,
 }
 
 impl McpServer {
@@ -60,6 +61,7 @@ impl McpServer {
             overlay: Arc::new(DocumentOverlay::new()),
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
             write_queue: None,
+            indexing_progress: crate::indexer::IndexingProgress::new(),
         }
     }
 
@@ -75,6 +77,7 @@ impl McpServer {
             overlay: Arc::new(DocumentOverlay::new()),
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
             write_queue: Some(write_queue),
+            indexing_progress: crate::indexer::IndexingProgress::new(),
         }
     }
 
@@ -85,6 +88,7 @@ impl McpServer {
             overlay,
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
             write_queue: None,
+            indexing_progress: crate::indexer::IndexingProgress::new(),
         }
     }
 
@@ -1879,6 +1883,22 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
+            // 23. get_indexing_status - Check indexing progress
+            Tool {
+                name: "get_indexing_status".into(),
+                title: Some("Get Indexing Status".to_string()),
+                description: Some(
+                    "Check current indexing progress. Returns files processed/total, symbols extracted, \
+                     errors, progress percentage, elapsed time, and ETA. Use to poll indexing status \
+                     after calling index_workspace."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetIndexingStatusParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
         ];
 
         Ok(ListToolsResult {
@@ -1987,6 +2007,10 @@ impl ServerHandler for McpServer {
 
                 let files_skipped = files_count - files_to_index.len();
 
+                // Start progress tracking
+                self.indexing_progress.start(files_to_index.len());
+                let progress_ref = &self.indexing_progress;
+
                 // Parallel parsing and extraction using rayon
                 let results: Vec<(std::path::PathBuf, String, crate::indexer::ExtractionResult)> = files_to_index
                     .into_par_iter()
@@ -2001,10 +2025,19 @@ impl ServerHandler for McpServer {
 
                         match parser.parse_file(&file) {
                             Ok(parsed) => match extractor.extract_all(&parsed, &file) {
-                                Ok(result) => Some((file.clone(), hash, result)),
-                                Err(_) => None,
+                                Ok(result) => {
+                                    progress_ref.inc(result.symbols.len());
+                                    Some((file.clone(), hash, result))
+                                }
+                                Err(_) => {
+                                    progress_ref.inc_error();
+                                    None
+                                }
                             },
-                            Err(_) => None,
+                            Err(_) => {
+                                progress_ref.inc_error();
+                                None
+                            }
                         }
                     })
                     .collect();
@@ -2038,6 +2071,8 @@ impl ServerHandler for McpServer {
                     let _ = self.index.set_file_content_hash(&file_path, &hash);
                 }
 
+                self.indexing_progress.finish();
+
                 let output = serde_json::json!({
                     "status": "indexed",
                     "path": workspace_path,
@@ -2048,6 +2083,7 @@ impl ServerHandler for McpServer {
                     "incremental": true,
                     "watch": params.watch.unwrap_or(false),
                     "include_deps": params.include_deps.unwrap_or(false),
+                    "progress": "completed",
                 });
                 CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&output).unwrap_or_default(),
@@ -3779,6 +3815,23 @@ impl ServerHandler for McpServer {
 
                 CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )])
+            }
+
+            "get_indexing_status" => {
+                let snap = self.indexing_progress.snapshot();
+                let output = serde_json::json!({
+                    "is_active": snap.is_active,
+                    "files_total": snap.files_total,
+                    "files_processed": snap.files_processed,
+                    "symbols_extracted": snap.symbols_extracted,
+                    "errors": snap.errors,
+                    "progress_pct": (snap.progress_pct * 10.0).round() / 10.0,
+                    "elapsed_ms": snap.elapsed_ms,
+                    "eta_ms": snap.eta_ms,
+                });
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&output).unwrap_or_default(),
                 )])
             }
 

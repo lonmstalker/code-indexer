@@ -2,6 +2,7 @@ pub mod call_analyzer;
 pub mod extractor;
 pub mod import_resolver;
 pub mod parser;
+pub mod progress;
 pub mod resolver;
 pub mod scope_builder;
 pub mod sidecar;
@@ -15,6 +16,7 @@ pub use import_resolver::{
     PythonImportResolver, RustImportResolver, TypeScriptImportResolver,
 };
 pub use parser::{ParseCache, Parser};
+pub use progress::IndexingProgress;
 pub use resolver::{compute_fqdn, ScopeResolver};
 pub use scope_builder::{scope_at_offset, scope_chain, ScopeBuilder};
 pub use sidecar::{

@@ -463,12 +463,30 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     let index = SqliteIndex::new(&effective_db)?;
 
     let files = walker.walk(path)?;
-    println!("Found {} files to index", files.len());
 
     // === Phase 1: Process sidecar files ===
     let sidecar_meta = process_sidecar_files(&files, path, &index)?;
 
+    // Set up progress tracking
+    use crate::indexer::IndexingProgress;
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let progress = IndexingProgress::new();
+    progress.start(files.len());
+
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {elapsed_precise} ETA {eta} | {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    pb.set_message("indexing...");
+
     // Parallel parsing and extraction using rayon
+    let progress_ref = &progress;
+    let pb_ref = &pb;
     let results: Vec<ExtractionResult> = files
         .par_iter()
         .filter_map(|file| {
@@ -479,14 +497,22 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
 
             match parser.parse_file(file) {
                 Ok(parsed) => match extractor.extract_all(&parsed, file) {
-                    Ok(result) => Some(result),
+                    Ok(result) => {
+                        progress_ref.inc(result.symbols.len());
+                        pb_ref.inc(1);
+                        Some(result)
+                    }
                     Err(e) => {
                         eprintln!("Error extracting symbols from {}: {}", file.display(), e);
+                        progress_ref.inc_error();
+                        pb_ref.inc(1);
                         None
                     }
                 },
                 Err(e) => {
                     eprintln!("Error parsing {}: {}", file.display(), e);
+                    progress_ref.inc_error();
+                    pb_ref.inc(1);
                     None
                 }
             }
@@ -500,11 +526,12 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     // Batch insert all results
     let total_symbols = index.add_extraction_results_batch(results)?;
 
-    println!(
-        "Indexed {} symbols from {} files",
+    pb.finish_with_message(format!(
+        "{} symbols from {} files",
         total_symbols,
         files.len()
-    );
+    ));
+    progress.finish();
 
     if !sidecar_meta.is_empty() {
         println!("Processed {} files with sidecar metadata", sidecar_meta.len());
