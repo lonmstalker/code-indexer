@@ -556,7 +556,7 @@ code-indexer tags stats
 
 ## Текущие ограничения
 
-1. **Нет type inference** — для Python/JS вызовы часто Possible (планируется: парсинг type hints)
+1. **Частичный type inference** — парсинг type hints для Python, TypeScript, Rust, Java, Go. Для кода без аннотаций вызовы остаются Possible
 2. **Нет межпроектных ссылок** — только внутри workspace (планируется: cross-project links)
 3. **Ограниченная поддержка generics** — template instantiation не отслеживается (планируется: generic resolver)
 4. **SQLite single-writer** — нет параллельной записи (используется batch inserts для ускорения)
@@ -565,6 +565,7 @@ code-indexer tags stats
 
 - **Batch writes** — все символы, ссылки и импорты вставляются в одной транзакции (2-3x ускорение)
 - **Incremental parsing** — `ParseCache` переиспользует старые деревья tree-sitter (30-50% ускорение для watch mode)
+- **Type-aware call resolution** — `filter_by_type()` использует аннотации типов для disambiguation вызовов методов
 
 ## Лицензия
 
