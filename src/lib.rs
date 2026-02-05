@@ -1,10 +1,13 @@
+pub mod compass;
 pub mod dependencies;
+pub mod docs;
 pub mod error;
 pub mod git;
 pub mod index;
 pub mod indexer;
 pub mod languages;
 pub mod memory;
+pub mod session;
 pub mod workspace;
 
 use once_cell::sync::Lazy;
@@ -27,6 +30,14 @@ pub use languages::{CrossLanguageAnalyzer, CrossLanguageRef, CrossRefType, Langu
 pub use memory::{ArchitectureAnalyzer, ArchitectureSummary, CodeConventions, ProjectContext};
 pub use workspace::{ModuleInfo, ModuleType, WorkspaceDetector, WorkspaceInfo, WorkspaceType};
 pub use git::{ChangeStatus, ChangedFile, ChangedSymbol, GitAnalyzer};
+pub use docs::{ConfigDigest, ConfigParser, ConfigType, DocDigest, DocParser, DocType};
+pub use index::sqlite::ProjectCommands;
+pub use compass::{
+    EntryDetector, EntryPoint, EntryType,
+    NodeBuilder, ProjectNode, NodeType,
+    ProfileBuilder, ProjectProfile, LanguageStats, FrameworkInfo,
+};
+pub use session::{DictEncoder, DictDecoder, DictDelta, SessionManager, Session};
 
 /// Global language registry instance (lazily initialized)
 pub static REGISTRY: Lazy<LanguageRegistry> = Lazy::new(LanguageRegistry::new);

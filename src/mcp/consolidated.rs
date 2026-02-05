@@ -468,3 +468,400 @@ pub struct ContextBundle {
     pub imports_relevant: Vec<RelevantImport>,
 }
 
+// =====================================================
+// P0-5: Doc/Config Digest Types
+// =====================================================
+
+/// Parameters for getting a documentation section
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GetDocSectionParams {
+    /// File path (e.g., "README.md") or doc type ("readme", "contributing")
+    pub target: String,
+    /// Optional section heading to extract (e.g., "Installation", "Usage")
+    #[serde(default)]
+    pub section: Option<String>,
+    /// Include code blocks from the section
+    #[serde(default)]
+    pub include_code: Option<bool>,
+}
+
+/// Response for get_doc_section
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DocSectionResponse {
+    /// File path
+    pub file_path: String,
+    /// Document type
+    pub doc_type: String,
+    /// Document title
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// All heading names (for discovery)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_sections: Vec<String>,
+    /// Extracted section content (if section was requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_content: Option<String>,
+    /// Code blocks in the section (if include_code=true)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_blocks: Vec<DocCodeBlock>,
+}
+
+/// A code block from documentation
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DocCodeBlock {
+    /// Language hint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Code content
+    pub content: String,
+    /// Line number in original file
+    pub line: u32,
+}
+
+/// Parameters for getting project commands
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GetProjectCommandsParams {
+    /// Filter by command type: "run", "build", "test", "all" (default: "all")
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// Response for project commands
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectCommandsResponse {
+    /// Run/start commands
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+    /// Build commands
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build: Vec<String>,
+    /// Test commands
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test: Vec<String>,
+}
+
+// =====================================================
+// P0-1: Project Compass Types
+// =====================================================
+
+/// Parameters for get_project_compass - macro-level project overview
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GetProjectCompassParams {
+    /// Project path (defaults to indexed workspace)
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Maximum response size in bytes (default: 16KB)
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    /// Include entry points (default: true)
+    #[serde(default)]
+    pub include_entry_points: Option<bool>,
+    /// Include module hierarchy (default: true)
+    #[serde(default)]
+    pub include_modules: Option<bool>,
+    /// Include documentation info (default: true)
+    #[serde(default)]
+    pub include_docs: Option<bool>,
+}
+
+/// Response for get_project_compass
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectCompassResponse {
+    /// Response metadata
+    pub meta: CompassMeta,
+    /// Project profile (languages, frameworks, build tools)
+    pub profile: CompassProfile,
+    /// Available commands (run, build, test)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<CompassCommands>,
+    /// Detected entry points
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_points: Vec<CompassEntryPoint>,
+    /// Top-level modules/directories
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules_top: Vec<CompassModuleNode>,
+    /// Documentation info
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<CompassDocs>,
+    /// Suggested next actions
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<CompassNextAction>,
+}
+
+/// Metadata for compass response
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassMeta {
+    /// Database revision
+    pub db_rev: u64,
+    /// Profile revision
+    pub profile_rev: u64,
+    /// Response size info
+    pub budget: CompassBudget,
+}
+
+/// Budget info for compass response
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassBudget {
+    /// Actual response bytes
+    pub actual_bytes: usize,
+    /// Maximum allowed bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+}
+
+/// Project profile summary
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassProfile {
+    /// Language statistics
+    pub languages: Vec<CompassLanguage>,
+    /// Detected frameworks
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frameworks: Vec<String>,
+    /// Build tools
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_tools: Vec<String>,
+    /// Workspace type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_type: Option<String>,
+}
+
+/// Language statistics
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassLanguage {
+    /// Language name
+    pub name: String,
+    /// Number of files
+    pub files: usize,
+    /// Number of symbols
+    pub symbols: usize,
+    /// Percentage of codebase
+    pub pct: f32,
+}
+
+/// Project commands
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassCommands {
+    /// Run commands
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+    /// Build commands
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build: Vec<String>,
+    /// Test commands
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test: Vec<String>,
+}
+
+/// Entry point info
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassEntryPoint {
+    /// Entry point name
+    pub name: String,
+    /// Entry type (main, server, cli, etc.)
+    pub entry_type: String,
+    /// File path
+    pub file: String,
+    /// Line number
+    pub line: u32,
+    /// Evidence for detection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// Module node for hierarchy
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassModuleNode {
+    /// Node ID (e.g., "mod:src/api")
+    pub id: String,
+    /// Node type (module, directory, layer, package)
+    pub node_type: String,
+    /// Display name
+    pub name: String,
+    /// Path
+    pub path: String,
+    /// Symbol count
+    pub symbol_count: usize,
+    /// File count
+    #[serde(default)]
+    pub file_count: usize,
+}
+
+/// Documentation info
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassDocs {
+    /// README headings (top-level)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readme_headings: Vec<String>,
+    /// Has CONTRIBUTING.md
+    #[serde(default)]
+    pub has_contributing: bool,
+    /// Has CHANGELOG.md
+    #[serde(default)]
+    pub has_changelog: bool,
+}
+
+/// Suggested next action
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassNextAction {
+    /// Tool to call
+    pub tool: String,
+    /// Arguments
+    pub args: serde_json::Value,
+    /// Description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+// =====================================================
+// P0-2: Expand Project Node Types
+// =====================================================
+
+/// Parameters for expand_project_node - drill-down into modules
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExpandProjectNodeParams {
+    /// Node ID to expand (e.g., "mod:src/api" or "dir:src")
+    pub node_id: String,
+    /// Maximum number of items (default: 20)
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include top symbols from this node
+    #[serde(default)]
+    pub include_symbols: Option<bool>,
+    /// Pagination cursor
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Response for expand_project_node
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExpandedNodeResponse {
+    /// The expanded node
+    pub node: CompassModuleNode,
+    /// Child nodes
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<CompassModuleNode>,
+    /// Top files in this node
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_files: Vec<NodeFileInfo>,
+    /// Top symbols in this node (if include_symbols=true)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_symbols: Vec<SymbolCard>,
+    /// Pagination cursor for more results
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// File info within a node
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeFileInfo {
+    /// File path
+    pub path: String,
+    /// Language
+    pub language: String,
+    /// Symbol count
+    pub symbol_count: usize,
+}
+
+// =====================================================
+// P0-3: Get Compass (Query) Types
+// =====================================================
+
+/// Parameters for get_compass - task-oriented diversified search
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GetCompassQueryParams {
+    /// Search query (e.g., "auth", "login", "database connection")
+    pub query: String,
+    /// Current file path for locality boost
+    #[serde(default)]
+    pub current_file: Option<String>,
+    /// Maximum number of results (default: 10)
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Response for get_compass (query-based)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassQueryResponse {
+    /// Query that was executed
+    pub query: String,
+    /// Diversified results
+    pub results: Vec<CompassResult>,
+    /// Total matches found (before diversification)
+    pub total_matches: usize,
+}
+
+/// A single compass search result
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompassResult {
+    /// Result type: "module", "file", "symbol", "doc", "command"
+    pub result_type: String,
+    /// Name
+    pub name: String,
+    /// Path or location
+    pub path: String,
+    /// Why this result was included
+    pub why: String,
+    /// Relevance score (0-1)
+    pub score: f32,
+    /// Symbol ID (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    /// Line number (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+// =====================================================
+// P0-4: Session Dictionary Codec Types
+// =====================================================
+
+/// Parameters for open_session
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct OpenSessionParams {
+    /// Restore an existing session by ID
+    #[serde(default)]
+    pub restore_session: Option<String>,
+    /// Project path for session context
+    #[serde(default)]
+    pub project_path: Option<String>,
+}
+
+/// Response for open_session
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionResponse {
+    /// Session ID (use this for subsequent requests)
+    pub session_id: String,
+    /// Current dictionary state
+    pub dict: SessionDict,
+    /// Whether this is a restored session
+    pub restored: bool,
+}
+
+/// Session dictionary state
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionDict {
+    /// File path mappings (id -> path)
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub files: std::collections::HashMap<u32, String>,
+    /// Symbol kind mappings (id -> kind)
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub kinds: std::collections::HashMap<u8, String>,
+    /// Module mappings (id -> module)
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub modules: std::collections::HashMap<u16, String>,
+}
+
+/// Parameters for close_session
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CloseSessionParams {
+    /// Session ID to close
+    pub session_id: String,
+}
+
+/// Response for close_session
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CloseSessionResponse {
+    /// Whether the session was successfully closed
+    pub closed: bool,
+}
+

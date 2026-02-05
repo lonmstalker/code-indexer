@@ -22,6 +22,7 @@ use crate::mcp::consolidated::*;
 pub struct McpServer {
     index: Arc<SqliteIndex>,
     overlay: Arc<DocumentOverlay>,
+    session_manager: Arc<code_indexer::session::SessionManager>,
 }
 
 impl McpServer {
@@ -29,11 +30,17 @@ impl McpServer {
         Self {
             index,
             overlay: Arc::new(DocumentOverlay::new()),
+            session_manager: Arc::new(code_indexer::session::SessionManager::new()),
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_overlay(index: Arc<SqliteIndex>, overlay: Arc<DocumentOverlay>) -> Self {
-        Self { index, overlay }
+        Self {
+            index,
+            overlay,
+            session_manager: Arc::new(code_indexer::session::SessionManager::new()),
+        }
     }
 
     // === Workspace helper methods ===
@@ -1378,6 +1385,114 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
+            // 15. get_doc_section - Get documentation section from README/docs
+            Tool {
+                name: "get_doc_section".into(),
+                title: Some("Get Doc Section".to_string()),
+                description: Some(
+                    "Extract sections from documentation files (README, CONTRIBUTING, etc.). \
+                     Returns headings, code blocks, and section content. Use for installation \
+                     instructions, usage examples, and API documentation."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetDocSectionParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 16. get_project_commands - Get run/build/test commands from config files
+            Tool {
+                name: "get_project_commands".into(),
+                title: Some("Get Project Commands".to_string()),
+                description: Some(
+                    "Extract run, build, and test commands from project configuration files \
+                     (package.json, Cargo.toml, Makefile, etc.). Useful for understanding \
+                     how to build and run the project."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetProjectCommandsParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 17. get_project_compass - Macro-level project overview
+            Tool {
+                name: "get_project_compass".into(),
+                title: Some("Get Project Compass".to_string()),
+                description: Some(
+                    "Get a macro-level overview of the project including languages, frameworks, \
+                     entry points, module hierarchy, and available commands. This is the primary \
+                     starting point for understanding an unfamiliar codebase."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetProjectCompassParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 18. expand_project_node - Drill-down into modules
+            Tool {
+                name: "expand_project_node".into(),
+                title: Some("Expand Project Node".to_string()),
+                description: Some(
+                    "Drill down into a specific module or directory from the project compass. \
+                     Returns child nodes, files, and optionally symbols within the node."
+                        .into(),
+                ),
+                input_schema: schema_for::<ExpandProjectNodeParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 19. get_compass - Task-oriented diversified search
+            Tool {
+                name: "get_compass".into(),
+                title: Some("Get Compass".to_string()),
+                description: Some(
+                    "Task-oriented search that returns diversified results across symbols, files, \
+                     modules, docs, and commands. Use for feature location and understanding \
+                     where specific functionality lives in the codebase."
+                        .into(),
+                ),
+                input_schema: schema_for::<GetCompassQueryParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 20. open_session - Open a session for token optimization
+            Tool {
+                name: "open_session".into(),
+                title: Some("Open Session".to_string()),
+                description: Some(
+                    "Open a session for dictionary-based token optimization. Returns a session ID \
+                     and initial dictionary mapping long strings to short IDs."
+                        .into(),
+                ),
+                input_schema: schema_for::<OpenSessionParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 21. close_session - Close a session
+            Tool {
+                name: "close_session".into(),
+                title: Some("Close Session".to_string()),
+                description: Some(
+                    "Close an open session and release its resources."
+                        .into(),
+                ),
+                input_schema: schema_for::<CloseSessionParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
         ];
 
         Ok(ListToolsResult {
@@ -2564,6 +2679,586 @@ impl ServerHandler for McpServer {
                         file_path, e
                     ))]),
                 }
+            }
+
+            "get_doc_section" => {
+                let params: GetDocSectionParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let include_code = params.include_code.unwrap_or(false);
+
+                // Try to find the document by path or type
+                let digest = if params.target.contains('/') || params.target.contains('.') {
+                    // Target is a file path
+                    self.index.get_doc_digest(&params.target)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                } else {
+                    // Target is a doc type (readme, contributing, etc.)
+                    let all_docs = self.index.get_all_doc_digests()
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    let target_lower = params.target.to_lowercase();
+                    all_docs.into_iter().find(|d| d.doc_type.as_str() == target_lower)
+                };
+
+                match digest {
+                    Some(doc) => {
+                        let available_sections: Vec<String> = doc.headings
+                            .iter()
+                            .map(|h| h.text.clone())
+                            .collect();
+
+                        let (section_content, code_blocks) = if let Some(ref section_name) = params.section {
+                            // Find and extract the specific section
+                            let file_content = std::fs::read_to_string(&doc.file_path).ok();
+                            let content = file_content.as_ref().and_then(|c| {
+                                code_indexer::docs::DocParser::extract_section(c, section_name)
+                            });
+
+                            let blocks: Vec<DocCodeBlock> = if include_code {
+                                // Find code blocks within the section
+                                doc.command_blocks.iter()
+                                    .filter(|b| {
+                                        // Check if block is within the section
+                                        let section = doc.key_sections.iter()
+                                            .find(|s| s.heading.to_lowercase().contains(&section_name.to_lowercase()));
+                                        if let Some(s) = section {
+                                            b.line >= s.start_line && b.line < s.end_line
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .map(|b| DocCodeBlock {
+                                        language: b.language.clone(),
+                                        content: b.content.clone(),
+                                        line: b.line,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            (content, blocks)
+                        } else {
+                            // Return all command blocks if no section specified
+                            let blocks: Vec<DocCodeBlock> = if include_code {
+                                doc.command_blocks.iter()
+                                    .map(|b| DocCodeBlock {
+                                        language: b.language.clone(),
+                                        content: b.content.clone(),
+                                        line: b.line,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            (None, blocks)
+                        };
+
+                        let response = DocSectionResponse {
+                            file_path: doc.file_path,
+                            doc_type: doc.doc_type.as_str().to_string(),
+                            title: doc.title,
+                            available_sections,
+                            section_content,
+                            code_blocks,
+                        };
+
+                        CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&response).unwrap_or_default(),
+                        )])
+                    }
+                    None => {
+                        // List available documentation files
+                        let all_docs = self.index.get_all_doc_digests()
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        let available: Vec<String> = all_docs.iter()
+                            .map(|d| format!("{} ({})", d.file_path, d.doc_type.as_str()))
+                            .collect();
+
+                        CallToolResult::error(vec![Content::text(format!(
+                            "Document '{}' not found. Available documents: {:?}",
+                            params.target, available
+                        ))])
+                    }
+                }
+            }
+
+            "get_project_commands" => {
+                let params: GetProjectCommandsParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                match self.index.get_project_commands() {
+                    Ok(commands) => {
+                        let response = match params.kind.as_deref() {
+                            Some("run") => ProjectCommandsResponse {
+                                run: commands.run,
+                                build: Vec::new(),
+                                test: Vec::new(),
+                            },
+                            Some("build") => ProjectCommandsResponse {
+                                run: Vec::new(),
+                                build: commands.build,
+                                test: Vec::new(),
+                            },
+                            Some("test") => ProjectCommandsResponse {
+                                run: Vec::new(),
+                                build: Vec::new(),
+                                test: commands.test,
+                            },
+                            _ => ProjectCommandsResponse {
+                                run: commands.run,
+                                build: commands.build,
+                                test: commands.test,
+                            },
+                        };
+
+                        CallToolResult::success(vec![Content::text(
+                            serde_json::to_string_pretty(&response).unwrap_or_default(),
+                        )])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            "get_project_compass" => {
+                let params: GetProjectCompassParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let max_bytes = params.max_bytes.unwrap_or(16 * 1024);
+                let include_entry_points = params.include_entry_points.unwrap_or(true);
+                let include_modules = params.include_modules.unwrap_or(true);
+                let include_docs = params.include_docs.unwrap_or(true);
+
+                // Get database revision
+                let db_rev = self.index.get_db_revision().unwrap_or(0);
+
+                // Build or get project profile
+                let (profile, profile_rev) = match code_indexer::compass::ProfileBuilder::build(self.index.as_ref()) {
+                    Ok(p) => {
+                        // Save to database for caching
+                        let _ = self.index.save_project_profile(".", &p);
+                        (p, db_rev)
+                    }
+                    Err(_) => {
+                        // Try to get cached profile
+                        match self.index.get_project_profile(".") {
+                            Ok(Some((p, rev))) => (p, rev),
+                            _ => {
+                                return Ok(CallToolResult::error(vec![Content::text(
+                                    "Failed to build project profile".to_string(),
+                                )]));
+                            }
+                        }
+                    }
+                };
+
+                // Convert profile to compass format
+                let compass_profile = CompassProfile {
+                    languages: profile.languages.iter().map(|l| CompassLanguage {
+                        name: l.name.clone(),
+                        files: l.file_count,
+                        symbols: l.symbol_count,
+                        pct: l.percentage,
+                    }).collect(),
+                    frameworks: profile.frameworks.iter().map(|f| f.name.clone()).collect(),
+                    build_tools: profile.build_tools.clone(),
+                    workspace_type: profile.workspace_type.clone(),
+                };
+
+                // Get commands
+                let commands = self.index.get_project_commands().ok().map(|c| CompassCommands {
+                    run: c.run,
+                    build: c.build,
+                    test: c.test,
+                });
+
+                // Get entry points
+                let entry_points = if include_entry_points {
+                    code_indexer::compass::EntryDetector::detect(self.index.as_ref())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(10) // Limit for budget
+                        .map(|e| CompassEntryPoint {
+                            name: e.name,
+                            entry_type: e.entry_type.as_str().to_string(),
+                            file: e.file_path,
+                            line: e.line,
+                            evidence: Some(e.evidence),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Get module hierarchy
+                let modules_top = if include_modules {
+                    let nodes = code_indexer::compass::NodeBuilder::build(self.index.as_ref(), ".")
+                        .unwrap_or_default();
+                    let _ = self.index.save_project_nodes(&nodes);
+
+                    code_indexer::compass::NodeBuilder::get_top_level(&nodes)
+                        .into_iter()
+                        .take(10) // Limit for budget
+                        .map(|n| CompassModuleNode {
+                            id: n.id.clone(),
+                            node_type: n.node_type.as_str().to_string(),
+                            name: n.name.clone(),
+                            path: n.path.clone(),
+                            symbol_count: n.symbol_count,
+                            file_count: n.file_count,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Get documentation info
+                let docs = if include_docs {
+                    let all_docs = self.index.get_all_doc_digests().unwrap_or_default();
+
+                    let readme_headings = all_docs.iter()
+                        .find(|d| d.doc_type == code_indexer::docs::DocType::Readme)
+                        .map(|d| d.headings.iter()
+                            .filter(|h| h.level <= 2)
+                            .map(|h| h.text.clone())
+                            .collect::<Vec<_>>())
+                        .unwrap_or_default();
+
+                    let has_contributing = all_docs.iter()
+                        .any(|d| d.doc_type == code_indexer::docs::DocType::Contributing);
+                    let has_changelog = all_docs.iter()
+                        .any(|d| d.doc_type == code_indexer::docs::DocType::Changelog);
+
+                    Some(CompassDocs {
+                        readme_headings,
+                        has_contributing,
+                        has_changelog,
+                    })
+                } else {
+                    None
+                };
+
+                // Build next actions
+                let mut next = Vec::new();
+                if !modules_top.is_empty() {
+                    next.push(CompassNextAction {
+                        tool: "expand_project_node".to_string(),
+                        args: serde_json::json!({"node_id": modules_top[0].id}),
+                        description: Some(format!("Explore {} module", modules_top[0].name)),
+                    });
+                }
+                if !entry_points.is_empty() {
+                    next.push(CompassNextAction {
+                        tool: "get_snippet".to_string(),
+                        args: serde_json::json!({"target": format!("{}:{}", entry_points[0].file, entry_points[0].line)}),
+                        description: Some("View main entry point".to_string()),
+                    });
+                }
+
+                // Build response
+                let response = ProjectCompassResponse {
+                    meta: CompassMeta {
+                        db_rev,
+                        profile_rev,
+                        budget: CompassBudget {
+                            actual_bytes: 0, // Will be updated
+                            max_bytes: Some(max_bytes),
+                        },
+                    },
+                    profile: compass_profile,
+                    commands,
+                    entry_points,
+                    modules_top,
+                    docs,
+                    next,
+                };
+
+                // Serialize and check budget
+                let json_output = serde_json::to_string_pretty(&response).unwrap_or_default();
+                let actual_bytes = json_output.len();
+
+                // Update actual_bytes in response
+                let mut final_response = response;
+                final_response.meta.budget.actual_bytes = actual_bytes;
+
+                let final_output = serde_json::to_string_pretty(&final_response).unwrap_or_default();
+
+                CallToolResult::success(vec![Content::text(final_output)])
+            }
+
+            "expand_project_node" => {
+                let params: ExpandProjectNodeParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let limit = params.limit.unwrap_or(20);
+                let include_symbols = params.include_symbols.unwrap_or(false);
+
+                // Get the node
+                let node = match self.index.get_project_node(&params.node_id) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Node not found: {}",
+                            params.node_id
+                        ))]));
+                    }
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+                    }
+                };
+
+                // Get children
+                let children: Vec<CompassModuleNode> = self.index.get_node_children(&params.node_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(limit)
+                    .map(|n| CompassModuleNode {
+                        id: n.id,
+                        node_type: n.node_type.as_str().to_string(),
+                        name: n.name,
+                        path: n.path,
+                        symbol_count: n.symbol_count,
+                        file_count: n.file_count,
+                    })
+                    .collect();
+
+                // Get files in this node's path
+                let top_files: Vec<NodeFileInfo> = if let Ok(stats) = self.index.get_stats() {
+                    // Create file info from languages found in this node
+                    stats.files_by_language.iter()
+                        .filter(|(_, count)| *count > 0)
+                        .take(limit)
+                        .map(|(lang, _)| {
+                            let symbol_count = stats.symbols_by_language.iter()
+                                .find(|(l, _)| l == lang)
+                                .map(|(_, c)| *c)
+                                .unwrap_or(0);
+                            NodeFileInfo {
+                                path: format!("{}/*.{}", node.path, lang),
+                                language: lang.clone(),
+                                symbol_count,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Get top symbols if requested
+                let top_symbols: Vec<SymbolCard> = if include_symbols {
+                    let sym_options = crate::index::SearchOptions {
+                        file_filter: Some(node.path.clone()),
+                        limit: Some(limit),
+                        ..Default::default()
+                    };
+
+                    let functions = self.index.list_functions(&sym_options).unwrap_or_default();
+                    let types = self.index.list_types(&sym_options).unwrap_or_default();
+
+                    functions.into_iter()
+                        .chain(types.into_iter())
+                        .take(limit)
+                        .enumerate()
+                        .map(|(i, s)| SymbolCard {
+                            id: s.id.clone(),
+                            fqdn: s.fqdn.clone(),
+                            kind: s.kind.as_str().to_string(),
+                            sig: s.signature.clone(),
+                            loc: format!("{}:{}", s.location.file_path, s.location.start_line),
+                            rank: (i + 1) as u32,
+                            snippet: None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let response = ExpandedNodeResponse {
+                    node: CompassModuleNode {
+                        id: node.id,
+                        node_type: node.node_type.as_str().to_string(),
+                        name: node.name,
+                        path: node.path,
+                        symbol_count: node.symbol_count,
+                        file_count: node.file_count,
+                    },
+                    children,
+                    top_files,
+                    top_symbols,
+                    next_cursor: None, // TODO: implement pagination
+                };
+
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )])
+            }
+
+            "get_compass" => {
+                let params: GetCompassQueryParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let limit = params.limit.unwrap_or(10);
+                let query = &params.query;
+                let query_lower = query.to_lowercase();
+
+                let mut results: Vec<CompassResult> = Vec::new();
+                let mut total_matches = 0usize;
+
+                // 1. Search symbols (max 4)
+                let sym_options = crate::index::SearchOptions {
+                    limit: Some(20),
+                    current_file: params.current_file.clone(),
+                    ..Default::default()
+                };
+                if let Ok(search_results) = self.index.search(query, &sym_options) {
+                    total_matches += search_results.len();
+                    for result in search_results.into_iter().take(4) {
+                        let symbol = result.symbol;
+                        results.push(CompassResult {
+                            result_type: "symbol".to_string(),
+                            name: symbol.name.clone(),
+                            path: symbol.location.file_path.clone(),
+                            why: format!("symbol name matches '{}'", query),
+                            score: result.score as f32,
+                            symbol_id: Some(symbol.id.clone()),
+                            line: Some(symbol.location.start_line),
+                        });
+                    }
+                }
+
+                // 2. Search modules (max 2)
+                let nodes = self.index.get_project_nodes().unwrap_or_default();
+                for node in nodes.iter().take(50) {
+                    if node.name.to_lowercase().contains(&query_lower)
+                        || node.path.to_lowercase().contains(&query_lower)
+                    {
+                        total_matches += 1;
+                        if results.iter().filter(|r| r.result_type == "module").count() < 2 {
+                            results.push(CompassResult {
+                                result_type: "module".to_string(),
+                                name: node.name.clone(),
+                                path: node.path.clone(),
+                                why: format!("module path contains '{}'", query),
+                                score: 0.8,
+                                symbol_id: None,
+                                line: None,
+                            });
+                        }
+                    }
+                }
+
+                // 3. Search docs (max 1)
+                if let Ok(docs) = self.index.get_all_doc_digests() {
+                    for doc in docs {
+                        // Search in headings
+                        for heading in &doc.headings {
+                            if heading.text.to_lowercase().contains(&query_lower) {
+                                total_matches += 1;
+                                if results.iter().filter(|r| r.result_type == "doc").count() < 1 {
+                                    results.push(CompassResult {
+                                        result_type: "doc".to_string(),
+                                        name: heading.text.clone(),
+                                        path: doc.file_path.clone(),
+                                        why: format!("doc heading contains '{}'", query),
+                                        score: 0.7,
+                                        symbol_id: None,
+                                        line: Some(heading.line),
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 4. Search commands (max 1)
+                if let Ok(commands) = self.index.get_project_commands() {
+                    for cmd in commands.run.iter()
+                        .chain(commands.build.iter())
+                        .chain(commands.test.iter())
+                    {
+                        if cmd.to_lowercase().contains(&query_lower) {
+                            total_matches += 1;
+                            if results.iter().filter(|r| r.result_type == "command").count() < 1 {
+                                results.push(CompassResult {
+                                    result_type: "command".to_string(),
+                                    name: cmd.clone(),
+                                    path: "project commands".to_string(),
+                                    why: format!("command contains '{}'", query),
+                                    score: 0.6,
+                                    symbol_id: None,
+                                    line: None,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Sort by score and limit
+                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(limit);
+
+                let response = CompassQueryResponse {
+                    query: query.clone(),
+                    results,
+                    total_matches,
+                };
+
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )])
+            }
+
+            "open_session" => {
+                let params: OpenSessionParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let session = self.session_manager.open_session(params.restore_session.as_deref());
+                let restored = params.restore_session.is_some();
+
+                let delta = session.get_dict();
+
+                let response = SessionResponse {
+                    session_id: session.id,
+                    dict: SessionDict {
+                        files: delta.files,
+                        kinds: delta.kinds,
+                        modules: delta.modules,
+                    },
+                    restored,
+                };
+
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )])
+            }
+
+            "close_session" => {
+                let params: CloseSessionParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let closed = self.session_manager.close_session(&params.session_id);
+
+                let response = CloseSessionResponse { closed };
+
+                CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&response).unwrap_or_default(),
+                )])
             }
 
             _ => {

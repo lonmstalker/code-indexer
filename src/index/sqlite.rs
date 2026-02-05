@@ -223,6 +223,92 @@ impl SqliteIndex {
 
             -- Initialize db_revision if it doesn't exist
             INSERT OR IGNORE INTO meta (key, value) VALUES ('db_revision', '0');
+
+            -- Documentation digests table
+            CREATE TABLE IF NOT EXISTS doc_digests (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL UNIQUE,
+                doc_type TEXT NOT NULL,
+                title TEXT,
+                headings TEXT,
+                command_blocks TEXT,
+                key_sections TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_doc_digests_type ON doc_digests(doc_type);
+
+            -- Configuration digests table
+            CREATE TABLE IF NOT EXISTS config_digests (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL UNIQUE,
+                config_type TEXT NOT NULL,
+                name TEXT,
+                version TEXT,
+                scripts TEXT,
+                build_targets TEXT,
+                test_commands TEXT,
+                run_commands TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_config_digests_type ON config_digests(config_type);
+
+            -- Project profile table
+            CREATE TABLE IF NOT EXISTS project_profile (
+                id INTEGER PRIMARY KEY,
+                project_path TEXT NOT NULL UNIQUE,
+                languages TEXT NOT NULL,
+                frameworks TEXT,
+                build_tools TEXT,
+                workspace_type TEXT,
+                profile_rev INTEGER DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Project nodes table for module hierarchy
+            CREATE TABLE IF NOT EXISTS project_nodes (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                node_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                symbol_count INTEGER DEFAULT 0,
+                public_symbol_count INTEGER DEFAULT 0,
+                file_count INTEGER DEFAULT 0,
+                centrality_score REAL DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_nodes_parent ON project_nodes(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_nodes_path ON project_nodes(path);
+
+            -- Entry points table
+            CREATE TABLE IF NOT EXISTS entry_points (
+                id INTEGER PRIMARY KEY,
+                symbol_id TEXT,
+                entry_type TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                evidence TEXT,
+                UNIQUE(file_path, line)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entry_type ON entry_points(entry_type);
+
+            -- Sessions table
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL,
+                metadata TEXT
+            );
+
+            -- Session dictionary table
+            CREATE TABLE IF NOT EXISTS session_dict (
+                session_id TEXT NOT NULL,
+                key_type TEXT NOT NULL,
+                full_value TEXT NOT NULL,
+                short_id INTEGER NOT NULL,
+                PRIMARY KEY (session_id, key_type, full_value)
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_dict_session ON session_dict(session_id);
             "#,
         )?;
 
@@ -3000,6 +3086,11 @@ impl CodeIndex for SqliteIndex {
 
         Ok(metrics)
     }
+
+    fn get_all_config_digests(&self) -> Result<Vec<crate::docs::ConfigDigest>> {
+        // Forward to the inherent impl
+        SqliteIndex::get_all_config_digests(self)
+    }
 }
 
 impl SqliteIndex {
@@ -3029,6 +3120,638 @@ impl SqliteIndex {
         }
         0
     }
+
+    // === Documentation and Configuration Digest Methods ===
+
+    /// Adds or updates a documentation digest
+    pub fn add_doc_digest(&self, digest: &crate::docs::DocDigest) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let headings_json = serde_json::to_string(&digest.headings).unwrap_or_default();
+        let command_blocks_json = serde_json::to_string(&digest.command_blocks).unwrap_or_default();
+        let key_sections_json = serde_json::to_string(&digest.key_sections).unwrap_or_default();
+
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO doc_digests
+            (file_path, doc_type, title, headings, command_blocks, key_sections, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                digest.file_path,
+                digest.doc_type.as_str(),
+                digest.title,
+                headings_json,
+                command_blocks_json,
+                key_sections_json,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Gets a documentation digest by file path
+    pub fn get_doc_digest(&self, file_path: &str) -> Result<Option<crate::docs::DocDigest>> {
+        let conn = self.conn.lock().unwrap();
+
+        let result = conn.query_row(
+            r#"
+            SELECT file_path, doc_type, title, headings, command_blocks, key_sections
+            FROM doc_digests WHERE file_path = ?1
+            "#,
+            params![file_path],
+            |row| {
+                let file_path: String = row.get(0)?;
+                let doc_type_str: String = row.get(1)?;
+                let title: Option<String> = row.get(2)?;
+                let headings_json: String = row.get(3)?;
+                let command_blocks_json: String = row.get(4)?;
+                let key_sections_json: String = row.get(5)?;
+
+                let doc_type = match doc_type_str.as_str() {
+                    "readme" => crate::docs::DocType::Readme,
+                    "contributing" => crate::docs::DocType::Contributing,
+                    "changelog" => crate::docs::DocType::Changelog,
+                    "license" => crate::docs::DocType::License,
+                    _ => crate::docs::DocType::Other,
+                };
+
+                let headings: Vec<crate::docs::Heading> =
+                    serde_json::from_str(&headings_json).unwrap_or_default();
+                let command_blocks: Vec<crate::docs::CodeBlock> =
+                    serde_json::from_str(&command_blocks_json).unwrap_or_default();
+                let key_sections: Vec<crate::docs::KeySection> =
+                    serde_json::from_str(&key_sections_json).unwrap_or_default();
+
+                Ok(crate::docs::DocDigest {
+                    file_path,
+                    doc_type,
+                    title,
+                    headings,
+                    command_blocks,
+                    key_sections,
+                })
+            },
+        ).optional()?;
+
+        Ok(result)
+    }
+
+    /// Gets all documentation digests
+    pub fn get_all_doc_digests(&self) -> Result<Vec<crate::docs::DocDigest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT file_path, doc_type, title, headings, command_blocks, key_sections
+            FROM doc_digests ORDER BY doc_type
+            "#,
+        )?;
+
+        let digests = stmt.query_map([], |row| {
+            let file_path: String = row.get(0)?;
+            let doc_type_str: String = row.get(1)?;
+            let title: Option<String> = row.get(2)?;
+            let headings_json: String = row.get(3)?;
+            let command_blocks_json: String = row.get(4)?;
+            let key_sections_json: String = row.get(5)?;
+
+            let doc_type = match doc_type_str.as_str() {
+                "readme" => crate::docs::DocType::Readme,
+                "contributing" => crate::docs::DocType::Contributing,
+                "changelog" => crate::docs::DocType::Changelog,
+                "license" => crate::docs::DocType::License,
+                _ => crate::docs::DocType::Other,
+            };
+
+            let headings: Vec<crate::docs::Heading> =
+                serde_json::from_str(&headings_json).unwrap_or_default();
+            let command_blocks: Vec<crate::docs::CodeBlock> =
+                serde_json::from_str(&command_blocks_json).unwrap_or_default();
+            let key_sections: Vec<crate::docs::KeySection> =
+                serde_json::from_str(&key_sections_json).unwrap_or_default();
+
+            Ok(crate::docs::DocDigest {
+                file_path,
+                doc_type,
+                title,
+                headings,
+                command_blocks,
+                key_sections,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok(digests)
+    }
+
+    /// Adds or updates a configuration digest
+    pub fn add_config_digest(&self, digest: &crate::docs::ConfigDigest) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let scripts_json = serde_json::to_string(&digest.scripts).unwrap_or_default();
+        let build_targets_json = serde_json::to_string(&digest.build_targets).unwrap_or_default();
+        let test_commands_json = serde_json::to_string(&digest.test_commands).unwrap_or_default();
+        let run_commands_json = serde_json::to_string(&digest.run_commands).unwrap_or_default();
+
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO config_digests
+            (file_path, config_type, name, version, scripts, build_targets, test_commands, run_commands, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                digest.file_path,
+                digest.config_type.as_str(),
+                digest.name,
+                digest.version,
+                scripts_json,
+                build_targets_json,
+                test_commands_json,
+                run_commands_json,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Gets a configuration digest by file path
+    pub fn get_config_digest(&self, file_path: &str) -> Result<Option<crate::docs::ConfigDigest>> {
+        let conn = self.conn.lock().unwrap();
+
+        let result = conn.query_row(
+            r#"
+            SELECT file_path, config_type, name, version, scripts, build_targets, test_commands, run_commands
+            FROM config_digests WHERE file_path = ?1
+            "#,
+            params![file_path],
+            |row| {
+                let file_path: String = row.get(0)?;
+                let config_type_str: String = row.get(1)?;
+                let name: Option<String> = row.get(2)?;
+                let version: Option<String> = row.get(3)?;
+                let scripts_json: String = row.get(4)?;
+                let build_targets_json: String = row.get(5)?;
+                let test_commands_json: String = row.get(6)?;
+                let run_commands_json: String = row.get(7)?;
+
+                let config_type = match config_type_str.as_str() {
+                    "package_json" => crate::docs::ConfigType::PackageJson,
+                    "cargo_toml" => crate::docs::ConfigType::CargoToml,
+                    "makefile" => crate::docs::ConfigType::Makefile,
+                    "pyproject_toml" => crate::docs::ConfigType::PyProjectToml,
+                    "go_mod" => crate::docs::ConfigType::GoMod,
+                    _ => crate::docs::ConfigType::Other,
+                };
+
+                let scripts: std::collections::HashMap<String, String> =
+                    serde_json::from_str(&scripts_json).unwrap_or_default();
+                let build_targets: Vec<String> =
+                    serde_json::from_str(&build_targets_json).unwrap_or_default();
+                let test_commands: Vec<String> =
+                    serde_json::from_str(&test_commands_json).unwrap_or_default();
+                let run_commands: Vec<String> =
+                    serde_json::from_str(&run_commands_json).unwrap_or_default();
+
+                Ok(crate::docs::ConfigDigest {
+                    file_path,
+                    config_type,
+                    name,
+                    version,
+                    scripts,
+                    build_targets,
+                    test_commands,
+                    run_commands,
+                })
+            },
+        ).optional()?;
+
+        Ok(result)
+    }
+
+    /// Gets all configuration digests
+    pub fn get_all_config_digests(&self) -> Result<Vec<crate::docs::ConfigDigest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT file_path, config_type, name, version, scripts, build_targets, test_commands, run_commands
+            FROM config_digests ORDER BY config_type
+            "#,
+        )?;
+
+        let digests = stmt.query_map([], |row| {
+            let file_path: String = row.get(0)?;
+            let config_type_str: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let version: Option<String> = row.get(3)?;
+            let scripts_json: String = row.get(4)?;
+            let build_targets_json: String = row.get(5)?;
+            let test_commands_json: String = row.get(6)?;
+            let run_commands_json: String = row.get(7)?;
+
+            let config_type = match config_type_str.as_str() {
+                "package_json" => crate::docs::ConfigType::PackageJson,
+                "cargo_toml" => crate::docs::ConfigType::CargoToml,
+                "makefile" => crate::docs::ConfigType::Makefile,
+                "pyproject_toml" => crate::docs::ConfigType::PyProjectToml,
+                "go_mod" => crate::docs::ConfigType::GoMod,
+                _ => crate::docs::ConfigType::Other,
+            };
+
+            let scripts: std::collections::HashMap<String, String> =
+                serde_json::from_str(&scripts_json).unwrap_or_default();
+            let build_targets: Vec<String> =
+                serde_json::from_str(&build_targets_json).unwrap_or_default();
+            let test_commands: Vec<String> =
+                serde_json::from_str(&test_commands_json).unwrap_or_default();
+            let run_commands: Vec<String> =
+                serde_json::from_str(&run_commands_json).unwrap_or_default();
+
+            Ok(crate::docs::ConfigDigest {
+                file_path,
+                config_type,
+                name,
+                version,
+                scripts,
+                build_targets,
+                test_commands,
+                run_commands,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok(digests)
+    }
+
+    /// Gets aggregated commands from all config digests
+    pub fn get_project_commands(&self) -> Result<ProjectCommands> {
+        let digests = self.get_all_config_digests()?;
+
+        let mut run = Vec::new();
+        let mut build = Vec::new();
+        let mut test = Vec::new();
+
+        for digest in digests {
+            run.extend(digest.run_commands);
+            build.extend(digest.build_targets.iter().map(|t| {
+                match digest.config_type {
+                    crate::docs::ConfigType::PackageJson => format!("npm run {}", t),
+                    crate::docs::ConfigType::CargoToml => format!("cargo build"),
+                    crate::docs::ConfigType::Makefile => format!("make {}", t),
+                    crate::docs::ConfigType::PyProjectToml => format!("python -m build"),
+                    crate::docs::ConfigType::GoMod => format!("go build"),
+                    crate::docs::ConfigType::Other => t.clone(),
+                }
+            }));
+            test.extend(digest.test_commands);
+        }
+
+        // Deduplicate
+        run.sort();
+        run.dedup();
+        build.sort();
+        build.dedup();
+        test.sort();
+        test.dedup();
+
+        Ok(ProjectCommands { run, build, test })
+    }
+
+    // === Project Compass Methods ===
+
+    /// Saves a project profile
+    pub fn save_project_profile(&self, project_path: &str, profile: &crate::compass::ProjectProfile) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let languages_json = serde_json::to_string(&profile.languages).unwrap_or_default();
+        let frameworks_json = serde_json::to_string(&profile.frameworks).unwrap_or_default();
+        let build_tools_json = serde_json::to_string(&profile.build_tools).unwrap_or_default();
+
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO project_profile
+            (project_path, languages, frameworks, build_tools, workspace_type, profile_rev, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT profile_rev FROM project_profile WHERE project_path = ?1), 0) + 1, ?6)
+            "#,
+            params![
+                project_path,
+                languages_json,
+                frameworks_json,
+                build_tools_json,
+                profile.workspace_type,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Gets the project profile
+    pub fn get_project_profile(&self, project_path: &str) -> Result<Option<(crate::compass::ProjectProfile, u64)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let result = conn.query_row(
+            r#"
+            SELECT languages, frameworks, build_tools, workspace_type, profile_rev
+            FROM project_profile WHERE project_path = ?1
+            "#,
+            params![project_path],
+            |row| {
+                let languages_json: String = row.get(0)?;
+                let frameworks_json: String = row.get(1)?;
+                let build_tools_json: String = row.get(2)?;
+                let workspace_type: Option<String> = row.get(3)?;
+                let profile_rev: i64 = row.get(4)?;
+
+                let languages: Vec<crate::compass::LanguageStats> =
+                    serde_json::from_str(&languages_json).unwrap_or_default();
+                let frameworks: Vec<crate::compass::FrameworkInfo> =
+                    serde_json::from_str(&frameworks_json).unwrap_or_default();
+                let build_tools: Vec<String> =
+                    serde_json::from_str(&build_tools_json).unwrap_or_default();
+
+                let total_files = languages.iter().map(|l| l.file_count).sum();
+                let total_symbols = languages.iter().map(|l| l.symbol_count).sum();
+
+                Ok((
+                    crate::compass::ProjectProfile {
+                        languages,
+                        frameworks,
+                        build_tools,
+                        workspace_type,
+                        total_files,
+                        total_symbols,
+                    },
+                    profile_rev as u64,
+                ))
+            },
+        ).optional()?;
+
+        Ok(result)
+    }
+
+    /// Saves project nodes
+    pub fn save_project_nodes(&self, nodes: &[crate::compass::ProjectNode]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Clear existing nodes
+        tx.execute("DELETE FROM project_nodes", [])?;
+
+        for node in nodes {
+            tx.execute(
+                r#"
+                INSERT INTO project_nodes
+                (id, parent_id, node_type, name, path, symbol_count, public_symbol_count, file_count, centrality_score)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    node.id,
+                    node.parent_id,
+                    node.node_type.as_str(),
+                    node.name,
+                    node.path,
+                    node.symbol_count as i64,
+                    node.public_symbol_count as i64,
+                    node.file_count as i64,
+                    node.centrality_score as f64,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gets all project nodes
+    pub fn get_project_nodes(&self) -> Result<Vec<crate::compass::ProjectNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, parent_id, node_type, name, path, symbol_count, public_symbol_count, file_count, centrality_score
+            FROM project_nodes ORDER BY symbol_count DESC
+            "#,
+        )?;
+
+        let nodes = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let parent_id: Option<String> = row.get(1)?;
+            let node_type_str: String = row.get(2)?;
+            let name: String = row.get(3)?;
+            let path: String = row.get(4)?;
+            let symbol_count: i64 = row.get(5)?;
+            let public_symbol_count: i64 = row.get(6)?;
+            let file_count: i64 = row.get(7)?;
+            let centrality_score: f64 = row.get(8)?;
+
+            let node_type = match node_type_str.as_str() {
+                "module" => crate::compass::NodeType::Module,
+                "directory" => crate::compass::NodeType::Directory,
+                "package" => crate::compass::NodeType::Package,
+                "layer" => crate::compass::NodeType::Layer,
+                _ => crate::compass::NodeType::Directory,
+            };
+
+            Ok(crate::compass::ProjectNode {
+                id,
+                parent_id,
+                node_type,
+                name,
+                path,
+                symbol_count: symbol_count as usize,
+                public_symbol_count: public_symbol_count as usize,
+                file_count: file_count as usize,
+                centrality_score: centrality_score as f32,
+                children: Vec::new(), // Will be populated separately
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok(nodes)
+    }
+
+    /// Gets a single project node by ID
+    pub fn get_project_node(&self, node_id: &str) -> Result<Option<crate::compass::ProjectNode>> {
+        let conn = self.conn.lock().unwrap();
+
+        let result = conn.query_row(
+            r#"
+            SELECT id, parent_id, node_type, name, path, symbol_count, public_symbol_count, file_count, centrality_score
+            FROM project_nodes WHERE id = ?1
+            "#,
+            params![node_id],
+            |row| {
+                let id: String = row.get(0)?;
+                let parent_id: Option<String> = row.get(1)?;
+                let node_type_str: String = row.get(2)?;
+                let name: String = row.get(3)?;
+                let path: String = row.get(4)?;
+                let symbol_count: i64 = row.get(5)?;
+                let public_symbol_count: i64 = row.get(6)?;
+                let file_count: i64 = row.get(7)?;
+                let centrality_score: f64 = row.get(8)?;
+
+                let node_type = match node_type_str.as_str() {
+                    "module" => crate::compass::NodeType::Module,
+                    "directory" => crate::compass::NodeType::Directory,
+                    "package" => crate::compass::NodeType::Package,
+                    "layer" => crate::compass::NodeType::Layer,
+                    _ => crate::compass::NodeType::Directory,
+                };
+
+                Ok(crate::compass::ProjectNode {
+                    id,
+                    parent_id,
+                    node_type,
+                    name,
+                    path,
+                    symbol_count: symbol_count as usize,
+                    public_symbol_count: public_symbol_count as usize,
+                    file_count: file_count as usize,
+                    centrality_score: centrality_score as f32,
+                    children: Vec::new(),
+                })
+            },
+        ).optional()?;
+
+        Ok(result)
+    }
+
+    /// Gets children of a project node
+    pub fn get_node_children(&self, parent_id: &str) -> Result<Vec<crate::compass::ProjectNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, parent_id, node_type, name, path, symbol_count, public_symbol_count, file_count, centrality_score
+            FROM project_nodes WHERE parent_id = ?1 ORDER BY symbol_count DESC
+            "#,
+        )?;
+
+        let nodes = stmt.query_map(params![parent_id], |row| {
+            let id: String = row.get(0)?;
+            let parent_id: Option<String> = row.get(1)?;
+            let node_type_str: String = row.get(2)?;
+            let name: String = row.get(3)?;
+            let path: String = row.get(4)?;
+            let symbol_count: i64 = row.get(5)?;
+            let public_symbol_count: i64 = row.get(6)?;
+            let file_count: i64 = row.get(7)?;
+            let centrality_score: f64 = row.get(8)?;
+
+            let node_type = match node_type_str.as_str() {
+                "module" => crate::compass::NodeType::Module,
+                "directory" => crate::compass::NodeType::Directory,
+                "package" => crate::compass::NodeType::Package,
+                "layer" => crate::compass::NodeType::Layer,
+                _ => crate::compass::NodeType::Directory,
+            };
+
+            Ok(crate::compass::ProjectNode {
+                id,
+                parent_id,
+                node_type,
+                name,
+                path,
+                symbol_count: symbol_count as usize,
+                public_symbol_count: public_symbol_count as usize,
+                file_count: file_count as usize,
+                centrality_score: centrality_score as f32,
+                children: Vec::new(),
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok(nodes)
+    }
+
+    /// Saves entry points
+    pub fn save_entry_points(&self, entries: &[crate::compass::EntryPoint]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Clear existing entry points
+        tx.execute("DELETE FROM entry_points", [])?;
+
+        for entry in entries {
+            tx.execute(
+                r#"
+                INSERT OR REPLACE INTO entry_points
+                (symbol_id, entry_type, file_path, line, name, evidence)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    entry.symbol_id,
+                    entry.entry_type.as_str(),
+                    entry.file_path,
+                    entry.line as i64,
+                    entry.name,
+                    entry.evidence,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gets all entry points
+    pub fn get_entry_points(&self) -> Result<Vec<crate::compass::EntryPoint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT symbol_id, entry_type, file_path, line, name, evidence
+            FROM entry_points ORDER BY entry_type, file_path
+            "#,
+        )?;
+
+        let entries = stmt.query_map([], |row| {
+            let symbol_id: Option<String> = row.get(0)?;
+            let entry_type_str: String = row.get(1)?;
+            let file_path: String = row.get(2)?;
+            let line: i64 = row.get(3)?;
+            let name: String = row.get(4)?;
+            let evidence: Option<String> = row.get(5)?;
+
+            let entry_type = match entry_type_str.as_str() {
+                "main" => crate::compass::EntryType::Main,
+                "tokio_main" => crate::compass::EntryType::TokioMain,
+                "actix_main" => crate::compass::EntryType::ActixMain,
+                "server" => crate::compass::EntryType::Server,
+                "cli" => crate::compass::EntryType::Cli,
+                "rest_endpoint" => crate::compass::EntryType::RestEndpoint,
+                "graphql_resolver" => crate::compass::EntryType::GraphqlResolver,
+                "grpc_service" => crate::compass::EntryType::GrpcService,
+                "test" => crate::compass::EntryType::Test,
+                "benchmark" => crate::compass::EntryType::Benchmark,
+                _ => crate::compass::EntryType::Main,
+            };
+
+            Ok(crate::compass::EntryPoint {
+                symbol_id,
+                entry_type,
+                file_path,
+                line: line as u32,
+                name,
+                evidence: evidence.unwrap_or_default(),
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        Ok(entries)
+    }
+}
+
+/// Aggregated project commands
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectCommands {
+    pub run: Vec<String>,
+    pub build: Vec<String>,
+    pub test: Vec<String>,
 }
 
 #[cfg(test)]

@@ -58,4 +58,8 @@ pub trait CodeIndex: Send + Sync {
 
     /// Get metrics for all functions in a file
     fn get_file_metrics(&self, file_path: &str) -> Result<Vec<FunctionMetrics>>;
+
+    // Documentation and configuration digest methods
+    /// Get all configuration digests (package.json, Cargo.toml, etc.)
+    fn get_all_config_digests(&self) -> Result<Vec<crate::docs::ConfigDigest>>;
 }
