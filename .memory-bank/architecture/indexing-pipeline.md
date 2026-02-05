@@ -1,0 +1,27 @@
+---
+description: "Пайплайн индексирования: от FileWalker до SqliteIndex."
+---
+
+# Indexing Pipeline (Architecture)
+
+Пайплайн индексации построен вокруг `index_directory` в `src/cli/commands.rs` и компонентов `indexer`.
+
+## Основная цепочка
+1. File discovery: `FileWalker::new(LanguageRegistry)` собирает поддерживаемые файлы.
+2. Parsing: `Parser::parse_file` строит AST через tree-sitter.
+3. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports.
+4. Persist: `SqliteIndex::add_extraction_results_batch` сохраняет данные в SQLite.
+
+## Watch mode
+- `FileWatcher` отслеживает изменения.
+- На Modified/Created: удаление старых данных по файлу и повторная индексация.
+- На Deleted: удаление файла из индекса.
+
+## Дополнительные анализаторы
+- `ScopeBuilder` строит дерево scopes на базе AST.
+- `ImportResolver` резолвит import пути для разных языков.
+- `CallAnalyzer` классифицирует уверенность call graph.
+Эти компоненты предназначены для scope/import/call graph функций и могут использоваться в расширенных сценариях анализа.
+
+## Связанные материалы
+[.memory-bank/guides/indexing-pipeline.md](../guides/indexing-pipeline.md): сценарии индексирования и параметры CLI.
