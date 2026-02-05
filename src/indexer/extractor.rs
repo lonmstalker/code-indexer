@@ -133,11 +133,14 @@ impl SymbolExtractor {
                         symbol.with_signature(format!("{}{}", name, signature_parts.join(" -> ")));
                 }
 
-                // Extract structured parameters for Python and TypeScript
+                // Extract structured parameters for supported languages
                 if let Some(pnode) = params_node {
                     let structured_params = match parsed.language.as_str() {
                         "python" => self.extract_python_params(parsed, &pnode),
                         "typescript" => self.extract_ts_params(parsed, &pnode),
+                        "rust" => self.extract_rust_params(parsed, &pnode),
+                        "java" => self.extract_java_params(parsed, &pnode),
+                        "go" => self.extract_go_params(parsed, &pnode),
                         _ => Vec::new(),
                     };
                     if !structured_params.is_empty() {
@@ -637,6 +640,227 @@ impl SymbolExtractor {
                             );
                             break;
                         }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a Rust function/method node
+    fn extract_rust_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "self_parameter" => {
+                    // &self, &mut self, self
+                    let text = parsed.node_text(&child);
+                    let mut param = crate::index::FunctionParam::new("self").is_self_param();
+                    // Extract the full type representation for &self or &mut self
+                    if text.contains("&mut") {
+                        param = param.with_type("&mut Self".to_string());
+                    } else if text.contains('&') {
+                        param = param.with_type("&Self".to_string());
+                    } else {
+                        param = param.with_type("Self".to_string());
+                    }
+                    params.push(param);
+                }
+                "parameter" => {
+                    // Regular parameter: pattern: type
+                    // Structure: pattern (identifier/reference_pattern/etc), ":", type
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+                    let mut is_mutable = false;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" if name.is_empty() => {
+                                name = parsed.node_text(&c);
+                            }
+                            "mutable_specifier" => {
+                                is_mutable = true;
+                            }
+                            "reference_pattern" => {
+                                // &name or &mut name - extract the inner identifier
+                                let mut ref_cursor = c.walk();
+                                for rc in c.children(&mut ref_cursor) {
+                                    if rc.kind() == "identifier" {
+                                        name = parsed.node_text(&rc);
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Check if this is a type node (comes after ":")
+                                if !name.is_empty() && c.kind() != ":" {
+                                    type_ann = Some(parsed.node_text(&c).to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = crate::index::FunctionParam::new(name);
+                        if let Some(t) = type_ann {
+                            param = param.with_type(t);
+                        }
+                        if is_mutable {
+                            // Store mutable info in the type if needed
+                        }
+                        params.push(param);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a Java method/constructor node
+    fn extract_java_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "formal_parameter" | "spread_parameter" => {
+                    // formal_parameter: [modifiers] type declarator_id
+                    // spread_parameter: [modifiers] type ... variable_declarator
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+                    let is_varargs = child.kind() == "spread_parameter";
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" => {
+                                // This is the parameter name (last identifier)
+                                name = parsed.node_text(&c);
+                            }
+                            "variable_declarator" => {
+                                // In spread_parameter, the name may be in variable_declarator
+                                // Extract the identifier from it
+                                let mut vd_cursor = c.walk();
+                                for vc in c.children(&mut vd_cursor) {
+                                    if vc.kind() == "identifier" {
+                                        name = parsed.node_text(&vc);
+                                        break;
+                                    }
+                                }
+                            }
+                            "type_identifier" | "integral_type" | "floating_point_type"
+                            | "boolean_type" | "void_type" | "array_type" | "generic_type" => {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            "scoped_type_identifier" => {
+                                // Qualified type like java.util.List
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = crate::index::FunctionParam::new(name);
+                        if let Some(t) = type_ann {
+                            param = param.with_type(t);
+                        }
+                        if is_varargs {
+                            param = param.variadic();
+                        }
+                        params.push(param);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        params
+    }
+
+    /// Extract structured parameters from a Go function/method node
+    fn extract_go_params(
+        &self,
+        parsed: &ParsedFile,
+        params_node: &tree_sitter::Node,
+    ) -> Vec<crate::index::FunctionParam> {
+        let mut params = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            match child.kind() {
+                "parameter_declaration" => {
+                    // Go allows multiple names with one type: a, b int
+                    // Structure: identifier(s), type
+                    let mut names: Vec<&str> = Vec::new();
+                    let mut type_ann: Option<String> = None;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" => {
+                                names.push(parsed.node_text(&c));
+                            }
+                            // Type nodes come after the names
+                            "type_identifier" | "pointer_type" | "slice_type" | "array_type"
+                            | "map_type" | "channel_type" | "function_type" | "interface_type"
+                            | "struct_type" | "qualified_type" => {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Create a param for each name with the same type
+                    for name in names {
+                        let mut param = crate::index::FunctionParam::new(name);
+                        if let Some(ref t) = type_ann {
+                            param = param.with_type(t.clone());
+                        }
+                        params.push(param);
+                    }
+                }
+                "variadic_parameter_declaration" => {
+                    // ...args type or identifier ...type
+                    let mut name = "";
+                    let mut type_ann: Option<String> = None;
+
+                    let mut child_cursor = child.walk();
+                    for c in child.children(&mut child_cursor) {
+                        match c.kind() {
+                            "identifier" => {
+                                name = parsed.node_text(&c);
+                            }
+                            "type_identifier" | "pointer_type" | "slice_type" | "array_type"
+                            | "map_type" | "qualified_type" => {
+                                type_ann = Some(parsed.node_text(&c).to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = crate::index::FunctionParam::new(name);
+                        if let Some(t) = type_ann {
+                            param = param.with_type(format!("...{}", t));
+                        }
+                        param = param.variadic();
+                        params.push(param);
                     }
                 }
                 _ => {}
@@ -1159,5 +1383,315 @@ function add(a: number, b: number): number {
         assert_eq!(func.params[0].type_annotation, Some("number".to_string()));
         assert_eq!(func.params[1].name, "b");
         assert_eq!(func.params[1].type_annotation, Some("number".to_string()));
+    }
+
+    // === Rust Type Tests ===
+
+    #[test]
+    fn test_extract_rust_function_with_types() {
+        let source = r#"
+fn calculate(a: i32, b: String) -> bool {
+    true
+}
+"#;
+        let symbols = parse_and_extract(source, "rust", "test.rs");
+
+        let func = symbols.iter().find(|s| s.name == "calculate").unwrap();
+        assert_eq!(func.kind, SymbolKind::Function);
+        assert!(func.return_type.as_ref().map_or(false, |t| t.contains("bool")));
+
+        // Check params have type annotations
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "a");
+        assert_eq!(func.params[0].type_annotation, Some("i32".to_string()));
+        assert_eq!(func.params[1].name, "b");
+        assert_eq!(func.params[1].type_annotation, Some("String".to_string()));
+    }
+
+    #[test]
+    fn test_extract_rust_method_with_self() {
+        let source = r#"
+struct Foo;
+
+impl Foo {
+    fn method(&self, x: i32) -> i32 {
+        x
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "rust", "test.rs");
+
+        let method = symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(method.kind, SymbolKind::Method);
+
+        // &self should be first param
+        assert!(!method.params.is_empty());
+        assert_eq!(method.params[0].name, "self");
+        assert!(method.params[0].is_self);
+        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("Self")));
+
+        // Second param should have type
+        assert_eq!(method.params[1].name, "x");
+        assert_eq!(method.params[1].type_annotation, Some("i32".to_string()));
+    }
+
+    #[test]
+    fn test_extract_rust_method_with_mut_self() {
+        let source = r#"
+struct Bar;
+
+impl Bar {
+    fn mutate(&mut self, value: String) {
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "rust", "test.rs");
+
+        let method = symbols.iter().find(|s| s.name == "mutate").unwrap();
+
+        // &mut self should include mut in type
+        assert!(method.params[0].is_self);
+        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("mut")));
+    }
+
+    #[test]
+    fn test_extract_rust_function_with_reference_params() {
+        let source = r#"
+fn process(data: &str, buffer: &mut Vec<u8>) -> &str {
+    data
+}
+"#;
+        let symbols = parse_and_extract(source, "rust", "test.rs");
+
+        let func = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "data");
+        assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("&str")));
+        assert_eq!(func.params[1].name, "buffer");
+        assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("Vec")));
+    }
+
+    #[test]
+    fn test_extract_rust_function_with_generic_types() {
+        let source = r#"
+fn transform<T: Clone>(item: T, items: Vec<T>) -> T {
+    item.clone()
+}
+"#;
+        let symbols = parse_and_extract(source, "rust", "test.rs");
+
+        let func = symbols.iter().find(|s| s.name == "transform").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "item");
+        assert_eq!(func.params[0].type_annotation, Some("T".to_string()));
+        assert_eq!(func.params[1].name, "items");
+        assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("Vec")));
+    }
+
+    // === Java Type Tests ===
+
+    #[test]
+    fn test_extract_java_method_with_types() {
+        let source = r#"
+public class Example {
+    public String greet(String name, int age) {
+        return "Hello";
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "java", "Example.java");
+
+        let method = symbols.iter().find(|s| s.name == "greet").unwrap();
+        // Java methods inside classes are captured with the query
+        assert!(method.kind == SymbolKind::Function || method.kind == SymbolKind::Method);
+
+        // Check params have type annotations
+        assert_eq!(method.params.len(), 2);
+        assert_eq!(method.params[0].name, "name");
+        assert_eq!(method.params[0].type_annotation, Some("String".to_string()));
+        assert_eq!(method.params[1].name, "age");
+        assert_eq!(method.params[1].type_annotation, Some("int".to_string()));
+    }
+
+    #[test]
+    fn test_extract_java_constructor_params() {
+        let source = r#"
+public class User {
+    public User(String name, int age) {
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "java", "User.java");
+
+        let constructor = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Method).unwrap();
+        assert_eq!(constructor.params.len(), 2);
+        assert_eq!(constructor.params[0].name, "name");
+        assert_eq!(constructor.params[0].type_annotation, Some("String".to_string()));
+    }
+
+    #[test]
+    fn test_extract_java_method_with_generic_types() {
+        let source = r#"
+public class Container {
+    public <T> T transform(T item, List<T> items) {
+        return item;
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "java", "Container.java");
+
+        let method = symbols.iter().find(|s| s.name == "transform").unwrap();
+        assert_eq!(method.params.len(), 2);
+        assert_eq!(method.params[0].name, "item");
+        assert_eq!(method.params[0].type_annotation, Some("T".to_string()));
+        assert_eq!(method.params[1].name, "items");
+        assert!(method.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("List")));
+    }
+
+    #[test]
+    fn test_extract_java_varargs() {
+        let source = r#"
+public class Formatter {
+    public String format(String template, Object... args) {
+        return "";
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "java", "Formatter.java");
+
+        let method = symbols.iter().find(|s| s.name == "format").unwrap();
+        // Both params should be captured
+        assert_eq!(method.params.len(), 2);
+        // First param is regular
+        assert_eq!(method.params[0].name, "template");
+        assert_eq!(method.params[0].type_annotation, Some("String".to_string()));
+        assert!(!method.params[0].is_variadic);
+        // Second param is varargs
+        assert_eq!(method.params[1].name, "args");
+        assert_eq!(method.params[1].type_annotation, Some("Object".to_string()));
+        assert!(method.params[1].is_variadic);
+    }
+
+    #[test]
+    fn test_extract_java_array_types() {
+        let source = r#"
+public class DataProcessor {
+    public byte[] process(byte[] input, int[] indices) {
+        return input;
+    }
+}
+"#;
+        let symbols = parse_and_extract(source, "java", "DataProcessor.java");
+
+        let method = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(method.params.len(), 2);
+        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("byte")));
+        assert!(method.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("int")));
+    }
+
+    // === Go Type Tests ===
+
+    #[test]
+    fn test_extract_go_function_with_types() {
+        let source = r#"
+package main
+
+func greet(name string, age int) string {
+    return ""
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let func = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(func.kind, SymbolKind::Function);
+
+        // Check params have type annotations
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "name");
+        assert_eq!(func.params[0].type_annotation, Some("string".to_string()));
+        assert_eq!(func.params[1].name, "age");
+        assert_eq!(func.params[1].type_annotation, Some("int".to_string()));
+    }
+
+    #[test]
+    fn test_extract_go_function_grouped_params() {
+        let source = r#"
+package main
+
+func add(a, b, c int) int {
+    return a + b + c
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let func = symbols.iter().find(|s| s.name == "add").unwrap();
+        // Go allows grouping params with same type: a, b, c int
+        assert_eq!(func.params.len(), 3);
+        assert_eq!(func.params[0].name, "a");
+        assert_eq!(func.params[0].type_annotation, Some("int".to_string()));
+        assert_eq!(func.params[1].name, "b");
+        assert_eq!(func.params[1].type_annotation, Some("int".to_string()));
+        assert_eq!(func.params[2].name, "c");
+        assert_eq!(func.params[2].type_annotation, Some("int".to_string()));
+    }
+
+    #[test]
+    fn test_extract_go_method_with_receiver() {
+        let source = r#"
+package main
+
+type Calculator struct{}
+
+func (c *Calculator) Add(a, b int) int {
+    return a + b
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let method = symbols.iter().find(|s| s.name == "Add").unwrap();
+        assert_eq!(method.kind, SymbolKind::Method);
+        // Method params (not including receiver)
+        assert_eq!(method.params.len(), 2);
+        assert_eq!(method.params[0].name, "a");
+        assert_eq!(method.params[1].name, "b");
+    }
+
+    #[test]
+    fn test_extract_go_variadic_function() {
+        let source = r#"
+package main
+
+func printf(format string, args ...interface{}) {
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let func = symbols.iter().find(|s| s.name == "printf").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "format");
+        assert_eq!(func.params[0].type_annotation, Some("string".to_string()));
+        assert!(!func.params[0].is_variadic);
+        // Variadic param
+        assert_eq!(func.params[1].name, "args");
+        assert!(func.params[1].is_variadic);
+    }
+
+    #[test]
+    fn test_extract_go_pointer_and_slice_types() {
+        let source = r#"
+package main
+
+func process(data []byte, ptr *int) *string {
+    return nil
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let func = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.params[0].name, "data");
+        assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("[]byte")));
+        assert_eq!(func.params[1].name, "ptr");
+        assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("*int")));
     }
 }
