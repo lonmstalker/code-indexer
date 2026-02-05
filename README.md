@@ -557,7 +557,7 @@ code-indexer tags stats
 ## Текущие ограничения
 
 1. **Нет межпроектных ссылок** — только внутри workspace (планируется: cross-project links)
-2. **Ограниченная поддержка generics** — template instantiation не отслеживается (планируется: generic resolver)
+2. **Template instantiation** — конкретные инстанциации generic типов не отслеживаются (планируется: generic resolver)
 
 ### Улучшения производительности
 
@@ -581,6 +581,19 @@ code-indexer tags stats
 | C# | ✅ | parameter, predefined_type, nullable_type |
 | Swift | ✅ | parameter (direct children), user_type |
 | Kotlin | ✅ | function_value_parameter, parameter |
+
+### Извлечение generic параметров (6 языков)
+
+| Язык | Поддержка | Примечания |
+|------|:---------:|-----------|
+| Rust | ✅ | type_parameters, constrained_type_parameter, trait_bounds |
+| TypeScript | ✅ | type_parameters, constraint, default_type |
+| Java | ✅ | type_parameters, type_bound |
+| Go | ✅ | type_parameter_list, type_parameter_declaration |
+| C# | ✅ | type_parameter_list |
+| Kotlin | ✅ | type_parameters, type_parameter |
+
+Generic параметры сохраняются в поле `generic_params` символа и хранятся в БД как JSON в колонке `generic_params_json`.
 
 ## Лицензия
 

@@ -28,12 +28,14 @@ impl LanguageGrammar for GoGrammar {
         r#"
         (function_declaration
             name: (identifier) @name
+            type_parameters: (type_parameter_list)? @type_params
             parameters: (parameter_list) @params
             result: (_)? @return_type
         ) @function
 
         (method_declaration
             name: (field_identifier) @method_name
+            type_parameters: (type_parameter_list)? @method_type_params
             parameters: (parameter_list) @method_params
             result: (_)? @method_return_type
         ) @method
@@ -45,6 +47,7 @@ impl LanguageGrammar for GoGrammar {
         (type_declaration
             (type_spec
                 name: (type_identifier) @name
+                type_parameters: (type_parameter_list)? @type_params
                 type: (struct_type)
             )
         ) @struct
@@ -52,6 +55,7 @@ impl LanguageGrammar for GoGrammar {
         (type_declaration
             (type_spec
                 name: (type_identifier) @name
+                type_parameters: (type_parameter_list)? @type_params
                 type: (interface_type)
             )
         ) @interface
@@ -59,6 +63,7 @@ impl LanguageGrammar for GoGrammar {
         (type_declaration
             (type_spec
                 name: (type_identifier) @name
+                type_parameters: (type_parameter_list)? @type_params
             )
         ) @type_alias
         "#

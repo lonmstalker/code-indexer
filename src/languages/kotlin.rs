@@ -18,6 +18,7 @@ impl LanguageGrammar for KotlinGrammar {
     fn functions_query(&self) -> &str {
         r#"
         (function_declaration
+            (type_parameters)? @type_params
             name: (identifier) @name
             (function_value_parameters) @params
         ) @function
@@ -32,6 +33,7 @@ impl LanguageGrammar for KotlinGrammar {
         r#"
         (class_declaration
             name: (identifier) @name
+            (type_parameters)? @type_params
         ) @class
 
         (object_declaration

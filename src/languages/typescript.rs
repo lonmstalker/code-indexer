@@ -19,12 +19,14 @@ impl LanguageGrammar for TypeScriptGrammar {
         r#"
         (function_declaration
             name: (identifier) @name
+            type_parameters: (type_parameters)? @type_params
             parameters: (formal_parameters) @params
             return_type: (_)? @return_type
         ) @function
 
         (method_definition
             name: (property_identifier) @name
+            type_parameters: (type_parameters)? @type_params
             parameters: (formal_parameters) @params
             return_type: (_)? @return_type
         ) @method
@@ -34,6 +36,7 @@ impl LanguageGrammar for TypeScriptGrammar {
         ) @arrow_function
 
         (arrow_function
+            type_parameters: (type_parameters)? @type_params
             parameters: (formal_parameters) @params
             return_type: (_)? @return_type
         ) @arrow_function_multi
@@ -49,14 +52,17 @@ impl LanguageGrammar for TypeScriptGrammar {
         r#"
         (class_declaration
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @class
 
         (interface_declaration
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @interface
 
         (type_alias_declaration
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @type_alias
 
         (enum_declaration

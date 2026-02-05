@@ -28,6 +28,7 @@ impl LanguageGrammar for CSharpGrammar {
         r#"
         (method_declaration
             name: (identifier) @name
+            (type_parameter_list)? @type_params
             parameters: (parameter_list) @params
             type: (_)? @return_type
         ) @method
@@ -39,6 +40,7 @@ impl LanguageGrammar for CSharpGrammar {
 
         (local_function_statement
             name: (identifier) @name
+            (type_parameter_list)? @type_params
             parameters: (parameter_list) @params
             type: (_)? @return_type
         ) @function
@@ -49,14 +51,17 @@ impl LanguageGrammar for CSharpGrammar {
         r#"
         (class_declaration
             name: (identifier) @name
+            (type_parameter_list)? @type_params
         ) @class
 
         (interface_declaration
             name: (identifier) @name
+            (type_parameter_list)? @type_params
         ) @interface
 
         (struct_declaration
             name: (identifier) @name
+            (type_parameter_list)? @type_params
         ) @struct
 
         (enum_declaration
@@ -65,6 +70,7 @@ impl LanguageGrammar for CSharpGrammar {
 
         (record_declaration
             name: (identifier) @name
+            (type_parameter_list)? @type_params
         ) @record
         "#
     }

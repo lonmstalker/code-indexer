@@ -3,7 +3,7 @@ use std::path::Path;
 use tree_sitter::StreamingIterator;
 
 use crate::error::{IndexerError, Result};
-use crate::index::{FileImport, ImportType, Location, ReferenceKind, Symbol, SymbolKind, SymbolReference, Visibility};
+use crate::index::{FileImport, GenericParam, ImportType, Location, ReferenceKind, Symbol, SymbolKind, SymbolReference, Visibility};
 use crate::indexer::parser::ParsedFile;
 
 /// Result of extraction containing symbols, references, and imports
@@ -61,6 +61,7 @@ impl SymbolExtractor {
             let mut kind = SymbolKind::Function;
             let mut node: Option<tree_sitter::Node> = None;
             let mut params_node: Option<tree_sitter::Node> = None;
+            let mut type_params_node: Option<tree_sitter::Node> = None;
             let mut signature_parts: Vec<&str> = Vec::new();
             let mut return_type_text: Option<&str> = None;
 
@@ -88,6 +89,9 @@ impl SymbolExtractor {
                     "return_type" | "method_return_type" => {
                         return_type_text = Some(text);
                         signature_parts.push(text);
+                    }
+                    "type_params" | "method_type_params" => {
+                        type_params_node = Some(capture.node);
                     }
                     _ => {}
                 }
@@ -163,6 +167,14 @@ impl SymbolExtractor {
                     symbol.return_type = Some(rt.to_string());
                 }
 
+                // Extract generic type parameters
+                if let Some(tp_node) = type_params_node {
+                    let generic_params = self.extract_generic_params(parsed, &tp_node);
+                    if !generic_params.is_empty() {
+                        symbol.generic_params = generic_params;
+                    }
+                }
+
                 symbols.push(symbol);
             }
         }
@@ -191,6 +203,7 @@ impl SymbolExtractor {
             let mut name: Option<&str> = None;
             let mut kind = SymbolKind::Struct;
             let mut node: Option<tree_sitter::Node> = None;
+            let mut type_params_node: Option<tree_sitter::Node> = None;
 
             for capture in m.captures {
                 let capture_name = query.capture_names()[capture.index as usize];
@@ -224,6 +237,9 @@ impl SymbolExtractor {
                         node = Some(capture.node);
                         kind = SymbolKind::TypeAlias;
                     }
+                    "type_params" | "impl_type_params" => {
+                        type_params_node = Some(capture.node);
+                    }
                     _ => {}
                 }
             }
@@ -247,6 +263,14 @@ impl SymbolExtractor {
                 let doc = self.extract_doc_comment(parsed, &node);
                 if let Some(d) = doc {
                     symbol = symbol.with_doc_comment(d);
+                }
+
+                // Extract generic type parameters for types
+                if let Some(tp_node) = type_params_node {
+                    let generic_params = self.extract_generic_params(parsed, &tp_node);
+                    if !generic_params.is_empty() {
+                        symbol.generic_params = generic_params;
+                    }
                 }
 
                 symbols.push(symbol);
@@ -441,6 +465,329 @@ impl SymbolExtractor {
 
         Ok(())
     }
+
+    // ========================================================================
+    // Generic Type Parameters Extraction
+    // ========================================================================
+
+    /// Extract generic type parameters from a type_parameters node.
+    /// Dispatches to language-specific extraction methods.
+    fn extract_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        type_params_node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        match parsed.language.as_str() {
+            "rust" => self.extract_rust_generic_params(parsed, type_params_node),
+            "typescript" => self.extract_ts_generic_params(parsed, type_params_node),
+            "java" => self.extract_java_generic_params(parsed, type_params_node),
+            "go" => self.extract_go_generic_params(parsed, type_params_node),
+            "csharp" => self.extract_csharp_generic_params(parsed, type_params_node),
+            "kotlin" => self.extract_kotlin_generic_params(parsed, type_params_node),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Extract Rust generic parameters: <T, E: Error + Clone, D = i32>
+    fn extract_rust_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "type_identifier" => {
+                    // Simple type parameter without bounds: T
+                    let name = parsed.node_text(&child).to_string();
+                    params.push(GenericParam::new(name));
+                }
+                "constrained_type_parameter" => {
+                    // Type parameter with bounds: T: Clone + Send
+                    let mut name = String::new();
+                    let mut bounds = Vec::new();
+
+                    let mut child_cursor = child.walk();
+                    for grandchild in child.children(&mut child_cursor) {
+                        match grandchild.kind() {
+                            "type_identifier" => {
+                                if name.is_empty() {
+                                    name = parsed.node_text(&grandchild).to_string();
+                                }
+                            }
+                            "trait_bounds" => {
+                                bounds = self.extract_rust_bounds(parsed, &grandchild);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = GenericParam::new(name);
+                        if !bounds.is_empty() {
+                            param = param.with_bounds(bounds);
+                        }
+                        params.push(param);
+                    }
+                }
+                "optional_type_parameter" => {
+                    // Type parameter with default: T = i32
+                    let mut name = String::new();
+                    let mut default = None;
+
+                    let mut child_cursor = child.walk();
+                    for grandchild in child.children(&mut child_cursor) {
+                        match grandchild.kind() {
+                            "type_identifier" => {
+                                if name.is_empty() {
+                                    name = parsed.node_text(&grandchild).to_string();
+                                } else if default.is_none() {
+                                    default = Some(parsed.node_text(&grandchild).to_string());
+                                }
+                            }
+                            _ if default.is_none() && grandchild.kind() != "=" => {
+                                // Capture any type as default (could be generic_type, etc.)
+                                if !name.is_empty() {
+                                    default = Some(parsed.node_text(&grandchild).to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !name.is_empty() {
+                        let mut param = GenericParam::new(name);
+                        if let Some(d) = default {
+                            param = param.with_default(d);
+                        }
+                        params.push(param);
+                    }
+                }
+                _ => {}
+            }
+        }
+        params
+    }
+
+    /// Extract bounds from Rust trait_bounds node
+    fn extract_rust_bounds(&self, parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
+        let mut bounds = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
+                bounds.push(parsed.node_text(&child).to_string());
+            }
+        }
+        bounds
+    }
+
+    /// Extract TypeScript generic parameters: <T, K extends keyof T, D = string>
+    fn extract_ts_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_parameter" {
+                let mut name = String::new();
+                let mut constraint = None;
+                let mut default = None;
+
+                let mut child_cursor = child.walk();
+                for grandchild in child.children(&mut child_cursor) {
+                    match grandchild.kind() {
+                        "type_identifier" => {
+                            if name.is_empty() {
+                                name = parsed.node_text(&grandchild).to_string();
+                            }
+                        }
+                        "constraint" => {
+                            constraint = Some(parsed.node_text(&grandchild).to_string());
+                        }
+                        "default_type" => {
+                            default = Some(parsed.node_text(&grandchild).to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = GenericParam::new(name);
+                    if let Some(c) = constraint {
+                        param = param.with_bounds(vec![c]);
+                    }
+                    if let Some(d) = default {
+                        param = param.with_default(d);
+                    }
+                    params.push(param);
+                }
+            }
+        }
+        params
+    }
+
+    /// Extract Java generic parameters: <T, E extends Exception, K super Number>
+    fn extract_java_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_parameter" {
+                let mut name = String::new();
+                let mut bounds = Vec::new();
+
+                let mut child_cursor = child.walk();
+                for grandchild in child.children(&mut child_cursor) {
+                    match grandchild.kind() {
+                        "type_identifier" | "identifier" => {
+                            if name.is_empty() {
+                                name = parsed.node_text(&grandchild).to_string();
+                            } else {
+                                bounds.push(parsed.node_text(&grandchild).to_string());
+                            }
+                        }
+                        "type_bound" => {
+                            // Collect all types in bounds
+                            let mut bound_cursor = grandchild.walk();
+                            for bound_child in grandchild.children(&mut bound_cursor) {
+                                if bound_child.kind() == "type_identifier" {
+                                    bounds.push(parsed.node_text(&bound_child).to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = GenericParam::new(name);
+                    if !bounds.is_empty() {
+                        param = param.with_bounds(bounds);
+                    }
+                    params.push(param);
+                }
+            }
+        }
+        params
+    }
+
+    /// Extract Go generic parameters: [T any, K comparable, V ~int | ~string]
+    fn extract_go_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_parameter_declaration" {
+                let mut name = String::new();
+                let mut constraint = None;
+
+                let mut child_cursor = child.walk();
+                for grandchild in child.children(&mut child_cursor) {
+                    match grandchild.kind() {
+                        "identifier" | "type_identifier" => {
+                            if name.is_empty() {
+                                name = parsed.node_text(&grandchild).to_string();
+                            } else if constraint.is_none() {
+                                constraint = Some(parsed.node_text(&grandchild).to_string());
+                            }
+                        }
+                        "type_constraint" | "constraint_elem" => {
+                            constraint = Some(parsed.node_text(&grandchild).to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = GenericParam::new(name);
+                    if let Some(c) = constraint {
+                        param = param.with_bounds(vec![c]);
+                    }
+                    params.push(param);
+                }
+            }
+        }
+        params
+    }
+
+    /// Extract C# generic parameters: <T, TKey, TValue> where T : class
+    fn extract_csharp_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_parameter" {
+                let name = parsed.node_text(&child).to_string();
+                if !name.is_empty() && name != "," && name != "<" && name != ">" {
+                    params.push(GenericParam::new(name));
+                }
+            }
+        }
+        params
+    }
+
+    /// Extract Kotlin generic parameters: <T, K : Comparable<K>, out V>
+    fn extract_kotlin_generic_params(
+        &self,
+        parsed: &ParsedFile,
+        node: &tree_sitter::Node,
+    ) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_parameter" {
+                let mut name = String::new();
+                let mut bounds = Vec::new();
+
+                let mut child_cursor = child.walk();
+                for grandchild in child.children(&mut child_cursor) {
+                    match grandchild.kind() {
+                        "type_identifier" | "identifier" => {
+                            if name.is_empty() {
+                                name = parsed.node_text(&grandchild).to_string();
+                            }
+                        }
+                        "type" | "user_type" => {
+                            bounds.push(parsed.node_text(&grandchild).to_string());
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !name.is_empty() {
+                    let mut param = GenericParam::new(name);
+                    if !bounds.is_empty() {
+                        param = param.with_bounds(bounds);
+                    }
+                    params.push(param);
+                }
+            }
+        }
+        params
+    }
+
+    // ========================================================================
+    // Function Parameters Extraction
+    // ========================================================================
 
     /// Extract structured parameters from a Python function/method node
     fn extract_python_params(

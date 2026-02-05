@@ -28,6 +28,7 @@ impl LanguageGrammar for RustGrammar {
         r#"
         (function_item
             name: (identifier) @name
+            type_parameters: (type_parameters)? @type_params
             parameters: (parameters) @params
             return_type: (_)? @return_type
         ) @function
@@ -37,6 +38,7 @@ impl LanguageGrammar for RustGrammar {
             body: (declaration_list
                 (function_item
                     name: (identifier) @method_name
+                    type_parameters: (type_parameters)? @method_type_params
                     parameters: (parameters) @method_params
                     return_type: (_)? @method_return_type
                 ) @method
@@ -49,21 +51,26 @@ impl LanguageGrammar for RustGrammar {
         r#"
         (struct_item
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @struct
 
         (enum_item
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @enum
 
         (trait_item
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @trait
 
         (type_item
             name: (type_identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @type_alias
 
         (impl_item
+            type_parameters: (type_parameters)? @impl_type_params
             trait: (type_identifier)? @trait_name
             type: (_) @impl_type
         ) @impl

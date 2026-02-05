@@ -47,6 +47,19 @@ impl SqliteIndex {
     /// Default pool size for concurrent connections.
     const DEFAULT_POOL_SIZE: u32 = 4;
 
+    /// Standard symbol columns for SELECT queries (16 columns).
+    /// Order: id(0), name(1), kind(2), file_path(3), start_line(4), start_column(5),
+    /// end_line(6), end_column(7), language(8), visibility(9), signature(10),
+    /// doc_comment(11), parent(12), generic_params_json(13), params_json(14), return_type(15)
+    const SYMBOL_COLUMNS: &'static str = "id, name, kind, file_path, start_line, start_column, \
+        end_line, end_column, language, visibility, signature, doc_comment, parent, \
+        generic_params_json, params_json, return_type";
+
+    /// Standard symbol columns with table alias 's.'
+    const SYMBOL_COLUMNS_ALIASED: &'static str = "s.id, s.name, s.kind, s.file_path, s.start_line, \
+        s.start_column, s.end_line, s.end_column, s.language, s.visibility, s.signature, \
+        s.doc_comment, s.parent, s.generic_params_json, s.params_json, s.return_type";
+
     /// Generates SQL placeholders for IN clause: "?, ?, ?"
     fn generate_placeholders(count: usize) -> String {
         std::iter::repeat("?")
@@ -410,8 +423,9 @@ impl SqliteIndex {
                 r#"
                 INSERT OR REPLACE INTO symbols
                 (id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                 language, visibility, signature, doc_comment, parent, source_type, dependency_id)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'dependency', ?14)
+                 language, visibility, signature, doc_comment, parent, source_type, dependency_id,
+                 generic_params_json, params_json, return_type)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'dependency', ?14, ?15, ?16, ?17)
                 "#,
                 params![
                     symbol.id,
@@ -428,6 +442,9 @@ impl SqliteIndex {
                     symbol.doc_comment,
                     symbol.parent,
                     dep_id,
+                    serde_json::to_string(&symbol.generic_params).ok(),
+                    serde_json::to_string(&symbol.params).ok(),
+                    symbol.return_type,
                 ],
             )?;
         }
@@ -448,15 +465,11 @@ impl SqliteIndex {
 
         let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
 
-        let mut sql = String::from(
-            r#"
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent, bm25(symbols_fts) as score
-            FROM symbols s
-            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
-            WHERE symbols_fts MATCH ?1 AND s.source_type = 'dependency'
-            "#,
+        let mut sql = format!(
+            "SELECT {}, bm25(symbols_fts) as score FROM symbols s \
+             JOIN symbols_fts ON s.rowid = symbols_fts.rowid \
+             WHERE symbols_fts MATCH ?1 AND s.source_type = 'dependency'",
+            Self::SYMBOL_COLUMNS_ALIASED
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
@@ -492,7 +505,7 @@ impl SqliteIndex {
         let results = stmt
             .query_map(params_refs.as_slice(), |row| {
                 let symbol = Self::symbol_from_row(row)?;
-                let score: f64 = row.get(13)?;
+                let score: f64 = row.get(16)?; // score is at position 16 after P2 fields
                 Ok(SearchResult {
                     symbol,
                     score: -score,
@@ -511,13 +524,9 @@ impl SqliteIndex {
     ) -> Result<Vec<Symbol>> {
         let conn = self.conn()?;
 
-        let mut sql = String::from(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols
-            WHERE name = ?1 AND kind NOT IN ('import', 'variable') AND source_type = 'dependency'
-            "#,
+        let mut sql = format!(
+            "SELECT {} FROM symbols WHERE name = ?1 AND kind NOT IN ('import', 'variable') AND source_type = 'dependency'",
+            Self::SYMBOL_COLUMNS
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
@@ -975,8 +984,9 @@ impl SqliteIndex {
                     r#"
                     INSERT OR REPLACE INTO symbols
                     (id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                     language, visibility, signature, doc_comment, parent)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     language, visibility, signature, doc_comment, parent,
+                     generic_params_json, params_json, return_type)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                     "#,
                     params![
                         symbol.id,
@@ -992,6 +1002,9 @@ impl SqliteIndex {
                         symbol.signature,
                         symbol.doc_comment,
                         symbol.parent,
+                        serde_json::to_string(&symbol.generic_params).ok(),
+                        serde_json::to_string(&symbol.params).ok(),
+                        symbol.return_type,
                     ],
                 )?;
                 total_symbols += 1;
@@ -1048,6 +1061,10 @@ impl SqliteIndex {
         let kind_str: String = row.get(2)?;
         let visibility_str: Option<String> = row.get(9)?;
 
+        // P2 fields - loaded from DB (columns 13, 14, 15 in basic queries)
+        let generic_params_json: Option<String> = row.get(13).ok().flatten();
+        let params_json: Option<String> = row.get(14).ok().flatten();
+
         Ok(Symbol {
             id: row.get(0)?,
             name: row.get(1)?,
@@ -1066,10 +1083,13 @@ impl SqliteIndex {
             parent: row.get(12)?,
             scope_id: None, // Not loaded from basic queries
             fqdn: None,     // Not loaded from basic queries
-            // P2 fields - not stored in DB yet, need migration to enable
-            generic_params: Vec::new(),
-            params: Vec::new(),
-            return_type: None,
+            generic_params: generic_params_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            params: params_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            return_type: row.get(15).ok().flatten(),
         })
     }
 
@@ -1078,6 +1098,10 @@ impl SqliteIndex {
     fn symbol_from_row_extended(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
         let kind_str: String = row.get(2)?;
         let visibility_str: Option<String> = row.get(9)?;
+
+        // P2 fields - loaded from DB (columns 15, 16, 17 in extended queries)
+        let generic_params_json: Option<String> = row.get(15).ok().flatten();
+        let params_json: Option<String> = row.get(16).ok().flatten();
 
         Ok(Symbol {
             id: row.get(0)?,
@@ -1097,10 +1121,13 @@ impl SqliteIndex {
             parent: row.get(12)?,
             scope_id: row.get(13).ok(),
             fqdn: row.get(14).ok(),
-            // P2 fields - not stored in DB yet, need migration to enable
-            generic_params: Vec::new(),
-            params: Vec::new(),
-            return_type: None,
+            generic_params: generic_params_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            params: params_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            return_type: row.get(17).ok().flatten(),
         })
     }
 
@@ -1176,13 +1203,9 @@ impl SqliteIndex {
         let symbols = {
             let conn = self.conn()?;
 
-            let mut sql = String::from(
-                r#"
-                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                       language, visibility, signature, doc_comment, parent
-                FROM symbols
-                WHERE name LIKE ?1
-                "#,
+            let mut sql = format!(
+                "SELECT {} FROM symbols WHERE name LIKE ?1",
+                Self::SYMBOL_COLUMNS
             );
 
             let prefix_pattern = format!("{}%", query.replace(['%', '_'], ""));
@@ -1293,16 +1316,12 @@ impl SqliteIndex {
         let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
 
         // Build base query
-        let mut sql = String::from(
-            r#"
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent, s.stable_id,
-                   bm25(symbols_fts) as score
-            FROM symbols s
-            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
-            WHERE symbols_fts MATCH ?1
-            "#,
+        let mut sql = format!(
+            "SELECT {}, bm25(symbols_fts) as score \
+             FROM symbols s \
+             JOIN symbols_fts ON s.rowid = symbols_fts.rowid \
+             WHERE symbols_fts MATCH ?1",
+            Self::SYMBOL_COLUMNS_ALIASED
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query.clone())];
@@ -1372,7 +1391,7 @@ impl SqliteIndex {
         let results: Vec<SearchResult> = stmt
             .query_map(params_refs.as_slice(), |row| {
                 let symbol = Self::symbol_from_row(row)?;
-                let score: f64 = row.get(14)?;
+                let score: f64 = row.get(16)?; // score is at position 16 after P2 fields
                 Ok(SearchResult {
                     symbol,
                     score: -score,
@@ -1415,16 +1434,12 @@ impl SqliteIndex {
         let conn = self.conn()?;
         let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
 
-        let mut sql = String::from(
-            r#"
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent,
-                   bm25(symbols_fts) as score
-            FROM symbols s
-            JOIN symbols_fts ON s.rowid = symbols_fts.rowid
-            WHERE symbols_fts MATCH ?1
-            "#,
+        let mut sql = format!(
+            "SELECT {}, bm25(symbols_fts) as score \
+             FROM symbols s \
+             JOIN symbols_fts ON s.rowid = symbols_fts.rowid \
+             WHERE symbols_fts MATCH ?1",
+            Self::SYMBOL_COLUMNS_ALIASED
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
@@ -1470,7 +1485,7 @@ impl SqliteIndex {
         let results: Vec<SearchResult> = stmt
             .query_map(params_refs.as_slice(), |row| {
                 let symbol = Self::symbol_from_row(row)?;
-                let score: f64 = row.get(13)?;
+                let score: f64 = row.get(16)?; // score is at position 16 after P2 fields
                 Ok(SearchResult {
                     symbol,
                     score: -score,
@@ -1485,13 +1500,10 @@ impl SqliteIndex {
     /// Get symbol by stable ID
     pub fn get_symbol_by_stable_id(&self, stable_id: &str) -> Result<Option<Symbol>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols WHERE stable_id = ?1
-            "#,
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM symbols WHERE stable_id = ?1",
+            Self::SYMBOL_COLUMNS
+        ))?;
 
         let symbol = stmt
             .query_row(params![stable_id], Self::symbol_from_row)
@@ -1564,8 +1576,9 @@ impl CodeIndex for SqliteIndex {
             r#"
             INSERT OR REPLACE INTO symbols
             (id, name, kind, file_path, start_line, start_column, end_line, end_column,
-             language, visibility, signature, doc_comment, parent)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             language, visibility, signature, doc_comment, parent,
+             generic_params_json, params_json, return_type)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 symbol.id,
@@ -1581,6 +1594,9 @@ impl CodeIndex for SqliteIndex {
                 symbol.signature,
                 symbol.doc_comment,
                 symbol.parent,
+                serde_json::to_string(&symbol.generic_params).ok(),
+                serde_json::to_string(&symbol.params).ok(),
+                symbol.return_type,
             ],
         )?;
         Ok(())
@@ -1595,8 +1611,9 @@ impl CodeIndex for SqliteIndex {
                 r#"
                 INSERT OR REPLACE INTO symbols
                 (id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                 language, visibility, signature, doc_comment, parent)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 language, visibility, signature, doc_comment, parent,
+                 generic_params_json, params_json, return_type)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 "#,
                 params![
                     symbol.id,
@@ -1612,6 +1629,9 @@ impl CodeIndex for SqliteIndex {
                     symbol.signature,
                     symbol.doc_comment,
                     symbol.parent,
+                    serde_json::to_string(&symbol.generic_params).ok(),
+                    serde_json::to_string(&symbol.params).ok(),
+                    symbol.return_type,
                 ],
             )?;
         }
@@ -1702,13 +1722,10 @@ impl CodeIndex for SqliteIndex {
 
     fn get_symbol(&self, id: &str) -> Result<Option<Symbol>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols WHERE id = ?1
-            "#,
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM symbols WHERE id = ?1",
+            Self::SYMBOL_COLUMNS
+        ))?;
 
         let symbol = stmt
             .query_row(params![id], Self::symbol_from_row)
@@ -1727,16 +1744,12 @@ impl CodeIndex for SqliteIndex {
             let conn = self.conn()?;
             let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
 
-            let mut sql = String::from(
-                r#"
-                SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                       s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                       s.doc_comment, s.parent,
-                       bm25(symbols_fts) as score
-                FROM symbols s
-                JOIN symbols_fts ON s.rowid = symbols_fts.rowid
-                WHERE symbols_fts MATCH ?1
-                "#,
+            let mut sql = format!(
+                "SELECT {}, bm25(symbols_fts) as score \
+                 FROM symbols s \
+                 JOIN symbols_fts ON s.rowid = symbols_fts.rowid \
+                 WHERE symbols_fts MATCH ?1",
+                Self::SYMBOL_COLUMNS_ALIASED
             );
 
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
@@ -1777,7 +1790,7 @@ impl CodeIndex for SqliteIndex {
             let results: Vec<(Symbol, f64)> = stmt
                 .query_map(params_refs.as_slice(), |row| {
                     let symbol = Self::symbol_from_row(row)?;
-                    let score: f64 = row.get(13)?;
+                    let score: f64 = row.get(16)?; // score is at position 16 after P2 fields
                     Ok((symbol, -score)) // bm25 returns negative scores
                 })?
                 .filter_map(|r| r.ok())
@@ -1860,17 +1873,13 @@ impl CodeIndex for SqliteIndex {
         let candidates = {
             let conn = self.conn()?;
 
-            let mut sql = String::from(
-                r#"
-                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                       language, visibility, signature, doc_comment, parent
-                FROM symbols
-                WHERE (
-                    LOWER(name) LIKE ? OR
-                    LOWER(name) LIKE ? OR
-                    LOWER(name) LIKE ?
-                )
-                "#,
+            let mut sql = format!(
+                "SELECT {} FROM symbols WHERE ( \
+                    LOWER(name) LIKE ? OR \
+                    LOWER(name) LIKE ? OR \
+                    LOWER(name) LIKE ? \
+                )",
+                Self::SYMBOL_COLUMNS
             );
 
             // Patterns: prefix%, _prefix% (skip first char), %query% (contains)
@@ -1973,15 +1982,12 @@ impl CodeIndex for SqliteIndex {
 
     fn find_definition(&self, name: &str) -> Result<Vec<Symbol>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols
-            WHERE name = ?1 AND kind NOT IN ('import', 'variable')
-            ORDER BY file_path, start_line
-            "#,
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM symbols \
+             WHERE name = ?1 AND kind NOT IN ('import', 'variable') \
+             ORDER BY file_path, start_line",
+            Self::SYMBOL_COLUMNS
+        ))?;
 
         let symbols = stmt
             .query_map(params![name], Self::symbol_from_row)?
@@ -2006,17 +2012,17 @@ impl CodeIndex for SqliteIndex {
     ) -> Result<Vec<Symbol>> {
         let conn = self.conn()?;
 
+        let base_sql = format!(
+            "SELECT {} FROM symbols WHERE name = ?1 AND kind NOT IN ('import', 'variable')",
+            Self::SYMBOL_COLUMNS
+        );
+
         let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (parent_type, language) {
             (Some(parent), Some(lang)) => (
-                r#"
-                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                       language, visibility, signature, doc_comment, parent
-                FROM symbols
-                WHERE name = ?1 AND parent = ?2 AND language = ?3
-                      AND kind NOT IN ('import', 'variable')
-                ORDER BY file_path, start_line
-                "#
-                .to_string(),
+                format!(
+                    "{} AND parent = ?2 AND language = ?3 ORDER BY file_path, start_line",
+                    base_sql
+                ),
                 vec![
                     Box::new(name.to_string()),
                     Box::new(parent.to_string()),
@@ -2024,42 +2030,27 @@ impl CodeIndex for SqliteIndex {
                 ],
             ),
             (Some(parent), None) => (
-                r#"
-                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                       language, visibility, signature, doc_comment, parent
-                FROM symbols
-                WHERE name = ?1 AND parent = ?2 AND kind NOT IN ('import', 'variable')
-                ORDER BY file_path, start_line
-                "#
-                .to_string(),
+                format!(
+                    "{} AND parent = ?2 ORDER BY file_path, start_line",
+                    base_sql
+                ),
                 vec![
                     Box::new(name.to_string()),
                     Box::new(parent.to_string()),
                 ],
             ),
             (None, Some(lang)) => (
-                r#"
-                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                       language, visibility, signature, doc_comment, parent
-                FROM symbols
-                WHERE name = ?1 AND language = ?2 AND kind NOT IN ('import', 'variable')
-                ORDER BY file_path, start_line
-                "#
-                .to_string(),
+                format!(
+                    "{} AND language = ?2 ORDER BY file_path, start_line",
+                    base_sql
+                ),
                 vec![
                     Box::new(name.to_string()),
                     Box::new(lang.to_string()),
                 ],
             ),
             (None, None) => (
-                r#"
-                SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                       language, visibility, signature, doc_comment, parent
-                FROM symbols
-                WHERE name = ?1 AND kind NOT IN ('import', 'variable')
-                ORDER BY file_path, start_line
-                "#
-                .to_string(),
+                format!("{} ORDER BY file_path, start_line", base_sql),
                 vec![Box::new(name.to_string())],
             ),
         };
@@ -2077,13 +2068,9 @@ impl CodeIndex for SqliteIndex {
         let conn = self.conn()?;
         let limit = options.limit.unwrap_or(1000);
 
-        let mut sql = String::from(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols
-            WHERE kind IN ('function', 'method')
-            "#,
+        let mut sql = format!(
+            "SELECT {} FROM symbols WHERE kind IN ('function', 'method')",
+            Self::SYMBOL_COLUMNS
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
@@ -2124,13 +2111,10 @@ impl CodeIndex for SqliteIndex {
         let conn = self.conn()?;
         let limit = options.limit.unwrap_or(1000);
 
-        let mut sql = String::from(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols
-            WHERE kind IN ('struct', 'class', 'interface', 'trait', 'enum', 'type_alias')
-            "#,
+        let mut sql = format!(
+            "SELECT {} FROM symbols \
+             WHERE kind IN ('struct', 'class', 'interface', 'trait', 'enum', 'type_alias')",
+            Self::SYMBOL_COLUMNS
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![];
@@ -2169,15 +2153,12 @@ impl CodeIndex for SqliteIndex {
 
     fn get_file_symbols(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols
-            WHERE file_path = ?1
-            ORDER BY start_line, start_column
-            "#,
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM symbols \
+             WHERE file_path = ?1 \
+             ORDER BY start_line, start_column",
+            Self::SYMBOL_COLUMNS
+        ))?;
 
         let symbols = stmt
             .query_map(params![file_path], Self::symbol_from_row)?
@@ -2364,36 +2345,32 @@ impl CodeIndex for SqliteIndex {
         let conn = self.conn()?;
 
         // Find symbols that extend/implement the given trait/interface
-        let sql = r#"
-            SELECT DISTINCT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent
-            FROM symbols s
-            JOIN symbol_references r ON s.name = (
-                SELECT DISTINCT
-                    CASE
-                        WHEN instr(referenced_in_file, '/') > 0
-                        THEN substr(referenced_in_file, instr(referenced_in_file, '/') + 1)
-                        ELSE referenced_in_file
-                    END
-                FROM symbol_references
-                WHERE symbol_name = ?1 AND reference_kind = 'extend'
-            )
-            WHERE s.kind IN ('struct', 'class', 'enum')
+        let sql = format!(
+            "SELECT DISTINCT {} \
+             FROM symbols s \
+             JOIN symbol_references r ON s.name = ( \
+                SELECT DISTINCT \
+                    CASE \
+                        WHEN instr(referenced_in_file, '/') > 0 \
+                        THEN substr(referenced_in_file, instr(referenced_in_file, '/') + 1) \
+                        ELSE referenced_in_file \
+                    END \
+                FROM symbol_references \
+                WHERE symbol_name = ?1 AND reference_kind = 'extend' \
+             ) \
+             WHERE s.kind IN ('struct', 'class', 'enum') \
+             UNION \
+             SELECT {} \
+             FROM symbols s \
+             WHERE s.id IN ( \
+                SELECT DISTINCT symbol_id FROM symbol_references \
+                WHERE symbol_name = ?1 AND reference_kind = 'extend' AND symbol_id IS NOT NULL \
+             )",
+            Self::SYMBOL_COLUMNS_ALIASED,
+            Self::SYMBOL_COLUMNS_ALIASED
+        );
 
-            UNION
-
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent
-            FROM symbols s
-            WHERE s.id IN (
-                SELECT DISTINCT symbol_id FROM symbol_references
-                WHERE symbol_name = ?1 AND reference_kind = 'extend' AND symbol_id IS NOT NULL
-            )
-        "#;
-
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let symbols = stmt
             .query_map(params![trait_name], Self::symbol_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2405,20 +2382,19 @@ impl CodeIndex for SqliteIndex {
         let conn = self.conn()?;
 
         // Find all methods and fields that have this type as parent
-        let sql = r#"
-            SELECT id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                   language, visibility, signature, doc_comment, parent
-            FROM symbols
-            WHERE parent = ?1 OR (
-                file_path IN (SELECT file_path FROM symbols WHERE name = ?1)
-                AND kind IN ('method', 'field')
-                AND start_line > (SELECT start_line FROM symbols WHERE name = ?1 LIMIT 1)
-                AND start_line < (SELECT end_line FROM symbols WHERE name = ?1 LIMIT 1)
-            )
-            ORDER BY start_line
-        "#;
+        let sql = format!(
+            "SELECT {} FROM symbols \
+             WHERE parent = ?1 OR ( \
+                file_path IN (SELECT file_path FROM symbols WHERE name = ?1) \
+                AND kind IN ('method', 'field') \
+                AND start_line > (SELECT start_line FROM symbols WHERE name = ?1 LIMIT 1) \
+                AND start_line < (SELECT end_line FROM symbols WHERE name = ?1 LIMIT 1) \
+             ) \
+             ORDER BY start_line",
+            Self::SYMBOL_COLUMNS
+        );
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let symbols = stmt
             .query_map(params![type_name], Self::symbol_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2680,40 +2656,34 @@ impl CodeIndex for SqliteIndex {
 
         // Find unused functions (private functions without incoming call references)
         // Exclude: main, test_*, __init__, new, and other common entry points
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent
-            FROM symbols s
-            LEFT JOIN symbol_references sr ON s.name = sr.symbol_name AND sr.reference_kind = 'call'
-            WHERE s.kind IN ('function', 'method')
-              AND (s.visibility IS NULL OR s.visibility IN ('private', 'internal'))
-              AND sr.symbol_name IS NULL
-              AND s.name NOT LIKE 'test_%'
-              AND s.name NOT IN ('main', '__init__', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into')
-            ORDER BY s.file_path, s.start_line
-            "#,
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} \
+             FROM symbols s \
+             LEFT JOIN symbol_references sr ON s.name = sr.symbol_name AND sr.reference_kind = 'call' \
+             WHERE s.kind IN ('function', 'method') \
+               AND (s.visibility IS NULL OR s.visibility IN ('private', 'internal')) \
+               AND sr.symbol_name IS NULL \
+               AND s.name NOT LIKE 'test_%' \
+               AND s.name NOT IN ('main', '__init__', 'new', 'default', 'drop', 'clone', 'fmt', 'from', 'into') \
+             ORDER BY s.file_path, s.start_line",
+            Self::SYMBOL_COLUMNS_ALIASED
+        ))?;
 
         let unused_functions = stmt
             .query_map([], Self::symbol_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         // Find unused types (private types without type_use references)
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT s.id, s.name, s.kind, s.file_path, s.start_line, s.start_column,
-                   s.end_line, s.end_column, s.language, s.visibility, s.signature,
-                   s.doc_comment, s.parent
-            FROM symbols s
-            LEFT JOIN symbol_references sr ON s.name = sr.symbol_name AND sr.reference_kind = 'type_use'
-            WHERE s.kind IN ('struct', 'class', 'interface', 'trait', 'enum', 'type_alias')
-              AND (s.visibility IS NULL OR s.visibility IN ('private', 'internal'))
-              AND sr.symbol_name IS NULL
-            ORDER BY s.file_path, s.start_line
-            "#,
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} \
+             FROM symbols s \
+             LEFT JOIN symbol_references sr ON s.name = sr.symbol_name AND sr.reference_kind = 'type_use' \
+             WHERE s.kind IN ('struct', 'class', 'interface', 'trait', 'enum', 'type_alias') \
+               AND (s.visibility IS NULL OR s.visibility IN ('private', 'internal')) \
+               AND sr.symbol_name IS NULL \
+             ORDER BY s.file_path, s.start_line",
+            Self::SYMBOL_COLUMNS_ALIASED
+        ))?;
 
         let unused_types = stmt
             .query_map([], Self::symbol_from_row)?

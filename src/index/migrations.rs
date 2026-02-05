@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 
 /// Current schema version. Increment when adding new migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Migration function type.
 type MigrationFn = fn(&Connection) -> Result<()>;
@@ -21,6 +21,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migration_v4_stable_id,
     migration_v5_content_hash,
     migration_v6_file_tags_intent,
+    migration_v7_p2_fields,
 ];
 
 /// Runs all pending migrations on the database.
@@ -79,6 +80,11 @@ fn get_schema_version(conn: &Connection) -> Result<u32> {
 /// Detects schema version by checking which columns exist.
 /// Used for backward compatibility with databases created before versioning.
 fn detect_version_from_schema(conn: &Connection) -> Result<u32> {
+    // Check for generic_params_json column (v7)
+    if column_exists(conn, "symbols", "generic_params_json")? {
+        return Ok(7);
+    }
+
     // Check for file_tags table (v6)
     if table_exists(conn, "file_tags")? {
         return Ok(6);
@@ -594,6 +600,29 @@ fn migration_v6_file_tags_intent(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// V7: Add P2 fields for generic params, function params, and return types.
+fn migration_v7_p2_fields(conn: &Connection) -> Result<()> {
+    // Add generic_params_json column for storing generic type parameters as JSON
+    if !column_exists(conn, "symbols", "generic_params_json")? {
+        conn.execute(
+            "ALTER TABLE symbols ADD COLUMN generic_params_json TEXT",
+            [],
+        )?;
+    }
+
+    // Add params_json column for storing function parameters as JSON
+    if !column_exists(conn, "symbols", "params_json")? {
+        conn.execute("ALTER TABLE symbols ADD COLUMN params_json TEXT", [])?;
+    }
+
+    // Add return_type column for storing function return types
+    if !column_exists(conn, "symbols", "return_type")? {
+        conn.execute("ALTER TABLE symbols ADD COLUMN return_type TEXT", [])?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,5 +732,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(found, 1, "FTS search should find the inserted row");
+    }
+
+    #[test]
+    fn test_migration_v7_p2_fields() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Verify P2 columns exist in symbols table
+        assert!(
+            column_exists(&conn, "symbols", "generic_params_json").unwrap(),
+            "generic_params_json column should exist"
+        );
+        assert!(
+            column_exists(&conn, "symbols", "params_json").unwrap(),
+            "params_json column should exist"
+        );
+        assert!(
+            column_exists(&conn, "symbols", "return_type").unwrap(),
+            "return_type column should exist"
+        );
+
+        // Test inserting symbol with P2 fields
+        conn.execute(
+            r#"INSERT INTO symbols
+            (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+             language, generic_params_json, params_json, return_type)
+            VALUES ('test-id', 'Result', 'enum', 'test.rs', 1, 0, 10, 1, 'rust',
+                    '[{"name":"T","bounds":[],"default":null},{"name":"E","bounds":["Error"],"default":null}]',
+                    '[]',
+                    'Self')"#,
+            [],
+        )
+        .unwrap();
+
+        // Verify data was inserted correctly
+        let generic_params: String = conn
+            .query_row(
+                "SELECT generic_params_json FROM symbols WHERE id = 'test-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(generic_params.contains("\"name\":\"T\""));
+        assert!(generic_params.contains("\"name\":\"E\""));
     }
 }

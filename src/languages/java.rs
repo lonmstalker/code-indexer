@@ -18,12 +18,14 @@ impl LanguageGrammar for JavaGrammar {
     fn functions_query(&self) -> &str {
         r#"
         (method_declaration
+            type_parameters: (type_parameters)? @type_params
             name: (identifier) @name
             parameters: (formal_parameters) @params
             type: (_)? @return_type
         ) @method
 
         (constructor_declaration
+            type_parameters: (type_parameters)? @type_params
             name: (identifier) @name
             parameters: (formal_parameters) @params
         ) @constructor
@@ -34,10 +36,12 @@ impl LanguageGrammar for JavaGrammar {
         r#"
         (class_declaration
             name: (identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @class
 
         (interface_declaration
             name: (identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @interface
 
         (enum_declaration
@@ -46,6 +50,7 @@ impl LanguageGrammar for JavaGrammar {
 
         (record_declaration
             name: (identifier) @name
+            type_parameters: (type_parameters)? @type_params
         ) @record
 
         (annotation_type_declaration
