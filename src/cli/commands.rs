@@ -522,20 +522,43 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
                 for event in events {
                     match event {
                         FileEvent::Modified(file_path) | FileEvent::Created(file_path) => {
+                            // Handle sidecar file changes
+                            if file_path.file_name().map_or(false, |n| n == SIDECAR_FILENAME) {
+                                if let Err(e) = handle_sidecar_change(&file_path, path, &index, &walker) {
+                                    eprintln!("Error processing sidecar change: {}", e);
+                                }
+                                continue;
+                            }
+
+                            // Handle source file changes
                             if walker.is_supported(&file_path) {
                                 index.remove_file(&file_path.to_string_lossy())?;
                                 if let Ok(parsed) = parser.parse_file(&file_path) {
                                     if let Ok(result) = extractor.extract_all(&parsed, &file_path) {
                                         let count = result.symbols.len();
                                         index.add_extraction_results_batch(vec![result])?;
+
+                                        // Re-apply sidecar metadata for this file
+                                        if let Err(e) = update_file_sidecar_meta(&file_path, path, &index) {
+                                            eprintln!("Warning: Could not update sidecar metadata: {}", e);
+                                        }
+
                                         println!("Updated {}: {} symbols", file_path.display(), count);
                                     }
                                 }
                             }
                         }
                         FileEvent::Deleted(file_path) => {
-                            index.remove_file(&file_path.to_string_lossy())?;
-                            println!("Removed {}", file_path.display());
+                            if file_path.file_name().map_or(false, |n| n == SIDECAR_FILENAME) {
+                                // Sidecar deleted - remove metadata for files in that directory
+                                if let Some(dir) = file_path.parent() {
+                                    println!("Sidecar deleted in {}", dir.display());
+                                    // Note: we don't remove file_meta as it may have been inferred
+                                }
+                            } else {
+                                index.remove_file(&file_path.to_string_lossy())?;
+                                println!("Removed {}", file_path.display());
+                            }
                         }
                     }
                 }
@@ -1591,6 +1614,131 @@ fn process_sidecar_files(
     }
 
     Ok(files_with_meta)
+}
+
+/// Handles changes to a .code-indexer.yml sidecar file during watch mode.
+/// Re-processes all files in the directory with the new sidecar metadata.
+fn handle_sidecar_change(
+    sidecar_path: &Path,
+    root: &Path,
+    index: &SqliteIndex,
+    walker: &FileWalker,
+) -> Result<()> {
+    let dir = match sidecar_path.parent() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    println!("Sidecar changed: {}", sidecar_path.display());
+
+    // Read and parse the sidecar
+    let content = match fs::read_to_string(sidecar_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: Could not read {}: {}", sidecar_path.display(), e);
+            return Ok(());
+        }
+    };
+
+    let sidecar_data = match parse_sidecar(&content) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Warning: Could not parse {}: {}", sidecar_path.display(), e);
+            return Ok(());
+        }
+    };
+
+    // Get tag dictionary for resolution
+    let tag_dict = index.get_tag_dictionary().unwrap_or_default();
+    let dir_str = dir.to_string_lossy().to_string();
+
+    // Find all supported files in this directory
+    let files: Vec<_> = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && walker.is_supported(p))
+            .collect(),
+        Err(e) => {
+            eprintln!("Warning: Could not read directory {}: {}", dir.display(), e);
+            return Ok(());
+        }
+    };
+
+    let mut updated_count = 0;
+
+    for file in files {
+        let file_path_str = file.to_string_lossy().to_string();
+        let relative_path = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .to_string();
+
+        // Update file metadata
+        if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
+            if index.upsert_file_meta(&meta).is_ok() {
+                updated_count += 1;
+            }
+        }
+
+        // Update file tags
+        let tag_strings = extract_file_tags(&relative_path, &sidecar_data);
+        if !tag_strings.is_empty() {
+            let file_tags = resolve_tags(&file_path_str, &tag_strings, &tag_dict);
+            if !file_tags.is_empty() {
+                let _ = index.add_file_tags(&file_path_str, &file_tags);
+            }
+        }
+    }
+
+    println!("Updated metadata for {} files", updated_count);
+    Ok(())
+}
+
+/// Updates sidecar metadata for a single file during watch mode.
+fn update_file_sidecar_meta(
+    file_path: &Path,
+    root: &Path,
+    index: &SqliteIndex,
+) -> Result<()> {
+    let dir = match file_path.parent() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let sidecar_path = dir.join(SIDECAR_FILENAME);
+    if !sidecar_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&sidecar_path)?;
+    let sidecar_data = parse_sidecar(&content)?;
+
+    let tag_dict = index.get_tag_dictionary().unwrap_or_default();
+    let dir_str = dir.to_string_lossy().to_string();
+    let file_path_str = file_path.to_string_lossy().to_string();
+    let relative_path = file_path
+        .strip_prefix(root)
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .to_string();
+
+    // Update file metadata
+    if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
+        index.upsert_file_meta(&meta)?;
+    }
+
+    // Update file tags
+    let tag_strings = extract_file_tags(&relative_path, &sidecar_data);
+    if !tag_strings.is_empty() {
+        let file_tags = resolve_tags(&file_path_str, &tag_strings, &tag_dict);
+        if !file_tags.is_empty() {
+            index.add_file_tags(&file_path_str, &file_tags)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Updates exported_hash for files based on their public symbols.
