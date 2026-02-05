@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,9 +10,13 @@ use code_indexer::dependencies::{DependencyRegistry, ProjectInfo};
 use code_indexer::git::GitAnalyzer;
 use crate::error::Result;
 use crate::index::sqlite::SqliteIndex;
-use crate::index::{CodeIndex, SearchOptions, OutputFormat, CompactSymbol};
+use crate::index::{CodeIndex, SearchOptions, OutputFormat, CompactSymbol, FileMeta, MetaSource};
 use crate::indexer::watcher::FileEvent;
-use crate::indexer::{FileWalker, FileWatcher, Parser as CodeParser, SymbolExtractor};
+use crate::indexer::{
+    FileWalker, FileWatcher, Parser as CodeParser, SymbolExtractor,
+    parse_sidecar, extract_file_meta, extract_file_tags, resolve_tags,
+    compute_exported_hash, SIDECAR_FILENAME,
+};
 use crate::languages::LanguageRegistry;
 
 #[derive(Parser)]
@@ -366,14 +371,14 @@ pub enum DepsCommands {
     },
 }
 
-pub fn index_directory(path: &PathBuf, db_path: &PathBuf, watch: bool) -> Result<()> {
+pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     use code_indexer::indexer::ExtractionResult;
 
     // If db_path is the default value, place the database inside the indexed directory
     let effective_db = if db_path == Path::new(".code-index.db") {
         path.join(".code-index.db")
     } else {
-        db_path.clone()
+        db_path.to_path_buf()
     };
 
     let registry = LanguageRegistry::new();
@@ -382,6 +387,9 @@ pub fn index_directory(path: &PathBuf, db_path: &PathBuf, watch: bool) -> Result
 
     let files = walker.walk(path)?;
     println!("Found {} files to index", files.len());
+
+    // === Phase 1: Process sidecar files ===
+    let sidecar_meta = process_sidecar_files(&files, path, &index)?;
 
     // Parallel parsing and extraction using rayon
     let results: Vec<ExtractionResult> = files
@@ -408,6 +416,10 @@ pub fn index_directory(path: &PathBuf, db_path: &PathBuf, watch: bool) -> Result
         })
         .collect();
 
+    // === Phase 2: Compute exported_hash for staleness detection ===
+    // Do this before batch insert to avoid moving results
+    update_exported_hashes(&results, &sidecar_meta, &index)?;
+
     // Batch insert all results
     let total_symbols = index.add_extraction_results_batch(results)?;
 
@@ -417,13 +429,15 @@ pub fn index_directory(path: &PathBuf, db_path: &PathBuf, watch: bool) -> Result
         files.len()
     );
 
+    if !sidecar_meta.is_empty() {
+        println!("Processed {} files with sidecar metadata", sidecar_meta.len());
+    }
+
     if watch {
         println!("Watching for changes...");
         let watcher = FileWatcher::new(path)?;
-        let registry = LanguageRegistry::new();
-        let walker = FileWalker::new(registry);
-        let registry = LanguageRegistry::new();
-        let parser = CodeParser::new(registry);
+        let walker = FileWalker::new(LanguageRegistry::new());
+        let parser = CodeParser::new(LanguageRegistry::new());
         let extractor = SymbolExtractor::new();
 
         loop {
@@ -455,7 +469,7 @@ pub fn index_directory(path: &PathBuf, db_path: &PathBuf, watch: bool) -> Result
     Ok(())
 }
 
-pub async fn run_mcp_server(db_path: &PathBuf) -> Result<()> {
+pub async fn run_mcp_server(db_path: &Path) -> Result<()> {
     use crate::mcp::McpServer;
     use rmcp::ServiceExt;
 
@@ -471,7 +485,7 @@ pub async fn run_mcp_server(db_path: &PathBuf) -> Result<()> {
 }
 
 pub fn search_symbols(
-    db_path: &PathBuf,
+    db_path: &Path,
     query: &str,
     limit: usize,
     format: &str,
@@ -533,7 +547,7 @@ pub fn search_symbols(
     Ok(())
 }
 
-pub fn find_definition(db_path: &PathBuf, name: &str) -> Result<()> {
+pub fn find_definition(db_path: &Path, name: &str) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
     let symbols = index.find_definition(name)?;
 
@@ -558,7 +572,7 @@ pub fn find_definition(db_path: &PathBuf, name: &str) -> Result<()> {
 }
 
 pub fn list_functions(
-    db_path: &PathBuf,
+    db_path: &Path,
     limit: usize,
     language: Option<String>,
     file: Option<String>,
@@ -614,7 +628,7 @@ pub fn list_functions(
 }
 
 pub fn list_types(
-    db_path: &PathBuf,
+    db_path: &Path,
     limit: usize,
     language: Option<String>,
     file: Option<String>,
@@ -669,7 +683,7 @@ pub fn list_types(
     Ok(())
 }
 
-pub fn show_stats(db_path: &PathBuf) -> Result<()> {
+pub fn show_stats(db_path: &Path) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
     let stats = index.get_stats()?;
 
@@ -701,7 +715,7 @@ pub fn show_stats(db_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn clear_index(db_path: &PathBuf) -> Result<()> {
+pub fn clear_index(db_path: &Path) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
     index.clear()?;
     println!("Index cleared");
@@ -712,7 +726,7 @@ pub fn clear_index(db_path: &PathBuf) -> Result<()> {
 
 /// Unified symbols command (replaces search, list_functions, list_types)
 pub fn symbols(
-    db_path: &PathBuf,
+    db_path: &Path,
     query: Option<String>,
     kind: &str,
     limit: usize,
@@ -799,7 +813,7 @@ pub fn symbols(
 
 /// Find references command
 pub fn find_references(
-    db_path: &PathBuf,
+    db_path: &Path,
     name: &str,
     include_callers: bool,
     depth: u32,
@@ -854,7 +868,7 @@ pub fn find_references(
 
 /// Call graph analysis command
 pub fn analyze_call_graph(
-    db_path: &PathBuf,
+    db_path: &Path,
     function: &str,
     direction: &str,
     depth: u32,
@@ -910,8 +924,8 @@ pub fn analyze_call_graph(
 
 /// Get file outline command
 pub fn get_outline(
-    db_path: &PathBuf,
-    file: &PathBuf,
+    db_path: &Path,
+    file: &Path,
     start_line: Option<u32>,
     end_line: Option<u32>,
     include_scopes: bool,
@@ -979,7 +993,7 @@ pub fn get_outline(
 }
 
 /// Get file imports command
-pub fn get_imports(db_path: &PathBuf, file: &PathBuf, resolve: bool) -> Result<()> {
+pub fn get_imports(db_path: &Path, file: &Path, resolve: bool) -> Result<()> {
     let index = SqliteIndex::new(db_path)?;
     let file_path = file.to_string_lossy();
 
@@ -1086,8 +1100,8 @@ fn print_symbols(symbols: &[crate::index::Symbol], format: OutputFormat) {
 
 /// Lists dependencies for a project.
 pub fn list_dependencies(
-    path: &PathBuf,
-    db_path: &PathBuf,
+    path: &Path,
+    db_path: &Path,
     include_dev: bool,
     format: &str,
 ) -> Result<()> {
@@ -1150,8 +1164,8 @@ pub fn list_dependencies(
 
 /// Indexes symbols from dependencies.
 pub fn index_dependencies(
-    path: &PathBuf,
-    db_path: &PathBuf,
+    path: &Path,
+    db_path: &Path,
     dep_name: Option<String>,
     include_dev: bool,
 ) -> Result<()> {
@@ -1193,7 +1207,10 @@ pub fn index_dependencies(
     let walker = FileWalker::new(lang_registry);
 
     for dep in deps_to_index {
-        let source_path = dep.source_path.as_ref().unwrap();
+        // Safe: deps_to_index is filtered to only include deps with source_path
+        let Some(source_path) = dep.source_path.as_ref() else {
+            continue;
+        };
         let source_dir = PathBuf::from(source_path);
 
         if !source_dir.exists() {
@@ -1242,7 +1259,7 @@ pub fn index_dependencies(
 
 /// Finds a symbol in indexed dependencies.
 pub fn find_in_dependencies(
-    db_path: &PathBuf,
+    db_path: &Path,
     name: &str,
     dep: Option<String>,
     limit: usize,
@@ -1281,7 +1298,7 @@ pub fn find_in_dependencies(
 
 /// Gets the source code for a symbol from a dependency.
 pub fn get_dependency_source(
-    db_path: &PathBuf,
+    db_path: &Path,
     name: &str,
     dep: Option<String>,
     context_lines: usize,
@@ -1335,7 +1352,7 @@ pub fn get_dependency_source(
 }
 
 /// Shows information about a dependency.
-pub fn show_dependency_info(path: &PathBuf, db_path: &PathBuf, name: &str) -> Result<()> {
+pub fn show_dependency_info(path: &Path, db_path: &Path, name: &str) -> Result<()> {
     let registry = DependencyRegistry::with_defaults();
     let project = find_and_parse_project(path, &registry)?;
 
@@ -1404,9 +1421,141 @@ fn find_and_parse_project(path: &Path, registry: &DependencyRegistry) -> Result<
     ))
 }
 
+// === Sidecar Processing Functions ===
+
+/// Processes sidecar files (.code-indexer.yml) and stores metadata in the index.
+/// Returns a map of file_path -> file_path for files that had sidecar metadata.
+fn process_sidecar_files(
+    files: &[PathBuf],
+    root: &Path,
+    index: &SqliteIndex,
+) -> Result<HashMap<String, String>> {
+    use std::collections::HashSet;
+
+    // Collect unique directories
+    let mut directories: HashSet<PathBuf> = HashSet::new();
+    for file in files {
+        if let Some(parent) = file.parent() {
+            directories.insert(parent.to_path_buf());
+        }
+    }
+
+    // Get tag dictionary for resolution
+    let tag_dict = index.get_tag_dictionary().unwrap_or_default();
+
+    let mut files_with_meta: HashMap<String, String> = HashMap::new();
+    let mut sidecar_count = 0;
+
+    // Process each directory's sidecar
+    for dir in directories {
+        let sidecar_path = dir.join(SIDECAR_FILENAME);
+        if !sidecar_path.exists() {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&sidecar_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: Could not read {}: {}", sidecar_path.display(), e);
+                continue;
+            }
+        };
+
+        let sidecar_data = match parse_sidecar(&content) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Warning: Could not parse {}: {}", sidecar_path.display(), e);
+                continue;
+            }
+        };
+
+        sidecar_count += 1;
+        let dir_str = dir.to_string_lossy();
+
+        // Process files in this directory that are listed in the sidecar
+        for file in files {
+            if file.parent() != Some(dir.as_path()) {
+                continue;
+            }
+
+            let file_path_str = file.to_string_lossy().to_string();
+
+            // Make relative path for sidecar lookup
+            let relative_path = file
+                .strip_prefix(root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .to_string();
+
+            // Extract file metadata from sidecar
+            if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
+                if let Err(e) = index.upsert_file_meta(&meta) {
+                    eprintln!("Warning: Could not save metadata for {}: {}", file_path_str, e);
+                } else {
+                    files_with_meta.insert(file_path_str.clone(), relative_path.clone());
+                }
+            }
+
+            // Extract and save file tags
+            let tag_strings = extract_file_tags(&relative_path, &sidecar_data);
+            if !tag_strings.is_empty() {
+                let file_tags = resolve_tags(&file_path_str, &tag_strings, &tag_dict);
+                if !file_tags.is_empty() {
+                    if let Err(e) = index.add_file_tags(&file_path_str, &file_tags) {
+                        eprintln!("Warning: Could not save tags for {}: {}", file_path_str, e);
+                    }
+                }
+            }
+        }
+    }
+
+    if sidecar_count > 0 {
+        println!("Found {} sidecar files", sidecar_count);
+    }
+
+    Ok(files_with_meta)
+}
+
+/// Updates exported_hash for files based on their public symbols.
+fn update_exported_hashes(
+    results: &[code_indexer::indexer::ExtractionResult],
+    files_with_meta: &HashMap<String, String>,
+    index: &SqliteIndex,
+) -> Result<()> {
+    for result in results {
+        // Get file_path from first symbol's location
+        let file_path = match result.symbols.first() {
+            Some(symbol) => symbol.location.file_path.clone(),
+            None => continue, // Skip files with no symbols
+        };
+
+        // Compute exported hash from public symbols
+        let exported_hash = compute_exported_hash(&result.symbols);
+
+        // Get existing file_meta or create new one
+        let mut meta = index
+            .get_file_meta(&file_path)?
+            .unwrap_or_else(|| FileMeta::new(&file_path));
+
+        // Update exported_hash
+        meta.exported_hash = Some(exported_hash);
+
+        // If this file wasn't in a sidecar, mark as inferred
+        if !files_with_meta.contains_key(&file_path) {
+            meta.source = MetaSource::Inferred;
+            meta.confidence = 0.5;
+        }
+
+        // Save updated metadata
+        index.upsert_file_meta(&meta)?;
+    }
+
+    Ok(())
+}
+
 /// Gets symbols from changed files (git diff)
 pub fn get_changed_symbols(
-    db_path: &PathBuf,
+    db_path: &Path,
     base: &str,
     staged: bool,
     unstaged: bool,
