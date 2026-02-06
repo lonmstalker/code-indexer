@@ -62,14 +62,30 @@ CLI-инструмент и MCP-сервер для индексации и се
 ### Установка
 
 ```bash
-# Клонирование и сборка
-git clone https://github.com/your-repo/code-indexer
+# Быстрая установка из GitHub Release (latest)
+curl -fsSL https://raw.githubusercontent.com/lonmstalker/code-indexer/master/scripts/install.sh | sh
+
+# Установка конкретной версии
+curl -fsSL https://raw.githubusercontent.com/lonmstalker/code-indexer/master/scripts/install.sh | CODE_INDEXER_VERSION=v0.1.0 sh
+
+# Установка в кастомную директорию
+curl -fsSL https://raw.githubusercontent.com/lonmstalker/code-indexer/master/scripts/install.sh | INSTALL_DIR="$HOME/bin" sh
+
+# Сборка из исходников
+git clone https://github.com/lonmstalker/code-indexer
 cd code-indexer
 cargo build --release
 
-# Или установка через cargo
+# Локальная установка через cargo
 cargo install --path .
 ```
+
+Release assets:
+- `code-indexer-aarch64-apple-darwin.tar.gz`
+- `code-indexer-x86_64-apple-darwin.tar.gz`
+- `checksums-v0.1.0.txt`
+
+Примечание: в `v0.1.0` опубликованы только macOS артефакты.
 
 ### Индексация проекта
 
