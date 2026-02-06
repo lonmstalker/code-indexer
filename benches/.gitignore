@@ -1,1 +1,5 @@
 repos/
+speed/__pycache__/
+results/speed/*.json
+results/speed/*.md
+!results/speed/README.md

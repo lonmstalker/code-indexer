@@ -3,7 +3,10 @@ use std::path::Path;
 use tree_sitter::StreamingIterator;
 
 use crate::error::{IndexerError, Result};
-use crate::index::{FileImport, GenericParam, ImportType, Location, ReferenceKind, Symbol, SymbolKind, SymbolReference, Visibility};
+use crate::index::{
+    FileImport, GenericParam, ImportType, Location, ReferenceKind, Symbol, SymbolKind,
+    SymbolReference, Visibility,
+};
 use crate::indexer::parser::ParsedFile;
 
 /// Result of extraction containing symbols, references, and imports
@@ -50,8 +53,14 @@ impl SymbolExtractor {
             return Ok(());
         }
 
-        let query = tree_sitter::Query::new(&parsed.grammar.language(), query_str)
-            .map_err(|e| IndexerError::Parse(format!("Invalid functions query: {}", e)))?;
+        let owned_query;
+        let query = if let Some(cached) = parsed.grammar.cached_functions_query() {
+            cached
+        } else {
+            owned_query = tree_sitter::Query::new(&parsed.grammar.language(), query_str)
+                .map_err(|e| IndexerError::Parse(format!("Invalid functions query: {}", e)))?;
+            &owned_query
+        };
 
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(&query, parsed.root_node(), parsed.source_bytes());
@@ -193,8 +202,14 @@ impl SymbolExtractor {
             return Ok(());
         }
 
-        let query = tree_sitter::Query::new(&parsed.grammar.language(), query_str)
-            .map_err(|e| IndexerError::Parse(format!("Invalid types query: {}", e)))?;
+        let owned_query;
+        let query = if let Some(cached) = parsed.grammar.cached_types_query() {
+            cached
+        } else {
+            owned_query = tree_sitter::Query::new(&parsed.grammar.language(), query_str)
+                .map_err(|e| IndexerError::Parse(format!("Invalid types query: {}", e)))?;
+            &owned_query
+        };
 
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(&query, parsed.root_node(), parsed.source_bytes());
@@ -252,6 +267,27 @@ impl SymbolExtractor {
                     node.end_position().row as u32 + 1,
                     node.end_position().column as u32,
                 );
+
+                let same_span = |symbol: &Symbol| {
+                    symbol.name == name
+                        && symbol.location.file_path == location.file_path
+                        && symbol.location.start_line == location.start_line
+                        && symbol.location.start_column == location.start_column
+                        && symbol.location.end_line == location.end_line
+                        && symbol.location.end_column == location.end_column
+                };
+
+                if kind == SymbolKind::TypeAlias
+                    && symbols
+                        .iter()
+                        .any(|s| same_span(s) && s.kind != SymbolKind::TypeAlias)
+                {
+                    continue;
+                }
+
+                if kind != SymbolKind::TypeAlias {
+                    symbols.retain(|s| !(same_span(s) && s.kind == SymbolKind::TypeAlias));
+                }
 
                 let mut symbol = Symbol::new(name, kind, location, &parsed.language);
 
@@ -314,11 +350,7 @@ impl SymbolExtractor {
         None
     }
 
-    fn extract_doc_comment(
-        &self,
-        parsed: &ParsedFile,
-        node: &tree_sitter::Node,
-    ) -> Option<String> {
+    fn extract_doc_comment(&self, parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<String> {
         if let Some(prev) = node.prev_sibling() {
             let kind = prev.kind();
             if kind.contains("comment") || kind == "line_comment" || kind == "block_comment" {
@@ -343,12 +375,20 @@ impl SymbolExtractor {
             return Ok(());
         }
 
-        let query = match tree_sitter::Query::new(&parsed.grammar.language(), query_str) {
-            Ok(q) => q,
-            Err(e) => {
-                // Log error but don't fail - references are optional
-                tracing::warn!("Invalid references query for {}: {}", parsed.language, e);
-                return Ok(());
+        let owned_query;
+        let query = if let Some(cached) = parsed.grammar.cached_references_query() {
+            cached
+        } else {
+            match tree_sitter::Query::new(&parsed.grammar.language(), query_str) {
+                Ok(q) => {
+                    owned_query = q;
+                    &owned_query
+                }
+                Err(e) => {
+                    // Log error but don't fail - references are optional
+                    tracing::warn!("Invalid references query for {}: {}", parsed.language, e);
+                    return Ok(());
+                }
             }
         };
 
@@ -370,9 +410,8 @@ impl SymbolExtractor {
                     "impl_trait" | "extends_type" | "implements_type" => {
                         Some(ReferenceKind::Extend)
                     }
-                    "field_access" | "field_access_name" | "property_access" | "static_access_name" => {
-                        Some(ReferenceKind::FieldAccess)
-                    }
+                    "field_access" | "field_access_name" | "property_access"
+                    | "static_access_name" => Some(ReferenceKind::FieldAccess),
                     _ => None,
                 };
 
@@ -405,11 +444,19 @@ impl SymbolExtractor {
             return Ok(());
         }
 
-        let query = match tree_sitter::Query::new(&parsed.grammar.language(), query_str) {
-            Ok(q) => q,
-            Err(e) => {
-                tracing::warn!("Invalid imports query for {}: {}", parsed.language, e);
-                return Ok(());
+        let owned_query;
+        let query = if let Some(cached) = parsed.grammar.cached_imports_query() {
+            cached
+        } else {
+            match tree_sitter::Query::new(&parsed.grammar.language(), query_str) {
+                Ok(q) => {
+                    owned_query = q;
+                    &owned_query
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid imports query for {}: {}", parsed.language, e);
+                    return Ok(());
+                }
             }
         };
 
@@ -904,8 +951,7 @@ impl SymbolExtractor {
                     for c in child.children(&mut child_cursor) {
                         if c.kind() == "identifier" {
                             params.push(
-                                crate::index::FunctionParam::new(parsed.node_text(&c))
-                                    .variadic()
+                                crate::index::FunctionParam::new(parsed.node_text(&c)).variadic(),
                             );
                             break;
                         }
@@ -917,8 +963,7 @@ impl SymbolExtractor {
                     for c in child.children(&mut child_cursor) {
                         if c.kind() == "identifier" {
                             params.push(
-                                crate::index::FunctionParam::new(parsed.node_text(&c))
-                                    .variadic()
+                                crate::index::FunctionParam::new(parsed.node_text(&c)).variadic(),
                             );
                             break;
                         }
@@ -992,8 +1037,7 @@ impl SymbolExtractor {
                     for c in child.children(&mut child_cursor) {
                         if c.kind() == "identifier" {
                             params.push(
-                                crate::index::FunctionParam::new(parsed.node_text(&c))
-                                    .variadic()
+                                crate::index::FunctionParam::new(parsed.node_text(&c)).variadic(),
                             );
                             break;
                         }
@@ -1120,8 +1164,13 @@ impl SymbolExtractor {
                                     }
                                 }
                             }
-                            "type_identifier" | "integral_type" | "floating_point_type"
-                            | "boolean_type" | "void_type" | "array_type" | "generic_type" => {
+                            "type_identifier"
+                            | "integral_type"
+                            | "floating_point_type"
+                            | "boolean_type"
+                            | "void_type"
+                            | "array_type"
+                            | "generic_type" => {
                                 type_ann = Some(parsed.node_text(&c).to_string());
                             }
                             "scoped_type_identifier" => {
@@ -1475,8 +1524,8 @@ impl SymbolExtractor {
                                 type_ann = Some(parsed.node_text(&c).to_string());
                             }
                         }
-                        "array_type" | "dictionary_type" | "optional_type"
-                        | "function_type" | "tuple_type" => {
+                        "array_type" | "dictionary_type" | "optional_type" | "function_type"
+                        | "tuple_type" => {
                             type_ann = Some(parsed.node_text(&c).to_string());
                         }
                         "..." => {
@@ -1593,23 +1642,83 @@ impl SymbolExtractor {
         match language {
             "rust" => matches!(
                 name,
-                "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                    | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-                    | "f32" | "f64" | "bool" | "char" | "str" | "String"
-                    | "Self" | "self" | "Vec" | "Option" | "Result" | "Box"
-                    | "Rc" | "Arc" | "Cell" | "RefCell" | "Ok" | "Err" | "Some" | "None"
+                "i8" | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "f32"
+                    | "f64"
+                    | "bool"
+                    | "char"
+                    | "str"
+                    | "String"
+                    | "Self"
+                    | "self"
+                    | "Vec"
+                    | "Option"
+                    | "Result"
+                    | "Box"
+                    | "Rc"
+                    | "Arc"
+                    | "Cell"
+                    | "RefCell"
+                    | "Ok"
+                    | "Err"
+                    | "Some"
+                    | "None"
             ),
             "java" | "kotlin" => matches!(
                 name,
-                "int" | "long" | "short" | "byte" | "float" | "double" | "boolean" | "char"
-                    | "void" | "Int" | "Long" | "Short" | "Byte" | "Float" | "Double"
-                    | "Boolean" | "Char" | "String" | "Object" | "Unit" | "Any" | "Nothing"
+                "int"
+                    | "long"
+                    | "short"
+                    | "byte"
+                    | "float"
+                    | "double"
+                    | "boolean"
+                    | "char"
+                    | "void"
+                    | "Int"
+                    | "Long"
+                    | "Short"
+                    | "Byte"
+                    | "Float"
+                    | "Double"
+                    | "Boolean"
+                    | "Char"
+                    | "String"
+                    | "Object"
+                    | "Unit"
+                    | "Any"
+                    | "Nothing"
             ),
             "typescript" => matches!(
                 name,
-                "string" | "number" | "boolean" | "void" | "null" | "undefined"
-                    | "any" | "unknown" | "never" | "object" | "symbol" | "bigint"
-                    | "String" | "Number" | "Boolean" | "Array" | "Object" | "Promise"
+                "string"
+                    | "number"
+                    | "boolean"
+                    | "void"
+                    | "null"
+                    | "undefined"
+                    | "any"
+                    | "unknown"
+                    | "never"
+                    | "object"
+                    | "symbol"
+                    | "bigint"
+                    | "String"
+                    | "Number"
+                    | "Boolean"
+                    | "Array"
+                    | "Object"
+                    | "Promise"
             ),
             _ => false,
         }
@@ -1636,7 +1745,9 @@ mod tests {
         let grammar = registry.get_by_name(language).unwrap();
         let parsed = parser.parse_source(source, grammar).unwrap();
         let extractor = SymbolExtractor::new();
-        extractor.extract(&parsed, &PathBuf::from(filename)).unwrap()
+        extractor
+            .extract(&parsed, &PathBuf::from(filename))
+            .unwrap()
     }
 
     // Rust tests
@@ -1752,7 +1863,10 @@ fn func_c() {}
 "#;
         let symbols = parse_and_extract(source, "rust", "test.rs");
 
-        let funcs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
+        let funcs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
         assert_eq!(funcs.len(), 3);
     }
 
@@ -1949,7 +2063,9 @@ const add = (a: number, b: number): number => a + b;
         let registry = LanguageRegistry::new();
         let grammar = registry.get_by_name("rust").unwrap();
         let parsed = parser.parse_source("fn test() {}", grammar).unwrap();
-        let symbols = extractor.extract(&parsed, &PathBuf::from("test.rs")).unwrap();
+        let symbols = extractor
+            .extract(&parsed, &PathBuf::from("test.rs"))
+            .unwrap();
         assert!(!symbols.is_empty());
     }
 
@@ -2065,7 +2181,10 @@ function add(a: number, b: number): number {
         let func = symbols.iter().find(|s| s.name == "add").unwrap();
         assert_eq!(func.kind, SymbolKind::Function);
         // Return type from query capture includes ": number"
-        assert!(func.return_type.as_ref().map_or(false, |t| t.contains("number")));
+        assert!(func
+            .return_type
+            .as_ref()
+            .map_or(false, |t| t.contains("number")));
 
         // Check params have correctly extracted types (without colon prefix)
         assert_eq!(func.params.len(), 2);
@@ -2088,7 +2207,10 @@ fn calculate(a: i32, b: String) -> bool {
 
         let func = symbols.iter().find(|s| s.name == "calculate").unwrap();
         assert_eq!(func.kind, SymbolKind::Function);
-        assert!(func.return_type.as_ref().map_or(false, |t| t.contains("bool")));
+        assert!(func
+            .return_type
+            .as_ref()
+            .map_or(false, |t| t.contains("bool")));
 
         // Check params have type annotations
         assert_eq!(func.params.len(), 2);
@@ -2118,7 +2240,10 @@ impl Foo {
         assert!(!method.params.is_empty());
         assert_eq!(method.params[0].name, "self");
         assert!(method.params[0].is_self);
-        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("Self")));
+        assert!(method.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("Self")));
 
         // Second param should have type
         assert_eq!(method.params[1].name, "x");
@@ -2141,7 +2266,10 @@ impl Bar {
 
         // &mut self should include mut in type
         assert!(method.params[0].is_self);
-        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("mut")));
+        assert!(method.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("mut")));
     }
 
     #[test]
@@ -2156,9 +2284,15 @@ fn process(data: &str, buffer: &mut Vec<u8>) -> &str {
         let func = symbols.iter().find(|s| s.name == "process").unwrap();
         assert_eq!(func.params.len(), 2);
         assert_eq!(func.params[0].name, "data");
-        assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("&str")));
+        assert!(func.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("&str")));
         assert_eq!(func.params[1].name, "buffer");
-        assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("Vec")));
+        assert!(func.params[1]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("Vec")));
     }
 
     #[test]
@@ -2175,7 +2309,10 @@ fn transform<T: Clone>(item: T, items: Vec<T>) -> T {
         assert_eq!(func.params[0].name, "item");
         assert_eq!(func.params[0].type_annotation, Some("T".to_string()));
         assert_eq!(func.params[1].name, "items");
-        assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("Vec")));
+        assert!(func.params[1]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("Vec")));
     }
 
     // === Java Type Tests ===
@@ -2213,10 +2350,16 @@ public class User {
 "#;
         let symbols = parse_and_extract(source, "java", "User.java");
 
-        let constructor = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Method).unwrap();
+        let constructor = symbols
+            .iter()
+            .find(|s| s.name == "User" && s.kind == SymbolKind::Method)
+            .unwrap();
         assert_eq!(constructor.params.len(), 2);
         assert_eq!(constructor.params[0].name, "name");
-        assert_eq!(constructor.params[0].type_annotation, Some("String".to_string()));
+        assert_eq!(
+            constructor.params[0].type_annotation,
+            Some("String".to_string())
+        );
     }
 
     #[test]
@@ -2235,7 +2378,10 @@ public class Container {
         assert_eq!(method.params[0].name, "item");
         assert_eq!(method.params[0].type_annotation, Some("T".to_string()));
         assert_eq!(method.params[1].name, "items");
-        assert!(method.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("List")));
+        assert!(method.params[1]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("List")));
     }
 
     #[test]
@@ -2275,8 +2421,14 @@ public class DataProcessor {
 
         let method = symbols.iter().find(|s| s.name == "process").unwrap();
         assert_eq!(method.params.len(), 2);
-        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("byte")));
-        assert!(method.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("int")));
+        assert!(method.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("byte")));
+        assert!(method.params[1]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("int")));
     }
 
     // === Go Type Tests ===
@@ -2380,9 +2532,80 @@ func process(data []byte, ptr *int) *string {
         let func = symbols.iter().find(|s| s.name == "process").unwrap();
         assert_eq!(func.params.len(), 2);
         assert_eq!(func.params[0].name, "data");
-        assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("[]byte")));
+        assert!(func.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("[]byte")));
         assert_eq!(func.params[1].name, "ptr");
-        assert!(func.params[1].type_annotation.as_ref().map_or(false, |t| t.contains("*int")));
+        assert!(func.params[1]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("*int")));
+    }
+
+    #[test]
+    fn test_go_struct_not_reported_as_type_alias() {
+        let source = r#"
+package main
+
+type SDConfig struct {
+    Region string
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let sdconfig_symbols: Vec<_> = symbols.iter().filter(|s| s.name == "SDConfig").collect();
+        assert_eq!(sdconfig_symbols.len(), 1);
+        assert_eq!(sdconfig_symbols[0].kind, SymbolKind::Struct);
+        assert_eq!(
+            sdconfig_symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::TypeAlias)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_go_interface_not_reported_as_type_alias() {
+        let source = r#"
+package main
+
+type Reader interface {
+    Read() string
+}
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let reader_symbols: Vec<_> = symbols.iter().filter(|s| s.name == "Reader").collect();
+        assert_eq!(reader_symbols.len(), 1);
+        assert_eq!(reader_symbols[0].kind, SymbolKind::Interface);
+        assert_eq!(
+            reader_symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::TypeAlias)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_go_named_types_still_reported_as_type_alias() {
+        let source = r#"
+package main
+
+type MyInt int
+type Alias MyInt
+"#;
+        let symbols = parse_and_extract(source, "go", "main.go");
+
+        let myint_symbols: Vec<_> = symbols.iter().filter(|s| s.name == "MyInt").collect();
+        assert_eq!(myint_symbols.len(), 1);
+        assert_eq!(myint_symbols[0].kind, SymbolKind::TypeAlias);
+
+        let alias_symbols: Vec<_> = symbols.iter().filter(|s| s.name == "Alias").collect();
+        assert_eq!(alias_symbols.len(), 1);
+        assert_eq!(alias_symbols[0].kind, SymbolKind::TypeAlias);
     }
 
     // C++ type extraction tests
@@ -2430,7 +2653,10 @@ public class Calculator {
         let method = symbols.iter().find(|s| s.name == "Add").unwrap();
         assert_eq!(method.params.len(), 2);
         assert_eq!(method.params[0].name, "a");
-        assert!(method.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("int")));
+        assert!(method.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("int")));
         assert_eq!(method.params[1].name, "b");
     }
 
@@ -2497,7 +2723,10 @@ fun add(a: Int, b: Int): Int {
         let func = symbols.iter().find(|s| s.name == "add").unwrap();
         assert_eq!(func.params.len(), 2);
         assert_eq!(func.params[0].name, "a");
-        assert!(func.params[0].type_annotation.as_ref().map_or(false, |t| t.contains("Int")));
+        assert!(func.params[0]
+            .type_annotation
+            .as_ref()
+            .map_or(false, |t| t.contains("Int")));
         assert_eq!(func.params[1].name, "b");
     }
 

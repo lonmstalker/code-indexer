@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "description": "Definition-like speed cases for exact count-parity checks (code-indexer vs rg).",
+  "cases": [
+    {
+      "id": "ripgrep_searcher_type",
+      "repo": "ripgrep",
+      "symbol": "Searcher",
+      "rg_pattern": "(struct|enum|trait|type)\\s+Searcher\\b",
+      "rg_glob": "*.rs"
+    },
+    {
+      "id": "tokio_runtime_type",
+      "repo": "tokio",
+      "symbol": "Runtime",
+      "rg_pattern": "(struct|enum|trait|type)\\s+Runtime\\b",
+      "rg_glob": "*.rs"
+    },
+    {
+      "id": "excalidraw_excalidrawelement_type_alias",
+      "repo": "excalidraw",
+      "symbol": "ExcalidrawElement",
+      "rg_pattern": "^\\s*(export\\s+)?type\\s+ExcalidrawElement\\b\\s*=",
+      "rg_glob": "*.ts"
+    },
+    {
+      "id": "guava_listenablefuture_interface",
+      "repo": "guava",
+      "symbol": "ListenableFuture",
+      "rg_pattern": "\\binterface\\s+ListenableFuture\\b",
+      "rg_glob": "*.java"
+    },
+    {
+      "id": "prometheus_sdconfig_type",
+      "repo": "prometheus",
+      "symbol": "SDConfig",
+      "rg_pattern": "\\btype\\s+SDConfig\\b",
+      "rg_glob": "*.go"
+    },
+    {
+      "id": "django_queryset_type",
+      "repo": "django",
+      "symbol": "QuerySet",
+      "rg_pattern": "\\bclass\\s+QuerySet\\b",
+      "rg_glob": "*.py"
+    },
+    {
+      "id": "kotlin_kttypecodefragment_type",
+      "repo": "kotlin",
+      "symbol": "KtTypeCodeFragment",
+      "rg_pattern": "\\bclass\\s+KtTypeCodeFragment\\b",
+      "rg_glob": "*.kt"
+    }
+  ]
+}

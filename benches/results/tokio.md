@@ -1,5 +1,9 @@
 # tokio (Rust)
 
+> [!WARNING]
+> Legacy speed data: этот файл сохранён как historical capability snapshot и не является источником честных speed-метрик.
+> Для honest speed-check используйте 'benches/speed/run_speed_bench.py' и отчёты в 'benches/results/speed/'.
+
 > Асинхронный runtime для Rust — [tokio-rs/tokio](https://github.com/tokio-rs/tokio)
 
 ## Характеристики проекта

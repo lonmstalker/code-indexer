@@ -64,8 +64,11 @@ impl LanguageGrammar for GoGrammar {
             (type_spec
                 name: (type_identifier) @name
                 type_parameters: (type_parameter_list)? @type_params
+                type: (_) @alias_target
             )
         ) @type_alias
+        (#not-match? @alias_target "^\\s*struct\\b")
+        (#not-match? @alias_target "^\\s*interface\\b")
         "#
     }
 
@@ -111,26 +114,26 @@ impl LanguageGrammar for GoGrammar {
     }
 
     fn cached_functions_query(&self) -> Option<&'static Query> {
-        GO_FUNCTIONS_QUERY.get_or_try_init(|| {
-            Query::new(&self.language(), self.functions_query())
-        }).ok()
+        GO_FUNCTIONS_QUERY
+            .get_or_try_init(|| Query::new(&self.language(), self.functions_query()))
+            .ok()
     }
 
     fn cached_types_query(&self) -> Option<&'static Query> {
-        GO_TYPES_QUERY.get_or_try_init(|| {
-            Query::new(&self.language(), self.types_query())
-        }).ok()
+        GO_TYPES_QUERY
+            .get_or_try_init(|| Query::new(&self.language(), self.types_query()))
+            .ok()
     }
 
     fn cached_imports_query(&self) -> Option<&'static Query> {
-        GO_IMPORTS_QUERY.get_or_try_init(|| {
-            Query::new(&self.language(), self.imports_query())
-        }).ok()
+        GO_IMPORTS_QUERY
+            .get_or_try_init(|| Query::new(&self.language(), self.imports_query()))
+            .ok()
     }
 
     fn cached_references_query(&self) -> Option<&'static Query> {
-        GO_REFERENCES_QUERY.get_or_try_init(|| {
-            Query::new(&self.language(), self.references_query())
-        }).ok()
+        GO_REFERENCES_QUERY
+            .get_or_try_init(|| Query::new(&self.language(), self.references_query()))
+            .ok()
     }
 }

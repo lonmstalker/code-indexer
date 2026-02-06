@@ -18,19 +18,21 @@ CLI-инструмент и MCP-сервер для индексации и се
 - **Virtual documents** — поддержка несохранённых изменений (LSP overlay)
 - **File Tags & Intent Layer** — метаданные файлов через sidecar `.code-indexer.yml`
 
-## Производительность (бенчмарк)
+## Производительность (честный speed-check v2)
 
-Тестирование на проекте JavaTgBots (2160 файлов, 18944 символа):
+В репозитории разделены два типа benchmark:
 
-| Операция | code-indexer | grep | Ускорение |
-|----------|--------------|------|-----------|
-| Поиск определения класса | 0.007 сек | 0.539 сек | **77x** |
-| Поиск реализаций интерфейса | 0.007 сек | 0.538 сек | **77x** |
-| Граф вызовов метода | 0.007 сек | 0.380 сек | **54x** |
-| Cross-module поиск | 0.011 сек | 0.363 сек | **33x** |
-| Fuzzy поиск с опечаткой | 0.089 сек | не найдено | **∞** |
+- **Capability checks (legacy)** — функциональные сравнения в `benches/results/*.md` (historical snapshot).
+- **Honest speed checks (v2)** — воспроизводимые speed-замеры `code-indexer` vs `rg` через `benches/speed/run_speed_bench.py`.
 
-**Время индексации**: 3.5 сек для 2160 файлов
+Методология speed-check v2:
+
+- только definition-like кейсы из `benches/speed/cases.json`;
+- strict precheck: `code_indexer_count == rg_count`;
+- метрики: `median`, `p95`, `cv%`;
+- режимы: `query-only` и `first-run`.
+
+Подробности и команды запуска: [benches/README.md](benches/README.md) и [benches/results/speed/README.md](benches/results/speed/README.md).
 
 ## Поддерживаемые языки (17)
 
@@ -605,10 +607,13 @@ Generic параметры сохраняются в поле `generic_params` �
 
 ## Сравнение с CLI-инструментами
 
-Детальные сравнения code-indexer с rg, grep, wc, find на 7 open-source проектах:
+### Capability checks (legacy)
 
-| Репо | Язык | Результаты |
-|------|------|-----------|
+`benches/results/*.md` содержат historical capability snapshot (семантика, граф вызовов, fuzzy, outline).  
+Эти файлы сохранены для функционального сравнения и не используются как источник честных speed-метрик.
+
+| Репо | Язык | Legacy capability |
+|------|------|-------------------|
 | ripgrep | Rust | [benches/results/ripgrep.md](benches/results/ripgrep.md) |
 | tokio | Rust | [benches/results/tokio.md](benches/results/tokio.md) |
 | excalidraw | TypeScript | [benches/results/excalidraw.md](benches/results/excalidraw.md) |
@@ -617,12 +622,34 @@ Generic параметры сохраняются в поле `generic_params` �
 | django | Python | [benches/results/django.md](benches/results/django.md) |
 | kotlin | Kotlin | [benches/results/kotlin.md](benches/results/kotlin.md) |
 
+### Honest speed checks (v2)
+
+Честные speed-замеры находятся в `benches/speed/run_speed_bench.py` и публикуются в `benches/results/speed/`.
+
+- baseline: только `rg`;
+- strict parity по количеству результатов;
+- speedup считается только для valid parity-case.
+
 ```bash
-# Загрузка тестовых репозиториев и запуск замеров
+# Скачивание pinned репозиториев (все 7)
 ./benches/download_repos.sh
+
+# Сборка
+cargo build --release
+
+# Honest speed benchmark (JSON + Markdown)
+python3 benches/speed/run_speed_bench.py \
+  --repos all \
+  --mode both \
+  --runs 10 \
+  --warmup 3 \
+  --out-json benches/results/speed/latest.json \
+  --out-md benches/results/speed/latest.md
 ```
 
-Подробнее: [benches/README.md](benches/README.md)
+Smoke-набор (CI): `ripgrep,tokio`.
+
+Подробнее: [benches/README.md](benches/README.md), [benches/results/speed/README.md](benches/results/speed/README.md)
 
 ## Лицензия
 

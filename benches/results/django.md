@@ -1,5 +1,9 @@
 # django (Python)
 
+> [!WARNING]
+> Legacy speed data: этот файл сохранён как historical capability snapshot и не является источником честных speed-метрик.
+> Для honest speed-check используйте 'benches/speed/run_speed_bench.py' и отчёты в 'benches/results/speed/'.
+
 > Веб-фреймворк для Python — [django/django](https://github.com/django/django)
 
 ## Характеристики проекта

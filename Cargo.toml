@@ -22,7 +22,7 @@ tokio = { version = "1.43", features = ["full"] }
 tokio-util = "0.7"
 
 # MCP Server
-rmcp = { version = "0.14.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "0.14.0", features = ["server", "client", "macros", "transport-io"] }
 
 # Tree-sitter parsing
 tree-sitter = "0.26.5"

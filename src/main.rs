@@ -23,14 +23,19 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         // === New consolidated commands ===
-        Commands::Index { path, watch, deep_deps } => {
-            cli::index_directory(&path, &cli.db, watch)?;
+        Commands::Index {
+            path,
+            watch,
+            deep_deps,
+            durability,
+        } => {
+            cli::index_directory(&path, &cli.db, watch, durability)?;
             if deep_deps {
                 cli::index_dependencies(&path, &cli.db, None, false)?;
             }
         }
-        Commands::Serve => {
-            cli::run_mcp_server(&cli.db).await?;
+        Commands::Serve { transport, socket } => {
+            cli::run_mcp_server(&cli.db, transport, socket.as_deref()).await?;
         }
         Commands::Symbols {
             query,
@@ -42,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
             format,
             fuzzy,
             fuzzy_threshold,
+            remote,
         } => {
             cli::symbols(
                 &cli.db,
@@ -54,14 +60,17 @@ async fn main() -> anyhow::Result<()> {
                 &format,
                 fuzzy,
                 fuzzy_threshold,
-            )?;
+                remote.as_deref(),
+            )
+            .await?;
         }
-        Commands::Definition { name, include_deps, dep } => {
-            if include_deps {
-                cli::find_in_dependencies(&cli.db, &name, dep, 20)?;
-            } else {
-                cli::find_definition(&cli.db, &name)?;
-            }
+        Commands::Definition {
+            name,
+            include_deps,
+            dep,
+            remote,
+        } => {
+            cli::find_definition(&cli.db, &name, include_deps, dep, remote.as_deref()).await?;
         }
         Commands::References {
             name,
@@ -69,27 +78,59 @@ async fn main() -> anyhow::Result<()> {
             depth,
             file,
             limit,
+            remote,
         } => {
-            cli::find_references(&cli.db, &name, callers, depth, file, limit)?;
+            cli::find_references(
+                &cli.db,
+                &name,
+                callers,
+                depth,
+                file,
+                limit,
+                remote.as_deref(),
+            )
+            .await?;
         }
         Commands::CallGraph {
             function,
             direction,
             depth,
             include_possible,
+            remote,
         } => {
-            cli::analyze_call_graph(&cli.db, &function, &direction, depth, include_possible)?;
+            cli::analyze_call_graph(
+                &cli.db,
+                &function,
+                &direction,
+                depth,
+                include_possible,
+                remote.as_deref(),
+            )
+            .await?;
         }
         Commands::Outline {
             file,
             start_line,
             end_line,
             scopes,
+            remote,
         } => {
-            cli::get_outline(&cli.db, &file, start_line, end_line, scopes)?;
+            cli::get_outline(
+                &cli.db,
+                &file,
+                start_line,
+                end_line,
+                scopes,
+                remote.as_deref(),
+            )
+            .await?;
         }
-        Commands::Imports { file, resolve } => {
-            cli::get_imports(&cli.db, &file, resolve)?;
+        Commands::Imports {
+            file,
+            resolve,
+            remote,
+        } => {
+            cli::get_imports(&cli.db, &file, resolve, remote.as_deref()).await?;
         }
         Commands::Changed {
             base,
@@ -99,8 +140,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             cli::get_changed_symbols(&cli.db, &base, staged, unstaged, &format)?;
         }
-        Commands::Stats => {
-            cli::show_stats(&cli.db)?;
+        Commands::Stats { remote } => {
+            cli::show_stats(&cli.db, remote.as_deref()).await?;
         }
         Commands::Clear => {
             cli::clear_index(&cli.db)?;
@@ -123,7 +164,12 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Tags { command } => match command {
-            TagsCommands::AddRule { tag, pattern, confidence, path } => {
+            TagsCommands::AddRule {
+                tag,
+                pattern,
+                confidence,
+                path,
+            } => {
                 cli::add_tag_rule(&path, &tag, &pattern, confidence)?;
             }
             TagsCommands::RemoveRule { pattern, path } => {
@@ -156,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
                     cli::search_symbols(&cli.db, &query, limit, &format, fuzzy, fuzzy_threshold)?;
                 }
                 QueryCommands::Definition { name } => {
-                    cli::find_definition(&cli.db, &name)?;
+                    cli::find_definition(&cli.db, &name, false, None, None).await?;
                 }
                 QueryCommands::Functions {
                     limit,

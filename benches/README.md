@@ -1,51 +1,85 @@
 # Benchmarks
 
-Сравнение code-indexer с CLI-инструментами (rg, grep, wc, find) на реальных open-source проектах.
+В репозитории есть два разных вида бенчмарков.
 
-## Тестовые репозитории
+## 1) Capability checks (legacy)
 
-| Репо | Язык | Описание | Результаты |
-|------|------|----------|-----------|
-| ripgrep | Rust | CLI поиск ([BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep)) | [results/ripgrep.md](results/ripgrep.md) |
-| tokio | Rust | Async runtime ([tokio-rs/tokio](https://github.com/tokio-rs/tokio)) | [results/tokio.md](results/tokio.md) |
-| excalidraw | TypeScript | Whiteboard app ([excalidraw/excalidraw](https://github.com/excalidraw/excalidraw)) | [results/excalidraw.md](results/excalidraw.md) |
-| guava | Java | Core libraries ([google/guava](https://github.com/google/guava)) | [results/guava.md](results/guava.md) |
-| prometheus | Go | Monitoring system ([prometheus/prometheus](https://github.com/prometheus/prometheus)) | [results/prometheus.md](results/prometheus.md) |
-| django | Python | Web framework ([django/django](https://github.com/django/django)) | [results/django.md](results/django.md) |
-| kotlin | Kotlin | Kotlin compiler ([JetBrains/kotlin](https://github.com/JetBrains/kotlin)) | [results/kotlin.md](results/kotlin.md) |
+`benches/results/*.md` сохранены как historical snapshot по функциональным преимуществам (`call graph`, `references`, `fuzzy`, `outline`).
 
-## Как запустить замеры
+Эти файлы **не являются источником честных speed-метрик**.
+
+## 2) Honest speed checks (v2)
+
+Честный speed-check находится в `benches/speed/run_speed_bench.py`.
+
+Он фиксирует:
+
+- baseline только `rg`;
+- только definition-like кейсы из `benches/speed/cases.json`;
+- strict parity precheck: `code_indexer_count == rg_count`;
+- метрики `median`, `p95`, `cv%`;
+- два режима: `query-only` и `first-run`.
+
+Ограничение: page-cache flush не выполняется (process-cold, не guaranteed disk-cold).
+
+## Репозитории и pinning
+
+Список репозиториев и commit SHAs фиксируется в `benches/repos.lock`.
+
+Скачивание pinned репозиториев:
 
 ```bash
-# 1. Скачать репозитории (~2 ГБ, shallow clone)
+# Все 7 репо
 ./benches/download_repos.sh
 
-# 2. Собрать code-indexer
+# Только smoke-набор для CI/быстрой локальной проверки
+./benches/download_repos.sh --repos ripgrep,tokio
+```
+
+## Локальный запуск честного speed-check
+
+```bash
+# 1) build
 cargo build --release
 
-# 3. Проиндексировать репо (пример: ripgrep)
-time ./target/release/code-indexer index benches/repos/ripgrep
-
-# 4. Посмотреть статистику
-./target/release/code-indexer stats --db benches/repos/ripgrep/.code-index.db
-
-# 5. Замеры rg для сравнения
-time rg "fn\s+new\b" benches/repos/ripgrep
-
-# 6. Замеры code-indexer
-time ./target/release/code-indexer definition "new" --db benches/repos/ripgrep/.code-index.db
-
-# 7. Заполнить результаты в соответствующем MD-файле
+# 2) run benchmark
+python3 benches/speed/run_speed_bench.py \
+  --repos all \
+  --mode both \
+  --runs 10 \
+  --warmup 3 \
+  --out-json benches/results/speed/latest.json \
+  --out-md benches/results/speed/latest.md
 ```
+
+## CI smoke
+
+Workflow: `.github/workflows/bench-smoke.yml`.
+
+Smoke scope:
+
+- repos: `ripgrep,tokio`
+- mode: `both`
+- output artifacts: `benches/results/speed/ci-smoke.json`, `benches/results/speed/ci-smoke.md`
+
+CI падает, если нарушен контракт runner или не найдено ни одного valid parity-case для выбранных smoke-репозиториев.
 
 ## Структура
 
-```
+```text
 benches/
-├── README.md              # Этот файл
-├── download_repos.sh      # Скрипт загрузки репозиториев
-├── repos/                 # Скачанные репозитории (gitignored)
-└── results/               # Шаблоны сравнений по репо
+├── README.md
+├── repos.lock
+├── download_repos.sh
+├── speed/
+│   ├── cases.json
+│   └── run_speed_bench.py
+├── repos/                 # gitignored
+└── results/
+    ├── speed/
+    │   ├── README.md
+    │   ├── latest.json
+    │   └── latest.md
     ├── ripgrep.md
     ├── tokio.md
     ├── excalidraw.md

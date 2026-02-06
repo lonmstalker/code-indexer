@@ -5,16 +5,16 @@ description: "Поверхности CLI и MCP tools, их назначение
 # Interfaces (Architecture)
 
 ## CLI Surface
-- `index` — индексация директории, поддерживает `--watch` и `--deep-deps`.
-- `serve` — запуск MCP server.
-- `symbols` — список символов с фильтрами.
-- `definition` — поиск определений.
-- `references` — поиск usages и callers.
-- `call-graph` — анализ графа вызовов.
-- `outline` — структура файла.
-- `imports` — импорты файла.
+- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`.
+- `serve` — запуск MCP server (`--transport stdio|unix`, `--socket <path>` для unix daemon).
+- `symbols` — список символов с фильтрами, поддерживает `--remote <unix-socket>`.
+- `definition` — поиск определений, поддерживает `--remote <unix-socket>`.
+- `references` — поиск usages и callers, поддерживает `--remote <unix-socket>`.
+- `call-graph` — анализ графа вызовов, поддерживает `--remote <unix-socket>`.
+- `outline` — структура файла, поддерживает `--remote <unix-socket>`.
+- `imports` — импорты файла, поддерживает `--remote <unix-socket>`.
 - `changed` — символы по git diff.
-- `stats` — статистика индекса.
+- `stats` — статистика индекса, поддерживает `--remote <unix-socket>`.
 - `clear` — очистка индекса.
 - `deps` — операции с зависимостями.
 - `query` — legacy namespace (deprecated).

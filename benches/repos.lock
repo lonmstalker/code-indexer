@@ -1,0 +1,8 @@
+# name url commit_sha
+ripgrep https://github.com/BurntSushi/ripgrep 0a88cccd5188074de96f54a4b6b44a63971ac157
+tokio https://github.com/tokio-rs/tokio 306ed1c30b67d78c8158e601acfda3b8650008dd
+excalidraw https://github.com/excalidraw/excalidraw 83d3943cd0973aa2fe6dc843a730bcb50e8a26ec
+guava https://github.com/google/guava 31df9ad7d80f9f6c63c2216113e464b773aa3a82
+prometheus https://github.com/prometheus/prometheus 3155c95c1f58542ed98d265b0bae6675df433f8a
+django https://github.com/django/django 6f8b2d1c6dfaab4b18a2b10bca4e54bdbabc10d8
+kotlin https://github.com/JetBrains/kotlin f30d120409202fddc448b5bbfb97e06296ac02a9

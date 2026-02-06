@@ -1,5 +1,9 @@
 # prometheus (Go)
 
+> [!WARNING]
+> Legacy speed data: этот файл сохранён как historical capability snapshot и не является источником честных speed-метрик.
+> Для honest speed-check используйте 'benches/speed/run_speed_bench.py' и отчёты в 'benches/results/speed/'.
+
 > Система мониторинга и алертинга — [prometheus/prometheus](https://github.com/prometheus/prometheus)
 
 ## Характеристики проекта

@@ -47,6 +47,7 @@ fn diversify_by_directory(results: Vec<SearchResult>, max_per_dir: usize) -> Vec
 pub struct McpServer {
     index: Arc<SqliteIndex>,
     overlay: Arc<DocumentOverlay>,
+    parse_cache: Arc<crate::indexer::ParseCache>,
     session_manager: Arc<code_indexer::session::SessionManager>,
     /// Optional write queue for serialized writes.
     /// When present, write operations go through this queue to prevent SQLITE_BUSY errors.
@@ -59,6 +60,7 @@ impl McpServer {
         Self {
             index,
             overlay: Arc::new(DocumentOverlay::new()),
+            parse_cache: Arc::new(crate::indexer::ParseCache::new()),
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
             write_queue: None,
             indexing_progress: crate::indexer::IndexingProgress::new(),
@@ -75,6 +77,7 @@ impl McpServer {
         Self {
             index,
             overlay: Arc::new(DocumentOverlay::new()),
+            parse_cache: Arc::new(crate::indexer::ParseCache::new()),
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
             write_queue: Some(write_queue),
             indexing_progress: crate::indexer::IndexingProgress::new(),
@@ -86,6 +89,7 @@ impl McpServer {
         Self {
             index,
             overlay,
+            parse_cache: Arc::new(crate::indexer::ParseCache::new()),
             session_manager: Arc::new(code_indexer::session::SessionManager::new()),
             write_queue: None,
             indexing_progress: crate::indexer::IndexingProgress::new(),
@@ -289,11 +293,7 @@ impl McpServer {
     }
 
     /// Load a code snippet from a file at the given location
-    fn load_snippet(
-        file_path: &str,
-        start_line: u32,
-        snippet_lines: usize,
-    ) -> Option<String> {
+    fn load_snippet(file_path: &str, start_line: u32, snippet_lines: usize) -> Option<String> {
         std::fs::read_to_string(file_path).ok().map(|content| {
             let lines: Vec<&str> = content.lines().collect();
             let start = (start_line.saturating_sub(1)) as usize;
@@ -918,7 +918,10 @@ impl McpServer {
             // Get top usages (diversified: 1-2 per file)
             if !symbol_cards.is_empty() {
                 let first_symbol_name = &results[0].symbol.name;
-                if let Ok(refs) = self.index.find_references(first_symbol_name, &SearchOptions::default()) {
+                if let Ok(refs) = self
+                    .index
+                    .find_references(first_symbol_name, &SearchOptions::default())
+                {
                     let mut files_seen: HashMap<String, usize> = HashMap::new();
                     for r in refs.iter().take(10) {
                         let count = files_seen.entry(r.file_path.clone()).or_insert(0);
@@ -1917,43 +1920,73 @@ impl ServerHandler for McpServer {
         let tool_name = match request.name.as_ref() {
             // Deprecated aliases → new tools (with warning)
             "search_symbol" | "search_by_pattern" | "search_in_module" => {
-                warn!("Tool '{}' is deprecated, use 'search_symbols' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'search_symbols' instead",
+                    request.name
+                );
                 "search_symbols"
             }
             "list_functions" | "list_types" => {
-                warn!("Tool '{}' is deprecated, use 'list_symbols' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'list_symbols' instead",
+                    request.name
+                );
                 "list_symbols"
             }
             "find_definition" | "find_in_dependency" => {
-                warn!("Tool '{}' is deprecated, use 'find_definitions' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'find_definitions' instead",
+                    request.name
+                );
                 "find_definitions"
             }
             "find_callers" | "get_file_importers" => {
-                warn!("Tool '{}' is deprecated, use 'find_references' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'find_references' instead",
+                    request.name
+                );
                 "find_references"
             }
             "get_call_graph" | "find_callees" => {
-                warn!("Tool '{}' is deprecated, use 'analyze_call_graph' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'analyze_call_graph' instead",
+                    request.name
+                );
                 "analyze_call_graph"
             }
             "get_file_structure" | "find_symbols_in_range" => {
-                warn!("Tool '{}' is deprecated, use 'get_file_outline' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'get_file_outline' instead",
+                    request.name
+                );
                 "get_file_outline"
             }
             "get_file_imports" => {
-                warn!("Tool '{}' is deprecated, use 'get_imports' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'get_imports' instead",
+                    request.name
+                );
                 "get_imports"
             }
             "find_dead_code" | "get_metrics" => {
-                warn!("Tool '{}' is deprecated, use 'get_diagnostics' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'get_diagnostics' instead",
+                    request.name
+                );
                 "get_diagnostics"
             }
             "index_stats" => {
-                warn!("Tool '{}' is deprecated, use 'get_stats' instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'get_stats' instead",
+                    request.name
+                );
                 "get_stats"
             }
             "batch_get_symbols" => {
-                warn!("Tool '{}' is deprecated, use 'get_symbol' with 'ids' parameter instead", request.name);
+                warn!(
+                    "Tool '{}' is deprecated, use 'get_symbol' with 'ids' parameter instead",
+                    request.name
+                );
                 "get_symbol"
             }
             other => other,
@@ -1992,10 +2025,10 @@ impl ServerHandler for McpServer {
                         // Read file content and compute hash
                         if let Ok(content) = std::fs::read_to_string(file) {
                             let hash = SqliteIndex::compute_content_hash(&content);
-                            if let Ok(needs_reindex) = self.index.file_needs_reindex(
-                                &file.to_string_lossy(),
-                                &hash,
-                            ) {
+                            if let Ok(needs_reindex) = self
+                                .index
+                                .file_needs_reindex(&file.to_string_lossy(), &hash)
+                            {
                                 if !needs_reindex {
                                     return false; // Skip unchanged file
                                 }
@@ -2012,35 +2045,38 @@ impl ServerHandler for McpServer {
                 let progress_ref = &self.indexing_progress;
 
                 // Parallel parsing and extraction using rayon
-                let results: Vec<(std::path::PathBuf, String, crate::indexer::ExtractionResult)> = files_to_index
-                    .into_par_iter()
-                    .filter_map(|file| {
-                        let registry = LanguageRegistry::new();
-                        let parser = Parser::new(registry);
-                        let extractor = SymbolExtractor::new();
+                let parse_cache = self.parse_cache.clone();
+                let results: Vec<(std::path::PathBuf, String, crate::indexer::ExtractionResult)> =
+                    files_to_index
+                        .into_par_iter()
+                        .map_init(
+                            || (Parser::new(LanguageRegistry::new()), SymbolExtractor::new()),
+                            |(parser, extractor), file| {
+                                // Read content and compute hash
+                                let content = std::fs::read_to_string(file).ok()?;
+                                let hash = SqliteIndex::compute_content_hash(&content);
 
-                        // Read content and compute hash
-                        let content = std::fs::read_to_string(&file).ok()?;
-                        let hash = SqliteIndex::compute_content_hash(&content);
-
-                        match parser.parse_file(&file) {
-                            Ok(parsed) => match extractor.extract_all(&parsed, &file) {
-                                Ok(result) => {
-                                    progress_ref.inc(result.symbols.len());
-                                    Some((file.clone(), hash, result))
-                                }
-                                Err(_) => {
-                                    progress_ref.inc_error();
-                                    None
+                                match parse_cache.parse_source_cached(file, &content, parser) {
+                                    Ok(parsed) => match extractor.extract_all(&parsed, file) {
+                                        Ok(result) => {
+                                            progress_ref.inc(result.symbols.len());
+                                            Some((file.clone(), hash, result))
+                                        }
+                                        Err(_) => {
+                                            progress_ref.inc_error();
+                                            None
+                                        }
+                                    },
+                                    Err(_) => {
+                                        progress_ref.inc_error();
+                                        parse_cache.invalidate(file);
+                                        None
+                                    }
                                 }
                             },
-                            Err(_) => {
-                                progress_ref.inc_error();
-                                None
-                            }
-                        }
-                    })
-                    .collect();
+                        )
+                        .filter_map(|r| r)
+                        .collect();
 
                 let files_updated = results.len();
 
@@ -2053,10 +2089,14 @@ impl ServerHandler for McpServer {
                 let _ = self.index.remove_files_batch(&file_refs);
 
                 // Extract hashes first (before moving results)
-                let file_hashes: Vec<_> = results.iter().map(|(f, h, _)| (f.to_string_lossy().to_string(), h.clone())).collect();
+                let file_hashes: Vec<_> = results
+                    .iter()
+                    .map(|(f, h, _)| (f.to_string_lossy().to_string(), h.clone()))
+                    .collect();
 
                 // Extract results for batch insert
-                let extraction_results: Vec<crate::indexer::ExtractionResult> = results.into_iter().map(|(_, _, r)| r).collect();
+                let extraction_results: Vec<crate::indexer::ExtractionResult> =
+                    results.into_iter().map(|(_, _, r)| r).collect();
 
                 // Batch insert all results
                 let total_symbols = self
@@ -2095,9 +2135,9 @@ impl ServerHandler for McpServer {
                 use crate::indexer::{Parser, SymbolExtractor};
                 use crate::languages::LanguageRegistry;
 
-                let params: UpdateFilesParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: UpdateFilesParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let registry = LanguageRegistry::new();
@@ -2129,47 +2169,43 @@ impl ServerHandler for McpServer {
                     // Update overlay with new content
                     self.overlay.update(path, content, version);
 
-                    // Parse and extract symbols from the content
-                    let registry = LanguageRegistry::new();
-                    if let Some(grammar) = registry.get_by_extension(
-                        std::path::Path::new(path)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or(""),
-                    ) {
-                        match parser.parse_source(content, grammar) {
-                            Ok(parsed) => {
-                                match extractor.extract_all(&parsed, std::path::Path::new(path)) {
-                                    Ok(result) => {
-                                        let symbols_count = result.symbols.len();
-                                        self.overlay.set_symbols(path, result.symbols);
-                                        symbol_counts.push(serde_json::json!({
-                                            "file": path,
-                                            "symbols": symbols_count
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        warnings.push(serde_json::json!({
-                                            "file": path,
-                                            "warning": "extraction_failed",
-                                            "error": e.to_string()
-                                        }));
-                                    }
-                                }
+                    // Parse and extract symbols from content using incremental ParseCache.
+                    let file_path = std::path::Path::new(path);
+                    match self
+                        .parse_cache
+                        .parse_source_cached(file_path, content, &parser)
+                    {
+                        Ok(parsed) => match extractor.extract_all(&parsed, file_path) {
+                            Ok(result) => {
+                                let symbols_count = result.symbols.len();
+                                self.overlay.set_symbols(path, result.symbols);
+                                symbol_counts.push(serde_json::json!({
+                                    "file": path,
+                                    "symbols": symbols_count
+                                }));
                             }
                             Err(e) => {
                                 warnings.push(serde_json::json!({
                                     "file": path,
-                                    "warning": "parse_failed",
+                                    "warning": "extraction_failed",
                                     "error": e.to_string()
                                 }));
                             }
+                        },
+                        Err(crate::error::IndexerError::UnsupportedLanguage(_)) => {
+                            warnings.push(serde_json::json!({
+                                "file": path,
+                                "warning": "unsupported_language"
+                            }));
                         }
-                    } else {
-                        warnings.push(serde_json::json!({
-                            "file": path,
-                            "warning": "unsupported_language"
-                        }));
+                        Err(e) => {
+                            warnings.push(serde_json::json!({
+                                "file": path,
+                                "warning": "parse_failed",
+                                "error": e.to_string()
+                            }));
+                            self.parse_cache.invalidate(file_path);
+                        }
                     }
 
                     updated_files.push(path.clone());
@@ -2194,9 +2230,9 @@ impl ServerHandler for McpServer {
             "list_symbols" => {
                 use crate::index::{CompactSymbol, OutputFormat};
 
-                let params: ListSymbolsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: ListSymbolsParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let kind_str = params.kind.as_deref().unwrap_or("all");
@@ -2256,7 +2292,7 @@ impl ServerHandler for McpServer {
 
             // === 4. search_symbols ===
             "search_symbols" => {
-                use crate::index::{CompactSymbol, CompactFileMeta, OutputFormat};
+                use crate::index::{CompactFileMeta, CompactSymbol, OutputFormat};
 
                 let params: SearchSymbolsParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -2278,18 +2314,19 @@ impl ServerHandler for McpServer {
                 let tag_filter = params.tag.clone();
 
                 // If tags are specified, first get files matching those tags
-                let tag_filtered_files: Option<std::collections::HashSet<String>> = if let Some(ref tags) = tag_filter {
-                    if !tags.is_empty() {
-                        match self.index.search_files_by_tags(tags) {
-                            Ok(files) => Some(files.into_iter().collect()),
-                            Err(_) => None, // Ignore tag filter errors
+                let tag_filtered_files: Option<std::collections::HashSet<String>> =
+                    if let Some(ref tags) = tag_filter {
+                        if !tags.is_empty() {
+                            match self.index.search_files_by_tags(tags) {
+                                Ok(files) => Some(files.into_iter().collect()),
+                                Err(_) => None, // Ignore tag filter errors
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
 
                 let options = SearchOptions {
                     limit: params.limit.or(Some(20)),
@@ -2312,18 +2349,21 @@ impl ServerHandler for McpServer {
                         })
                 } else if fuzzy {
                     // Check overlay first, then DB
-                    self.overlay.search_with_overlay(&params.query, &self.index, &options)
+                    self.overlay
+                        .search_with_overlay(&params.query, &self.index, &options)
                         .or_else(|_| self.index.search_fuzzy(&params.query, &options))
                 } else {
                     // Overlay-first search: prioritize dirty documents
-                    self.overlay.search_with_overlay(&params.query, &self.index, &options)
+                    self.overlay
+                        .search_with_overlay(&params.query, &self.index, &options)
                 };
 
                 match search_result {
                     Ok(mut results) => {
                         // Apply tag filter if specified
                         if let Some(ref allowed_files) = tag_filtered_files {
-                            results.retain(|r| allowed_files.contains(&r.symbol.location.file_path));
+                            results
+                                .retain(|r| allowed_files.contains(&r.symbol.location.file_path));
                         }
 
                         // Apply max_per_directory diversification if specified
@@ -2334,15 +2374,19 @@ impl ServerHandler for McpServer {
                         let output = if include_file_meta {
                             // Build results with file metadata
                             let mut items: Vec<serde_json::Value> = Vec::new();
-                            let mut file_meta_cache: std::collections::HashMap<String, Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>> = std::collections::HashMap::new();
+                            let mut file_meta_cache: std::collections::HashMap<
+                                String,
+                                Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>,
+                            > = std::collections::HashMap::new();
 
                             for r in &results {
                                 let file_path = &r.symbol.location.file_path;
 
                                 // Get cached or fetch file metadata
-                                let meta_tags = file_meta_cache.entry(file_path.clone()).or_insert_with(|| {
-                                    self.index.get_file_meta_with_tags(file_path).ok().flatten()
-                                });
+                                let meta_tags =
+                                    file_meta_cache.entry(file_path.clone()).or_insert_with(|| {
+                                        self.index.get_file_meta_with_tags(file_path).ok().flatten()
+                                    });
 
                                 match output_format {
                                     OutputFormat::Full => {
@@ -2350,23 +2394,35 @@ impl ServerHandler for McpServer {
                                         if let Some((ref meta, ref tags)) = meta_tags {
                                             let fm = CompactFileMeta::from_file_meta(meta, tags);
                                             if let serde_json::Value::Object(ref mut map) = item {
-                                                map.insert("fm".to_string(), serde_json::to_value(&fm).unwrap_or_default());
+                                                map.insert(
+                                                    "fm".to_string(),
+                                                    serde_json::to_value(&fm).unwrap_or_default(),
+                                                );
                                             }
                                         }
                                         items.push(item);
                                     }
                                     OutputFormat::Compact => {
-                                        let mut compact = serde_json::to_value(CompactSymbol::from_symbol(&r.symbol, Some(r.score))).unwrap_or_default();
+                                        let mut compact = serde_json::to_value(
+                                            CompactSymbol::from_symbol(&r.symbol, Some(r.score)),
+                                        )
+                                        .unwrap_or_default();
                                         if let Some((ref meta, ref tags)) = meta_tags {
                                             let fm = CompactFileMeta::from_file_meta(meta, tags);
-                                            if let serde_json::Value::Object(ref mut map) = compact {
-                                                map.insert("fm".to_string(), serde_json::to_value(&fm).unwrap_or_default());
+                                            if let serde_json::Value::Object(ref mut map) = compact
+                                            {
+                                                map.insert(
+                                                    "fm".to_string(),
+                                                    serde_json::to_value(&fm).unwrap_or_default(),
+                                                );
                                             }
                                         }
                                         items.push(compact);
                                     }
                                     OutputFormat::Minimal => {
-                                        let minimal = CompactSymbol::from_symbol(&r.symbol, Some(r.score)).to_minimal_string();
+                                        let minimal =
+                                            CompactSymbol::from_symbol(&r.symbol, Some(r.score))
+                                                .to_minimal_string();
                                         items.push(serde_json::Value::String(minimal));
                                     }
                                 }
@@ -2382,7 +2438,9 @@ impl ServerHandler for McpServer {
                                 OutputFormat::Compact => {
                                     let compact: Vec<CompactSymbol> = results
                                         .iter()
-                                        .map(|r| CompactSymbol::from_symbol(&r.symbol, Some(r.score)))
+                                        .map(|r| {
+                                            CompactSymbol::from_symbol(&r.symbol, Some(r.score))
+                                        })
                                         .collect();
                                     serde_json::to_string(&compact).unwrap_or_default()
                                 }
@@ -2414,7 +2472,9 @@ impl ServerHandler for McpServer {
                     let mut symbols = Vec::new();
                     for id in ids {
                         // Try overlay first, then DB
-                        if let Ok(Some(symbol)) = self.overlay.get_symbol_with_overlay(&id, &self.index) {
+                        if let Ok(Some(symbol)) =
+                            self.overlay.get_symbol_with_overlay(&id, &self.index)
+                        {
                             symbols.push(symbol);
                         }
                     }
@@ -2429,12 +2489,10 @@ impl ServerHandler for McpServer {
                             let json = serde_json::to_string_pretty(&symbol).unwrap_or_default();
                             CallToolResult::success(vec![Content::text(json)])
                         }
-                        Ok(None) => {
-                            CallToolResult::error(vec![Content::text(format!(
-                                "Symbol not found: {}",
-                                id
-                            ))])
-                        }
+                        Ok(None) => CallToolResult::error(vec![Content::text(format!(
+                            "Symbol not found: {}",
+                            id
+                        ))]),
                         Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
                     }
                 }
@@ -2553,9 +2611,8 @@ impl ServerHandler for McpServer {
                     }
                 }
 
-                let json =
-                    serde_json::to_string_pretty(&serde_json::Value::Object(output.clone()))
-                        .unwrap_or_default();
+                let json = serde_json::to_string_pretty(&serde_json::Value::Object(output.clone()))
+                    .unwrap_or_default();
                 CallToolResult::success(vec![Content::text(json)])
             }
 
@@ -2622,20 +2679,19 @@ impl ServerHandler for McpServer {
                 match self.index.get_file_symbols(&params.file) {
                     Ok(symbols) => {
                         // Filter by line range if specified
-                        let filtered: Vec<_> = if params.start_line.is_some()
-                            || params.end_line.is_some()
-                        {
-                            let start = params.start_line.unwrap_or(0);
-                            let end = params.end_line.unwrap_or(u32::MAX);
-                            symbols
-                                .into_iter()
-                                .filter(|s| {
-                                    s.location.start_line >= start && s.location.end_line <= end
-                                })
-                                .collect()
-                        } else {
-                            symbols
-                        };
+                        let filtered: Vec<_> =
+                            if params.start_line.is_some() || params.end_line.is_some() {
+                                let start = params.start_line.unwrap_or(0);
+                                let end = params.end_line.unwrap_or(u32::MAX);
+                                symbols
+                                    .into_iter()
+                                    .filter(|s| {
+                                        s.location.start_line >= start && s.location.end_line <= end
+                                    })
+                                    .collect()
+                            } else {
+                                symbols
+                            };
 
                         // Include scopes if requested
                         let mut output = serde_json::Map::new();
@@ -2655,55 +2711,90 @@ impl ServerHandler for McpServer {
 
                         // Include file metadata (Intent Layer) if requested
                         if params.include_file_meta.unwrap_or(false) {
-                            if let Ok(Some((meta, tags))) = self.index.get_file_meta_with_tags(&params.file) {
+                            if let Ok(Some((meta, tags))) =
+                                self.index.get_file_meta_with_tags(&params.file)
+                            {
                                 // Build compact file_meta object
                                 let mut file_meta = serde_json::Map::new();
                                 if let Some(ref d1) = meta.doc1 {
-                                    file_meta.insert("doc1".to_string(), serde_json::Value::String(d1.clone()));
+                                    file_meta.insert(
+                                        "doc1".to_string(),
+                                        serde_json::Value::String(d1.clone()),
+                                    );
                                 }
                                 if let Some(ref purpose) = meta.purpose {
-                                    file_meta.insert("purpose".to_string(), serde_json::Value::String(purpose.clone()));
+                                    file_meta.insert(
+                                        "purpose".to_string(),
+                                        serde_json::Value::String(purpose.clone()),
+                                    );
                                 }
                                 if !meta.capabilities.is_empty() {
-                                    file_meta.insert("capabilities".to_string(), serde_json::to_value(&meta.capabilities).unwrap_or_default());
+                                    file_meta.insert(
+                                        "capabilities".to_string(),
+                                        serde_json::to_value(&meta.capabilities)
+                                            .unwrap_or_default(),
+                                    );
                                 }
                                 if !meta.invariants.is_empty() {
-                                    file_meta.insert("invariants".to_string(), serde_json::to_value(&meta.invariants).unwrap_or_default());
+                                    file_meta.insert(
+                                        "invariants".to_string(),
+                                        serde_json::to_value(&meta.invariants).unwrap_or_default(),
+                                    );
                                 }
                                 if let Some(stability) = meta.stability {
-                                    file_meta.insert("stability".to_string(), serde_json::Value::String(stability.as_str().to_string()));
+                                    file_meta.insert(
+                                        "stability".to_string(),
+                                        serde_json::Value::String(stability.as_str().to_string()),
+                                    );
                                 }
                                 if let Some(ref owner) = meta.owner {
-                                    file_meta.insert("owner".to_string(), serde_json::Value::String(owner.clone()));
+                                    file_meta.insert(
+                                        "owner".to_string(),
+                                        serde_json::Value::String(owner.clone()),
+                                    );
                                 }
 
                                 // Add tags as category:name format
-                                let tag_strs: Vec<String> = tags.iter()
+                                let tag_strs: Vec<String> = tags
+                                    .iter()
                                     .filter_map(|t| {
                                         t.tag_category.as_ref().and_then(|cat| {
-                                            t.tag_name.as_ref().map(|name| format!("{}:{}", cat, name))
+                                            t.tag_name
+                                                .as_ref()
+                                                .map(|name| format!("{}:{}", cat, name))
                                         })
                                     })
                                     .collect();
                                 if !tag_strs.is_empty() {
-                                    file_meta.insert("tags".to_string(), serde_json::to_value(&tag_strs).unwrap_or_default());
+                                    file_meta.insert(
+                                        "tags".to_string(),
+                                        serde_json::to_value(&tag_strs).unwrap_or_default(),
+                                    );
                                 }
 
                                 // Add staleness info
                                 if meta.is_stale {
-                                    file_meta.insert("is_stale".to_string(), serde_json::Value::Bool(true));
+                                    file_meta.insert(
+                                        "is_stale".to_string(),
+                                        serde_json::Value::Bool(true),
+                                    );
                                 }
                                 if let Some(ref hash) = meta.exported_hash {
-                                    file_meta.insert("exported_hash".to_string(), serde_json::Value::String(hash.clone()));
+                                    file_meta.insert(
+                                        "exported_hash".to_string(),
+                                        serde_json::Value::String(hash.clone()),
+                                    );
                                 }
 
-                                output.insert("file_meta".to_string(), serde_json::Value::Object(file_meta));
+                                output.insert(
+                                    "file_meta".to_string(),
+                                    serde_json::Value::Object(file_meta),
+                                );
                             }
                         }
 
-                        let json =
-                            serde_json::to_string_pretty(&serde_json::Value::Object(output))
-                                .unwrap_or_default();
+                        let json = serde_json::to_string_pretty(&serde_json::Value::Object(output))
+                            .unwrap_or_default();
                         CallToolResult::success(vec![Content::text(json)])
                     }
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
@@ -2712,9 +2803,9 @@ impl ServerHandler for McpServer {
 
             // === 10. get_imports ===
             "get_imports" => {
-                let params: GetImportsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: GetImportsParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 match self.index.get_file_imports(&params.file) {
@@ -2730,8 +2821,7 @@ impl ServerHandler for McpServer {
                             let mut resolved = Vec::new();
                             for import in &imports {
                                 if let Some(ref symbol_name) = import.imported_symbol {
-                                    if let Ok(definitions) =
-                                        self.index.find_definition(symbol_name)
+                                    if let Ok(definitions) = self.index.find_definition(symbol_name)
                                     {
                                         resolved.push(serde_json::json!({
                                             "import": import,
@@ -2746,9 +2836,8 @@ impl ServerHandler for McpServer {
                             );
                         }
 
-                        let json =
-                            serde_json::to_string_pretty(&serde_json::Value::Object(output))
-                                .unwrap_or_default();
+                        let json = serde_json::to_string_pretty(&serde_json::Value::Object(output))
+                            .unwrap_or_default();
                         CallToolResult::success(vec![Content::text(json)])
                     }
                     Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
@@ -2813,9 +2902,9 @@ impl ServerHandler for McpServer {
 
             // === 12. get_stats ===
             "get_stats" => {
-                let params: GetStatsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: GetStatsParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 match self.index.get_stats() {
@@ -2825,7 +2914,9 @@ impl ServerHandler for McpServer {
                         // Add workspace info if requested
                         if params.include_workspace.unwrap_or(false) {
                             if let Ok(modules) = self.list_modules_impl(".") {
-                                if let Ok(modules_json) = serde_json::from_str::<serde_json::Value>(&modules) {
+                                if let Ok(modules_json) =
+                                    serde_json::from_str::<serde_json::Value>(&modules)
+                                {
                                     if let serde_json::Value::Object(ref mut map) = output {
                                         map.insert("workspace".to_string(), modules_json);
                                     }
@@ -2836,7 +2927,9 @@ impl ServerHandler for McpServer {
                         // Add architecture summary if requested
                         if params.include_architecture.unwrap_or(false) {
                             if let Ok(arch) = self.get_architecture_summary_impl(".") {
-                                if let Ok(arch_json) = serde_json::from_str::<serde_json::Value>(&arch) {
+                                if let Ok(arch_json) =
+                                    serde_json::from_str::<serde_json::Value>(&arch)
+                                {
                                     if let serde_json::Value::Object(ref mut map) = output {
                                         map.insert("architecture".to_string(), arch_json);
                                     }
@@ -2870,7 +2963,6 @@ impl ServerHandler for McpServer {
             // === Legacy tools kept for backward compatibility ===
             // These are handled by the alias mapping above, but we keep explicit handlers
             // for tools that have slightly different parameter structures
-
             "list_dependencies" => {
                 let params: ListDependenciesParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -2886,7 +2978,6 @@ impl ServerHandler for McpServer {
                 }
             }
             // === Additional legacy tools that need explicit handling ===
-
             "get_dependency_source" => {
                 let params: GetDependencySourceParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -2950,9 +3041,9 @@ impl ServerHandler for McpServer {
             }
 
             "list_modules" => {
-                let params: ListModulesParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: ListModulesParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let workspace_path = params.workspace_path.unwrap_or_else(|| ".".to_string());
@@ -3120,9 +3211,9 @@ impl ServerHandler for McpServer {
 
             // === 14. get_snippet ===
             "get_snippet" => {
-                let params: GetSnippetParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: GetSnippetParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let context_lines = params.context_lines.unwrap_or(3);
@@ -3188,8 +3279,9 @@ impl ServerHandler for McpServer {
                         let end_with_context = (base_end + context_lines).min(total_lines);
 
                         // Apply max_lines limit
-                        let actual_end =
-                            (start_with_context + max_lines).min(end_with_context).min(total_lines);
+                        let actual_end = (start_with_context + max_lines)
+                            .min(end_with_context)
+                            .min(total_lines);
 
                         let snippet_lines: Vec<String> = lines[start_with_context..actual_end]
                             .iter()
@@ -3236,69 +3328,78 @@ impl ServerHandler for McpServer {
                 // Try to find the document by path or type
                 let digest = if params.target.contains('/') || params.target.contains('.') {
                     // Target is a file path
-                    self.index.get_doc_digest(&params.target)
+                    self.index
+                        .get_doc_digest(&params.target)
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 } else {
                     // Target is a doc type (readme, contributing, etc.)
-                    let all_docs = self.index.get_all_doc_digests()
+                    let all_docs = self
+                        .index
+                        .get_all_doc_digests()
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                     let target_lower = params.target.to_lowercase();
-                    all_docs.into_iter().find(|d| d.doc_type.as_str() == target_lower)
+                    all_docs
+                        .into_iter()
+                        .find(|d| d.doc_type.as_str() == target_lower)
                 };
 
                 match digest {
                     Some(doc) => {
-                        let available_sections: Vec<String> = doc.headings
-                            .iter()
-                            .map(|h| h.text.clone())
-                            .collect();
+                        let available_sections: Vec<String> =
+                            doc.headings.iter().map(|h| h.text.clone()).collect();
 
-                        let (section_content, code_blocks) = if let Some(ref section_name) = params.section {
-                            // Find and extract the specific section
-                            let file_content = std::fs::read_to_string(&doc.file_path).ok();
-                            let content = file_content.as_ref().and_then(|c| {
-                                code_indexer::docs::DocParser::extract_section(c, section_name)
-                            });
+                        let (section_content, code_blocks) =
+                            if let Some(ref section_name) = params.section {
+                                // Find and extract the specific section
+                                let file_content = std::fs::read_to_string(&doc.file_path).ok();
+                                let content = file_content.as_ref().and_then(|c| {
+                                    code_indexer::docs::DocParser::extract_section(c, section_name)
+                                });
 
-                            let blocks: Vec<DocCodeBlock> = if include_code {
-                                // Find code blocks within the section
-                                doc.command_blocks.iter()
-                                    .filter(|b| {
-                                        // Check if block is within the section
-                                        let section = doc.key_sections.iter()
-                                            .find(|s| s.heading.to_lowercase().contains(&section_name.to_lowercase()));
-                                        if let Some(s) = section {
-                                            b.line >= s.start_line && b.line < s.end_line
-                                        } else {
-                                            false
-                                        }
-                                    })
-                                    .map(|b| DocCodeBlock {
-                                        language: b.language.clone(),
-                                        content: b.content.clone(),
-                                        line: b.line,
-                                    })
-                                    .collect()
+                                let blocks: Vec<DocCodeBlock> = if include_code {
+                                    // Find code blocks within the section
+                                    doc.command_blocks
+                                        .iter()
+                                        .filter(|b| {
+                                            // Check if block is within the section
+                                            let section = doc.key_sections.iter().find(|s| {
+                                                s.heading
+                                                    .to_lowercase()
+                                                    .contains(&section_name.to_lowercase())
+                                            });
+                                            if let Some(s) = section {
+                                                b.line >= s.start_line && b.line < s.end_line
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .map(|b| DocCodeBlock {
+                                            language: b.language.clone(),
+                                            content: b.content.clone(),
+                                            line: b.line,
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+
+                                (content, blocks)
                             } else {
-                                Vec::new()
+                                // Return all command blocks if no section specified
+                                let blocks: Vec<DocCodeBlock> = if include_code {
+                                    doc.command_blocks
+                                        .iter()
+                                        .map(|b| DocCodeBlock {
+                                            language: b.language.clone(),
+                                            content: b.content.clone(),
+                                            line: b.line,
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                (None, blocks)
                             };
-
-                            (content, blocks)
-                        } else {
-                            // Return all command blocks if no section specified
-                            let blocks: Vec<DocCodeBlock> = if include_code {
-                                doc.command_blocks.iter()
-                                    .map(|b| DocCodeBlock {
-                                        language: b.language.clone(),
-                                        content: b.content.clone(),
-                                        line: b.line,
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            (None, blocks)
-                        };
 
                         let response = DocSectionResponse {
                             file_path: doc.file_path,
@@ -3315,9 +3416,12 @@ impl ServerHandler for McpServer {
                     }
                     None => {
                         // List available documentation files
-                        let all_docs = self.index.get_all_doc_digests()
+                        let all_docs = self
+                            .index
+                            .get_all_doc_digests()
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        let available: Vec<String> = all_docs.iter()
+                        let available: Vec<String> = all_docs
+                            .iter()
                             .map(|d| format!("{} ({})", d.file_path, d.doc_type.as_str()))
                             .collect();
 
@@ -3383,44 +3487,53 @@ impl ServerHandler for McpServer {
                 let db_rev = self.index.get_db_revision().unwrap_or(0);
 
                 // Build or get project profile
-                let (profile, profile_rev) = match code_indexer::compass::ProfileBuilder::build(self.index.as_ref()) {
-                    Ok(p) => {
-                        // Save to database for caching
-                        let _ = self.index.save_project_profile(".", &p);
-                        (p, db_rev)
-                    }
-                    Err(_) => {
-                        // Try to get cached profile
-                        match self.index.get_project_profile(".") {
-                            Ok(Some((p, rev))) => (p, rev),
-                            _ => {
-                                return Ok(CallToolResult::error(vec![Content::text(
-                                    "Failed to build project profile".to_string(),
-                                )]));
+                let (profile, profile_rev) =
+                    match code_indexer::compass::ProfileBuilder::build(self.index.as_ref()) {
+                        Ok(p) => {
+                            // Save to database for caching
+                            let _ = self.index.save_project_profile(".", &p);
+                            (p, db_rev)
+                        }
+                        Err(_) => {
+                            // Try to get cached profile
+                            match self.index.get_project_profile(".") {
+                                Ok(Some((p, rev))) => (p, rev),
+                                _ => {
+                                    return Ok(CallToolResult::error(vec![Content::text(
+                                        "Failed to build project profile".to_string(),
+                                    )]));
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
                 // Convert profile to compass format
                 let compass_profile = CompassProfile {
-                    languages: profile.languages.iter().map(|l| CompassLanguage {
-                        name: l.name.clone(),
-                        files: l.file_count,
-                        symbols: l.symbol_count,
-                        pct: l.percentage,
-                    }).collect(),
+                    languages: profile
+                        .languages
+                        .iter()
+                        .map(|l| CompassLanguage {
+                            name: l.name.clone(),
+                            files: l.file_count,
+                            symbols: l.symbol_count,
+                            pct: l.percentage,
+                        })
+                        .collect(),
                     frameworks: profile.frameworks.iter().map(|f| f.name.clone()).collect(),
                     build_tools: profile.build_tools.clone(),
                     workspace_type: profile.workspace_type.clone(),
                 };
 
                 // Get commands
-                let commands = self.index.get_project_commands().ok().map(|c| CompassCommands {
-                    run: c.run,
-                    build: c.build,
-                    test: c.test,
-                });
+                let commands = self
+                    .index
+                    .get_project_commands()
+                    .ok()
+                    .map(|c| CompassCommands {
+                        run: c.run,
+                        build: c.build,
+                        test: c.test,
+                    });
 
                 // Get entry points
                 let entry_points = if include_entry_points {
@@ -3466,17 +3579,23 @@ impl ServerHandler for McpServer {
                 let docs = if include_docs {
                     let all_docs = self.index.get_all_doc_digests().unwrap_or_default();
 
-                    let readme_headings = all_docs.iter()
+                    let readme_headings = all_docs
+                        .iter()
                         .find(|d| d.doc_type == code_indexer::docs::DocType::Readme)
-                        .map(|d| d.headings.iter()
-                            .filter(|h| h.level <= 2)
-                            .map(|h| h.text.clone())
-                            .collect::<Vec<_>>())
+                        .map(|d| {
+                            d.headings
+                                .iter()
+                                .filter(|h| h.level <= 2)
+                                .map(|h| h.text.clone())
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default();
 
-                    let has_contributing = all_docs.iter()
+                    let has_contributing = all_docs
+                        .iter()
                         .any(|d| d.doc_type == code_indexer::docs::DocType::Contributing);
-                    let has_changelog = all_docs.iter()
+                    let has_changelog = all_docs
+                        .iter()
                         .any(|d| d.doc_type == code_indexer::docs::DocType::Changelog);
 
                     Some(CompassDocs {
@@ -3531,7 +3650,8 @@ impl ServerHandler for McpServer {
                 let mut final_response = response;
                 final_response.meta.budget.actual_bytes = actual_bytes;
 
-                let final_output = serde_json::to_string_pretty(&final_response).unwrap_or_default();
+                let final_output =
+                    serde_json::to_string_pretty(&final_response).unwrap_or_default();
 
                 CallToolResult::success(vec![Content::text(final_output)])
             }
@@ -3560,7 +3680,9 @@ impl ServerHandler for McpServer {
                 };
 
                 // Get children
-                let children: Vec<CompassModuleNode> = self.index.get_node_children(&params.node_id)
+                let children: Vec<CompassModuleNode> = self
+                    .index
+                    .get_node_children(&params.node_id)
                     .unwrap_or_default()
                     .into_iter()
                     .take(limit)
@@ -3577,11 +3699,15 @@ impl ServerHandler for McpServer {
                 // Get files in this node's path
                 let top_files: Vec<NodeFileInfo> = if let Ok(stats) = self.index.get_stats() {
                     // Create file info from languages found in this node
-                    stats.files_by_language.iter()
+                    stats
+                        .files_by_language
+                        .iter()
                         .filter(|(_, count)| *count > 0)
                         .take(limit)
                         .map(|(lang, _)| {
-                            let symbol_count = stats.symbols_by_language.iter()
+                            let symbol_count = stats
+                                .symbols_by_language
+                                .iter()
                                 .find(|(l, _)| l == lang)
                                 .map(|(_, c)| *c)
                                 .unwrap_or(0);
@@ -3607,7 +3733,8 @@ impl ServerHandler for McpServer {
                     let functions = self.index.list_functions(&sym_options).unwrap_or_default();
                     let types = self.index.list_types(&sym_options).unwrap_or_default();
 
-                    functions.into_iter()
+                    functions
+                        .into_iter()
                         .chain(types.into_iter())
                         .take(limit)
                         .enumerate()
@@ -3727,13 +3854,20 @@ impl ServerHandler for McpServer {
 
                 // 4. Search commands (max 1)
                 if let Ok(commands) = self.index.get_project_commands() {
-                    for cmd in commands.run.iter()
+                    for cmd in commands
+                        .run
+                        .iter()
                         .chain(commands.build.iter())
                         .chain(commands.test.iter())
                     {
                         if cmd.to_lowercase().contains(&query_lower) {
                             total_matches += 1;
-                            if results.iter().filter(|r| r.result_type == "command").count() < 1 {
+                            if results
+                                .iter()
+                                .filter(|r| r.result_type == "command")
+                                .count()
+                                < 1
+                            {
                                 results.push(CompassResult {
                                     result_type: "command".to_string(),
                                     name: cmd.clone(),
@@ -3750,7 +3884,11 @@ impl ServerHandler for McpServer {
                 }
 
                 // Sort by score and limit
-                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                results.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 results.truncate(limit);
 
                 let response = CompassQueryResponse {
@@ -3765,12 +3903,14 @@ impl ServerHandler for McpServer {
             }
 
             "open_session" => {
-                let params: OpenSessionParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: OpenSessionParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let session = self.session_manager.open_session(params.restore_session.as_deref());
+                let session = self
+                    .session_manager
+                    .open_session(params.restore_session.as_deref());
                 let restored = params.restore_session.is_some();
 
                 let delta = session.get_dict();
@@ -3791,9 +3931,9 @@ impl ServerHandler for McpServer {
             }
 
             "close_session" => {
-                let params: CloseSessionParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: CloseSessionParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let closed = self.session_manager.close_session(&params.session_id);
@@ -3806,9 +3946,9 @@ impl ServerHandler for McpServer {
             }
 
             "manage_tags" => {
-                let params: ManageTagsParams = serde_json::from_value(
-                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
-                )
+                let params: ManageTagsParams = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let response = self.handle_manage_tags(params)?;

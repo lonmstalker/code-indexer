@@ -5,10 +5,10 @@
 
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{IndexerError, Result};
 
 /// Current schema version. Increment when adding new migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Migration function type.
 type MigrationFn = fn(&Connection) -> Result<()>;
@@ -22,6 +22,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migration_v5_content_hash,
     migration_v6_file_tags_intent,
     migration_v7_p2_fields,
+    migration_v8_definition_lookup_index,
 ];
 
 /// Runs all pending migrations on the database.
@@ -80,6 +81,11 @@ fn get_schema_version(conn: &Connection) -> Result<u32> {
 /// Detects schema version by checking which columns exist.
 /// Used for backward compatibility with databases created before versioning.
 fn detect_version_from_schema(conn: &Connection) -> Result<u32> {
+    // Check for definition lookup index (v8)
+    if index_exists(conn, "idx_symbols_def_lookup")? {
+        return Ok(8);
+    }
+
     // Check for generic_params_json column (v7)
     if column_exists(conn, "symbols", "generic_params_json")? {
         return Ok(7);
@@ -151,6 +157,44 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+/// Checks if an index exists.
+fn index_exists(conn: &Connection, index: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+        [index],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Verifies that database schema version is compatible for read-only query operations.
+/// Query paths do not run migrations and should fail fast on mismatched schema.
+pub fn verify_schema_compatibility(conn: &Connection) -> Result<()> {
+    let current = get_schema_version(conn)?;
+
+    if current == 0 {
+        return Err(IndexerError::Index(
+            "Index database is not initialized. Run `code-indexer index` first.".to_string(),
+        ));
+    }
+
+    if current > CURRENT_SCHEMA_VERSION {
+        return Err(IndexerError::Index(format!(
+            "Index schema version {} is newer than this binary ({}). Please upgrade code-indexer.",
+            current, CURRENT_SCHEMA_VERSION
+        )));
+    }
+
+    if current < CURRENT_SCHEMA_VERSION {
+        return Err(IndexerError::Index(format!(
+            "Index schema version {} is outdated (expected {}). Run `code-indexer index` to migrate.",
+            current, CURRENT_SCHEMA_VERSION
+        )));
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -623,6 +667,15 @@ fn migration_v7_p2_fields(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// V8: Add composite index optimized for definition lookups.
+fn migration_v8_definition_lookup_index(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_def_lookup ON symbols(name, file_path, start_line)",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,5 +829,19 @@ mod tests {
             .unwrap();
         assert!(generic_params.contains("\"name\":\"T\""));
         assert!(generic_params.contains("\"name\":\"E\""));
+    }
+
+    #[test]
+    fn test_verify_schema_compatibility() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        verify_schema_compatibility(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE meta SET value = '7' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        assert!(verify_schema_compatibility(&conn).is_err());
     }
 }

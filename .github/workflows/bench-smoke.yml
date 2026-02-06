@@ -1,0 +1,68 @@
+name: bench-smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'benches/**'
+      - '.github/workflows/bench-smoke.yml'
+      - 'README.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+  push:
+    branches: [ main ]
+    paths:
+      - 'benches/**'
+      - '.github/workflows/bench-smoke.yml'
+      - 'README.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+
+jobs:
+  speed-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Download pinned benchmark repos (smoke set)
+        run: ./benches/download_repos.sh --repos ripgrep,tokio
+
+      - name: Run honest speed smoke benchmark
+        run: |
+          python3 benches/speed/run_speed_bench.py \
+            --repos ripgrep,tokio \
+            --mode both \
+            --runs 5 \
+            --warmup 2 \
+            --out-json benches/results/speed/ci-smoke.json \
+            --out-md benches/results/speed/ci-smoke.md \
+            --require-valid
+
+      - name: Validate JSON contract
+        run: |
+          jq -e '
+            .meta
+            and .cases
+            and .results
+            and .summary
+            and ([.results[] | has("counts") and has("timings") and has("speedup") and has("validity")] | all)
+          ' benches/results/speed/ci-smoke.json > /dev/null
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: speed-bench-smoke
+          path: |
+            benches/results/speed/ci-smoke.json
+            benches/results/speed/ci-smoke.md

@@ -1,23 +1,23 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 
-use code_indexer::dependencies::{DependencyRegistry, ProjectInfo};
-use code_indexer::git::GitAnalyzer;
 use crate::error::Result;
 use crate::index::sqlite::SqliteIndex;
-use crate::index::{CodeIndex, SearchOptions, OutputFormat, CompactSymbol, FileMeta, MetaSource};
+use crate::index::{CodeIndex, CompactSymbol, FileMeta, MetaSource, OutputFormat, SearchOptions};
 use crate::indexer::watcher::FileEvent;
 use crate::indexer::{
-    FileWalker, FileWatcher, Parser as CodeParser, SymbolExtractor,
-    parse_sidecar, extract_file_meta, extract_file_tags, resolve_tags,
-    compute_exported_hash, SIDECAR_FILENAME,
+    compute_exported_hash, extract_file_meta, extract_file_tags, parse_sidecar, resolve_tags,
+    FileWalker, FileWatcher, ParseCache, Parser as CodeParser, SymbolExtractor, SIDECAR_FILENAME,
 };
 use crate::languages::LanguageRegistry;
+use code_indexer::dependencies::{DependencyRegistry, ProjectInfo};
+use code_indexer::git::GitAnalyzer;
 
 #[derive(Parser)]
 #[command(name = "code-indexer")]
@@ -58,6 +58,18 @@ pub struct Cli {
     pub db: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ServeTransport {
+    Stdio,
+    Unix,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum IndexDurability {
+    Safe,
+    Fast,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Index a directory
@@ -73,10 +85,22 @@ pub enum Commands {
         /// Also index dependencies (deep indexing)
         #[arg(long)]
         deep_deps: bool,
+
+        /// Durability profile for bulk index write path
+        #[arg(long, value_enum, default_value = "fast")]
+        durability: IndexDurability,
     },
 
     /// Start MCP server
-    Serve,
+    Serve {
+        /// Transport for MCP server
+        #[arg(long, value_enum, default_value = "stdio")]
+        transport: ServeTransport,
+
+        /// Unix socket path (required when --transport unix)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 
     /// Search and list symbols (replaces query search/functions/types)
     Symbols {
@@ -114,6 +138,10 @@ pub enum Commands {
         /// Fuzzy search threshold (0.0-1.0)
         #[arg(long, default_value = "0.7")]
         fuzzy_threshold: f64,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Find symbol definitions
@@ -128,6 +156,10 @@ pub enum Commands {
         /// Filter by specific dependency
         #[arg(long)]
         dep: Option<String>,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Find symbol references (replaces find_references + find_callers)
@@ -150,6 +182,10 @@ pub enum Commands {
         /// Maximum number of results
         #[arg(long, default_value = "50")]
         limit: usize,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Analyze call graph (replaces get_call_graph + find_callees)
@@ -168,6 +204,10 @@ pub enum Commands {
         /// Include possible (uncertain) calls
         #[arg(long)]
         include_possible: bool,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Get file outline/structure
@@ -186,6 +226,10 @@ pub enum Commands {
         /// Include scopes
         #[arg(long)]
         scopes: bool,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Get file imports
@@ -196,6 +240,10 @@ pub enum Commands {
         /// Resolve imports to their definitions
         #[arg(long)]
         resolve: bool,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Show changed symbols (git diff)
@@ -218,7 +266,11 @@ pub enum Commands {
     },
 
     /// Show index statistics
-    Stats,
+    Stats {
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
+    },
 
     /// Clear the index
     Clear,
@@ -261,9 +313,7 @@ pub enum QueryCommands {
     },
 
     /// Find symbol definition (deprecated: use 'definition' command)
-    Definition {
-        name: String,
-    },
+    Definition { name: String },
 
     /// List functions (deprecated: use 'symbols --kind function')
     Functions {
@@ -448,7 +498,12 @@ pub enum TagsCommands {
     },
 }
 
-pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
+pub fn index_directory(
+    path: &Path,
+    db_path: &Path,
+    watch: bool,
+    durability: IndexDurability,
+) -> Result<()> {
     use code_indexer::indexer::ExtractionResult;
 
     // If db_path is the default value, place the database inside the indexed directory
@@ -461,6 +516,11 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     let registry = LanguageRegistry::new();
     let walker = FileWalker::new(registry);
     let index = SqliteIndex::new(&effective_db)?;
+    let use_fast_bulk = durability == IndexDurability::Fast && !watch;
+
+    if durability == IndexDurability::Fast && watch {
+        eprintln!("--durability fast is ignored in watch mode; using safe durability for updates.");
+    }
 
     let files = walker.walk(path)?;
 
@@ -487,36 +547,50 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     // Parallel parsing and extraction using rayon
     let progress_ref = &progress;
     let pb_ref = &pb;
+    let total_files = files.len();
+    let files_done = AtomicUsize::new(0);
+    let progress_batch_size = 32usize;
     let results: Vec<ExtractionResult> = files
         .par_iter()
-        .filter_map(|file| {
-            // Each thread gets its own parser and extractor
-            let registry = LanguageRegistry::new();
-            let parser = CodeParser::new(registry);
-            let extractor = SymbolExtractor::new();
-
-            match parser.parse_file(file) {
+        .map_init(
+            || {
+                (
+                    CodeParser::new(LanguageRegistry::new()),
+                    SymbolExtractor::new(),
+                )
+            },
+            |(parser, extractor), file| match parser.parse_file(file) {
                 Ok(parsed) => match extractor.extract_all(&parsed, file) {
                     Ok(result) => {
                         progress_ref.inc(result.symbols.len());
-                        pb_ref.inc(1);
+                        let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if completed % progress_batch_size == 0 || completed == total_files {
+                            pb_ref.set_position(completed as u64);
+                        }
                         Some(result)
                     }
                     Err(e) => {
                         eprintln!("Error extracting symbols from {}: {}", file.display(), e);
                         progress_ref.inc_error();
-                        pb_ref.inc(1);
+                        let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if completed % progress_batch_size == 0 || completed == total_files {
+                            pb_ref.set_position(completed as u64);
+                        }
                         None
                     }
                 },
                 Err(e) => {
                     eprintln!("Error parsing {}: {}", file.display(), e);
                     progress_ref.inc_error();
-                    pb_ref.inc(1);
+                    let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if completed % progress_batch_size == 0 || completed == total_files {
+                        pb_ref.set_position(completed as u64);
+                    }
                     None
                 }
-            }
-        })
+            },
+        )
+        .filter_map(|r| r)
         .collect();
 
     // === Phase 2: Compute exported_hash for staleness detection ===
@@ -524,7 +598,8 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     update_exported_hashes(&results, &sidecar_meta, &index)?;
 
     // Batch insert all results
-    let total_symbols = index.add_extraction_results_batch(results)?;
+    let total_symbols =
+        index.add_extraction_results_batch_with_durability(results, use_fast_bulk)?;
 
     pb.finish_with_message(format!(
         "{} symbols from {} files",
@@ -534,7 +609,10 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     progress.finish();
 
     if !sidecar_meta.is_empty() {
-        println!("Processed {} files with sidecar metadata", sidecar_meta.len());
+        println!(
+            "Processed {} files with sidecar metadata",
+            sidecar_meta.len()
+        );
     }
 
     if watch {
@@ -542,6 +620,7 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
         let watcher = FileWatcher::new(path)?;
         let walker = FileWalker::new(LanguageRegistry::new());
         let parser = CodeParser::new(LanguageRegistry::new());
+        let parse_cache = ParseCache::new();
         let extractor = SymbolExtractor::new();
 
         loop {
@@ -550,8 +629,13 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
                     match event {
                         FileEvent::Modified(file_path) | FileEvent::Created(file_path) => {
                             // Handle sidecar file changes
-                            if file_path.file_name().map_or(false, |n| n == SIDECAR_FILENAME) {
-                                if let Err(e) = handle_sidecar_change(&file_path, path, &index, &walker) {
+                            if file_path
+                                .file_name()
+                                .map_or(false, |n| n == SIDECAR_FILENAME)
+                            {
+                                if let Err(e) =
+                                    handle_sidecar_change(&file_path, path, &index, &walker)
+                                {
                                     eprintln!("Error processing sidecar change: {}", e);
                                 }
                                 continue;
@@ -560,23 +644,38 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
                             // Handle source file changes
                             if walker.is_supported(&file_path) {
                                 index.remove_file(&file_path.to_string_lossy())?;
-                                if let Ok(parsed) = parser.parse_file(&file_path) {
+                                if let Ok(parsed) = parse_cache.parse_file(&file_path, &parser) {
                                     if let Ok(result) = extractor.extract_all(&parsed, &file_path) {
                                         let count = result.symbols.len();
                                         index.add_extraction_results_batch(vec![result])?;
 
                                         // Re-apply sidecar metadata for this file
-                                        if let Err(e) = update_file_sidecar_meta(&file_path, path, &index) {
-                                            eprintln!("Warning: Could not update sidecar metadata: {}", e);
+                                        if let Err(e) =
+                                            update_file_sidecar_meta(&file_path, path, &index)
+                                        {
+                                            eprintln!(
+                                                "Warning: Could not update sidecar metadata: {}",
+                                                e
+                                            );
                                         }
 
-                                        println!("Updated {}: {} symbols", file_path.display(), count);
+                                        println!(
+                                            "Updated {}: {} symbols",
+                                            file_path.display(),
+                                            count
+                                        );
                                     }
+                                } else {
+                                    parse_cache.invalidate(&file_path);
                                 }
                             }
                         }
                         FileEvent::Deleted(file_path) => {
-                            if file_path.file_name().map_or(false, |n| n == SIDECAR_FILENAME) {
+                            parse_cache.invalidate(&file_path);
+                            if file_path
+                                .file_name()
+                                .map_or(false, |n| n == SIDECAR_FILENAME)
+                            {
                                 // Sidecar deleted - remove metadata for files in that directory
                                 if let Some(dir) = file_path.parent() {
                                     println!("Sidecar deleted in {}", dir.display());
@@ -596,19 +695,158 @@ pub fn index_directory(path: &Path, db_path: &Path, watch: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_mcp_server(db_path: &Path) -> Result<()> {
+pub async fn run_mcp_server(
+    db_path: &Path,
+    transport: ServeTransport,
+    socket: Option<&Path>,
+) -> Result<()> {
     use crate::mcp::McpServer;
     use rmcp::ServiceExt;
 
     let index = Arc::new(SqliteIndex::new(db_path)?);
-    let server = McpServer::new(index);
 
-    let transport = (tokio::io::stdin(), tokio::io::stdout());
-    server.serve(transport).await.map_err(|e| {
-        crate::error::IndexerError::Mcp(e.to_string())
-    })?;
+    match transport {
+        ServeTransport::Stdio => {
+            let server = McpServer::new(index);
+            let io_transport = (tokio::io::stdin(), tokio::io::stdout());
+            let running = server
+                .serve(io_transport)
+                .await
+                .map_err(|e| crate::error::IndexerError::Mcp(e.to_string()))?;
+            running
+                .waiting()
+                .await
+                .map_err(|e| crate::error::IndexerError::Mcp(e.to_string()))?;
+            Ok(())
+        }
+        ServeTransport::Unix => {
+            let socket_path = socket.ok_or_else(|| {
+                crate::error::IndexerError::Mcp(
+                    "--socket is required when --transport unix".to_string(),
+                )
+            })?;
 
-    Ok(())
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(socket_path);
+            }
+
+            let listener = tokio::net::UnixListener::bind(socket_path).map_err(|e| {
+                crate::error::IndexerError::Mcp(format!(
+                    "Failed to bind unix socket {}: {}",
+                    socket_path.display(),
+                    e
+                ))
+            })?;
+
+            println!(
+                "MCP daemon listening on unix socket {}",
+                socket_path.display()
+            );
+
+            loop {
+                let (stream, _) = listener.accept().await.map_err(|e| {
+                    crate::error::IndexerError::Mcp(format!("Unix accept failed: {}", e))
+                })?;
+                let server = McpServer::new(index.clone());
+                tokio::spawn(async move {
+                    use rmcp::ServiceExt;
+                    match server.serve(stream).await {
+                        Ok(running) => {
+                            let _ = running.waiting().await;
+                        }
+                        Err(e) => {
+                            eprintln!("MCP unix client session failed: {}", e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn open_query_index(db_path: &Path) -> Result<SqliteIndex> {
+    SqliteIndex::new_read_only(db_path)
+}
+
+fn tool_result_text(result: rmcp::model::CallToolResult) -> Result<String> {
+    let rmcp::model::CallToolResult {
+        content,
+        structured_content,
+        is_error,
+        ..
+    } = result;
+
+    let mut chunks = Vec::new();
+    for content in content {
+        if let Some(text) = content.raw.as_text() {
+            chunks.push(text.text.clone());
+        } else if let Some(resource) = content.raw.as_resource() {
+            if let rmcp::model::ResourceContents::TextResourceContents { text, .. } =
+                &resource.resource
+            {
+                chunks.push(text.clone());
+            }
+        }
+    }
+
+    let fallback = structured_content
+        .as_ref()
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+        .unwrap_or_default();
+
+    let text = if chunks.is_empty() {
+        fallback
+    } else {
+        chunks.join("\n")
+    };
+
+    if is_error.unwrap_or(false) {
+        return Err(crate::error::IndexerError::Mcp(if text.is_empty() {
+            "Remote MCP tool returned an error".to_string()
+        } else {
+            text
+        }));
+    }
+
+    Ok(text)
+}
+
+async fn call_remote_tool(
+    socket_path: &Path,
+    tool_name: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    use rmcp::ServiceExt;
+
+    let stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| {
+            crate::error::IndexerError::Mcp(format!(
+                "Failed to connect remote daemon {}: {}",
+                socket_path.display(),
+                e
+            ))
+        })?;
+
+    let mut client = ()
+        .serve(stream)
+        .await
+        .map_err(|e| crate::error::IndexerError::Mcp(e.to_string()))?;
+
+    let result = client
+        .peer()
+        .call_tool(rmcp::model::CallToolRequestParams {
+            name: tool_name.to_string().into(),
+            arguments: Some(arguments),
+            meta: None,
+            task: None,
+        })
+        .await
+        .map_err(|e| crate::error::IndexerError::Mcp(e.to_string()))?;
+
+    let output = tool_result_text(result);
+    let _ = client.close().await;
+    output
 }
 
 pub fn search_symbols(
@@ -619,7 +857,7 @@ pub fn search_symbols(
     fuzzy: bool,
     fuzzy_threshold: f64,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    let index = open_query_index(db_path)?;
     let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
     let options = SearchOptions {
         limit: Some(limit),
@@ -674,8 +912,40 @@ pub fn search_symbols(
     Ok(())
 }
 
-pub fn find_definition(db_path: &Path, name: &str) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+pub async fn find_definition(
+    db_path: &Path,
+    name: &str,
+    include_deps: bool,
+    dep: Option<String>,
+    remote: Option<&Path>,
+) -> Result<()> {
+    if let Some(socket) = remote {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        if include_deps {
+            args.insert("include_deps".to_string(), serde_json::Value::Bool(true));
+        }
+        if let Some(dep_name) = dep {
+            args.insert(
+                "dependency".to_string(),
+                serde_json::Value::String(dep_name),
+            );
+        }
+        let output = call_remote_tool(socket, "find_definitions", args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    if include_deps {
+        return find_in_dependencies(db_path, name, dep, 20);
+    }
+
+    let index = open_query_index(db_path)?;
     let symbols = index.find_definition(name)?;
 
     if symbols.is_empty() {
@@ -706,7 +976,7 @@ pub fn list_functions(
     pattern: Option<String>,
     format: &str,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    let index = open_query_index(db_path)?;
     let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
     let options = SearchOptions {
         limit: Some(limit),
@@ -762,7 +1032,7 @@ pub fn list_types(
     pattern: Option<String>,
     format: &str,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    let index = open_query_index(db_path)?;
     let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
     let options = SearchOptions {
         limit: Some(limit),
@@ -810,8 +1080,16 @@ pub fn list_types(
     Ok(())
 }
 
-pub fn show_stats(db_path: &Path) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+pub async fn show_stats(db_path: &Path, remote: Option<&Path>) -> Result<()> {
+    if let Some(socket) = remote {
+        let output = call_remote_tool(socket, "get_stats", serde_json::Map::new()).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    let index = open_query_index(db_path)?;
     let stats = index.get_stats()?;
 
     println!("Index Statistics:");
@@ -843,7 +1121,7 @@ pub fn show_stats(db_path: &Path) -> Result<()> {
 }
 
 pub fn clear_index(db_path: &Path) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    let index = open_query_index(db_path)?;
     index.clear()?;
     println!("Index cleared");
     Ok(())
@@ -852,7 +1130,7 @@ pub fn clear_index(db_path: &Path) -> Result<()> {
 // === New consolidated commands ===
 
 /// Unified symbols command (replaces search, list_functions, list_types)
-pub fn symbols(
+pub async fn symbols(
     db_path: &Path,
     query: Option<String>,
     kind: &str,
@@ -863,8 +1141,52 @@ pub fn symbols(
     format: &str,
     fuzzy: bool,
     fuzzy_threshold: f64,
+    remote: Option<&Path>,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    if let Some(socket) = remote {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+        args.insert("limit".to_string(), serde_json::Value::from(limit));
+        args.insert(
+            "format".to_string(),
+            serde_json::Value::String(format.to_string()),
+        );
+        if let Some(lang) = language {
+            args.insert("language".to_string(), serde_json::Value::String(lang));
+        }
+        if let Some(file_filter) = file {
+            args.insert("file".to_string(), serde_json::Value::String(file_filter));
+        }
+        if let Some(name_pattern) = pattern {
+            args.insert(
+                "pattern".to_string(),
+                serde_json::Value::String(name_pattern),
+            );
+        }
+
+        let (tool_name, final_args) = if let Some(q) = query {
+            args.insert("query".to_string(), serde_json::Value::String(q));
+            args.insert("fuzzy".to_string(), serde_json::Value::Bool(fuzzy));
+            args.insert(
+                "fuzzy_threshold".to_string(),
+                serde_json::Value::from(fuzzy_threshold),
+            );
+            ("search_symbols", args)
+        } else {
+            ("list_symbols", args)
+        };
+
+        let output = call_remote_tool(socket, tool_name, final_args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    let index = open_query_index(db_path)?;
     let output_format = OutputFormat::from_str(format).unwrap_or(OutputFormat::Full);
 
     // If query is provided, search; otherwise list
@@ -939,15 +1261,38 @@ pub fn symbols(
 }
 
 /// Find references command
-pub fn find_references(
+pub async fn find_references(
     db_path: &Path,
     name: &str,
     include_callers: bool,
     depth: u32,
     file: Option<String>,
     limit: usize,
+    remote: Option<&Path>,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    if let Some(socket) = remote {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        args.insert(
+            "include_callers".to_string(),
+            serde_json::Value::Bool(include_callers),
+        );
+        args.insert("depth".to_string(), serde_json::Value::from(depth));
+        args.insert("limit".to_string(), serde_json::Value::from(limit));
+        if let Some(file_filter) = file {
+            args.insert("file".to_string(), serde_json::Value::String(file_filter));
+        }
+        let output = call_remote_tool(socket, "find_references", args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    let index = open_query_index(db_path)?;
 
     let options = SearchOptions {
         limit: Some(limit),
@@ -979,10 +1324,7 @@ pub fn find_references(
                     println!("  No callers found");
                 } else {
                     for c in callers {
-                        println!(
-                            "  {} at {}:{}",
-                            c.symbol_name, c.file_path, c.line
-                        );
+                        println!("  {} at {}:{}", c.symbol_name, c.file_path, c.line);
                     }
                 }
             }
@@ -994,16 +1336,42 @@ pub fn find_references(
 }
 
 /// Call graph analysis command
-pub fn analyze_call_graph(
+pub async fn analyze_call_graph(
     db_path: &Path,
     function: &str,
     direction: &str,
     depth: u32,
-    _include_possible: bool,
+    include_possible: bool,
+    remote: Option<&Path>,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    if let Some(socket) = remote {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "function".to_string(),
+            serde_json::Value::String(function.to_string()),
+        );
+        args.insert(
+            "direction".to_string(),
+            serde_json::Value::String(direction.to_string()),
+        );
+        args.insert("depth".to_string(), serde_json::Value::from(depth));
+        args.insert(
+            "include_possible".to_string(),
+            serde_json::Value::Bool(include_possible),
+        );
+        let output = call_remote_tool(socket, "analyze_call_graph", args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
 
-    println!("Call graph for '{}' (direction: {}, depth: {}):", function, direction, depth);
+    let index = open_query_index(db_path)?;
+
+    println!(
+        "Call graph for '{}' (direction: {}, depth: {}):",
+        function, direction, depth
+    );
 
     // Outgoing calls (callees)
     if direction == "out" || direction == "both" {
@@ -1050,14 +1418,38 @@ pub fn analyze_call_graph(
 }
 
 /// Get file outline command
-pub fn get_outline(
+pub async fn get_outline(
     db_path: &Path,
     file: &Path,
     start_line: Option<u32>,
     end_line: Option<u32>,
     include_scopes: bool,
+    remote: Option<&Path>,
 ) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+    if let Some(socket) = remote {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file".to_string(),
+            serde_json::Value::String(file.to_string_lossy().to_string()),
+        );
+        if let Some(start) = start_line {
+            args.insert("start_line".to_string(), serde_json::Value::from(start));
+        }
+        if let Some(end) = end_line {
+            args.insert("end_line".to_string(), serde_json::Value::from(end));
+        }
+        args.insert(
+            "include_scopes".to_string(),
+            serde_json::Value::Bool(include_scopes),
+        );
+        let output = call_remote_tool(socket, "get_file_outline", args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    let index = open_query_index(db_path)?;
     let file_path = file.to_string_lossy();
 
     let symbols = index.get_file_symbols(&file_path)?;
@@ -1080,7 +1472,11 @@ pub fn get_outline(
         println!("  No symbols found");
     } else {
         for symbol in &filtered {
-            let indent = if symbol.parent.is_some() { "    " } else { "  " };
+            let indent = if symbol.parent.is_some() {
+                "    "
+            } else {
+                "  "
+            };
             println!(
                 "{}{} ({}) - lines {}-{}",
                 indent,
@@ -1120,8 +1516,27 @@ pub fn get_outline(
 }
 
 /// Get file imports command
-pub fn get_imports(db_path: &Path, file: &Path, resolve: bool) -> Result<()> {
-    let index = SqliteIndex::new(db_path)?;
+pub async fn get_imports(
+    db_path: &Path,
+    file: &Path,
+    resolve: bool,
+    remote: Option<&Path>,
+) -> Result<()> {
+    if let Some(socket) = remote {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file".to_string(),
+            serde_json::Value::String(file.to_string_lossy().to_string()),
+        );
+        args.insert("resolve".to_string(), serde_json::Value::Bool(resolve));
+        let output = call_remote_tool(socket, "get_imports", args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    let index = open_query_index(db_path)?;
     let file_path = file.to_string_lossy();
 
     let imports = index.get_file_imports(&file_path)?;
@@ -1246,11 +1661,7 @@ pub fn list_dependencies(
         let output = serde_json::to_string_pretty(&project.dependencies).unwrap_or_default();
         println!("{}", output);
     } else {
-        println!(
-            "Project: {} ({})",
-            project.name,
-            project.ecosystem.as_str()
-        );
+        println!("Project: {} ({})", project.name, project.ecosystem.as_str());
         if let Some(ref version) = project.version {
             println!("Version: {}", version);
         }
@@ -1524,10 +1935,7 @@ pub fn show_dependency_info(path: &Path, db_path: &Path, name: &str) -> Result<(
     let index = SqliteIndex::new(db_path)?;
     if let Some(project_id) = index.get_project_id(&project.manifest_path)? {
         if let Some(db_dep) = index.get_dependency(project_id, name)? {
-            println!(
-                "Indexed: {}",
-                if db_dep.is_indexed { "yes" } else { "no" }
-            );
+            println!("Indexed: {}", if db_dep.is_indexed { "yes" } else { "no" });
         }
     }
 
@@ -1625,7 +2033,10 @@ fn process_sidecar_files(
             // Extract file metadata from sidecar
             if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
                 if let Err(e) = index.upsert_file_meta(&meta) {
-                    eprintln!("Warning: Could not save metadata for {}: {}", file_path_str, e);
+                    eprintln!(
+                        "Warning: Could not save metadata for {}: {}",
+                        file_path_str, e
+                    );
                 } else {
                     files_with_meta.insert(file_path_str.clone(), relative_path.clone());
                 }
@@ -1732,11 +2143,7 @@ fn handle_sidecar_change(
 }
 
 /// Updates sidecar metadata for a single file during watch mode.
-fn update_file_sidecar_meta(
-    file_path: &Path,
-    root: &Path,
-    index: &SqliteIndex,
-) -> Result<()> {
+fn update_file_sidecar_meta(file_path: &Path, root: &Path, index: &SqliteIndex) -> Result<()> {
     let dir = match file_path.parent() {
         Some(d) => d,
         None => return Ok(()),
@@ -1836,7 +2243,8 @@ pub fn get_changed_symbols(
         (staged, unstaged)
     };
 
-    let changed_symbols = git.find_changed_symbols(&index, base, include_staged, include_unstaged)?;
+    let changed_symbols =
+        git.find_changed_symbols(&index, base, include_staged, include_unstaged)?;
 
     if changed_symbols.is_empty() {
         println!("No changed symbols found");
@@ -1896,15 +2304,12 @@ pub fn get_changed_symbols(
 
 // === Tags Commands Implementation ===
 
-use crate::indexer::{TagRule, RootSidecarData, apply_tag_rules, preview_tag_rules, resolve_inferred_tags};
+use crate::indexer::{
+    apply_tag_rules, preview_tag_rules, resolve_inferred_tags, RootSidecarData, TagRule,
+};
 
 /// Adds a tag inference rule to the root .code-indexer.yml
-pub fn add_tag_rule(
-    path: &Path,
-    tag: &str,
-    pattern: &str,
-    confidence: f64,
-) -> Result<()> {
+pub fn add_tag_rule(path: &Path, tag: &str, pattern: &str, confidence: f64) -> Result<()> {
     let sidecar_path = path.join(SIDECAR_FILENAME);
 
     // Load existing or create new
@@ -1930,12 +2335,16 @@ pub fn add_tag_rule(
             tags: vec![tag.to_string()],
             confidence,
         });
-        println!("Added new tag rule: {} -> {} (confidence: {})", pattern, tag, confidence);
+        println!(
+            "Added new tag rule: {} -> {} (confidence: {})",
+            pattern, tag, confidence
+        );
     }
 
     // Write back
-    let content = serde_yaml::to_string(&data)
-        .map_err(|e| crate::error::IndexerError::Parse(format!("Failed to serialize YAML: {}", e)))?;
+    let content = serde_yaml::to_string(&data).map_err(|e| {
+        crate::error::IndexerError::Parse(format!("Failed to serialize YAML: {}", e))
+    })?;
     fs::write(&sidecar_path, content)?;
 
     println!("Saved to {}", sidecar_path.display());
@@ -1958,8 +2367,9 @@ pub fn remove_tag_rule(path: &Path, pattern: &str) -> Result<()> {
     data.tag_rules.retain(|r| r.pattern != pattern);
 
     if data.tag_rules.len() < original_len {
-        let content = serde_yaml::to_string(&data)
-            .map_err(|e| crate::error::IndexerError::Parse(format!("Failed to serialize YAML: {}", e)))?;
+        let content = serde_yaml::to_string(&data).map_err(|e| {
+            crate::error::IndexerError::Parse(format!("Failed to serialize YAML: {}", e))
+        })?;
         fs::write(&sidecar_path, content)?;
         println!("Removed rule with pattern '{}'", pattern);
     } else {
@@ -1987,7 +2397,10 @@ pub fn list_tag_rules(path: &Path, format: &str) -> Result<()> {
     }
 
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&data.tag_rules).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data.tag_rules).unwrap_or_default()
+        );
     } else {
         println!("Tag Rules ({}):\n", data.tag_rules.len());
         for rule in &data.tag_rules {
@@ -2019,7 +2432,8 @@ pub fn preview_tags(file: &Path, project_path: &Path) -> Result<()> {
     }
 
     // Get relative path from project root
-    let file_path = file.strip_prefix(project_path)
+    let file_path = file
+        .strip_prefix(project_path)
         .unwrap_or(file)
         .to_string_lossy()
         .to_string();
@@ -2043,7 +2457,10 @@ pub fn preview_tags(file: &Path, project_path: &Path) -> Result<()> {
     let inferred = apply_tag_rules(&file_path, &data.tag_rules);
     println!("Consolidated tags (with highest confidence):");
     for tag in &inferred {
-        println!("  {} (confidence: {}, from: {})", tag.tag, tag.confidence, tag.source_pattern);
+        println!(
+            "  {} (confidence: {}, from: {})",
+            tag.tag, tag.confidence, tag.source_pattern
+        );
     }
 
     Ok(())
@@ -2078,7 +2495,11 @@ pub fn apply_tags(project_path: &Path, db_path: &Path) -> Result<()> {
 
     // Get all indexed files
     let stats = index.get_stats()?;
-    println!("Applying {} tag rules to {} files...", data.tag_rules.len(), stats.total_files);
+    println!(
+        "Applying {} tag rules to {} files...",
+        data.tag_rules.len(),
+        stats.total_files
+    );
 
     // Get file list from symbols (unique files)
     let files = index.get_indexed_files()?;
@@ -2132,13 +2553,17 @@ pub fn show_tag_stats(db_path: &Path) -> Result<()> {
         Ok(stats) => {
             println!("Tag Statistics:\n");
             // stats is Vec<(category, tag_name, count)>
-            println!("Total tags: {}", stats.iter().map(|(_, _, count)| count).sum::<usize>());
+            println!(
+                "Total tags: {}",
+                stats.iter().map(|(_, _, count)| count).sum::<usize>()
+            );
             println!();
 
             // Group by category
             let mut by_category: HashMap<String, Vec<(String, usize)>> = HashMap::new();
             for (category, tag_name, count) in stats {
-                by_category.entry(category)
+                by_category
+                    .entry(category)
                     .or_default()
                     .push((tag_name, count));
             }

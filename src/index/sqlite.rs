@@ -1,6 +1,6 @@
 use r2d2::{CustomizeConnection, Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::dependencies::{Dependency, Ecosystem, ProjectInfo, SymbolSource};
@@ -14,7 +14,7 @@ use crate::index::{
 };
 use crate::indexer::ExtractionResult;
 
-/// Customizer to configure SQLite connections with optimal PRAGMA settings.
+/// Customizer to configure writable SQLite connections with balanced PRAGMA settings.
 /// Applied to each connection when acquired from the pool.
 #[derive(Debug)]
 struct SqliteConnectionCustomizer;
@@ -30,6 +30,24 @@ impl CustomizeConnection<Connection, rusqlite::Error> for SqliteConnectionCustom
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
+            PRAGMA temp_store = MEMORY;
+            "#,
+        )?;
+        Ok(())
+    }
+}
+
+/// Customizer for read-only query connections.
+/// Keeps connection setup minimal and avoids write-oriented PRAGMAs.
+#[derive(Debug)]
+struct SqliteReadOnlyConnectionCustomizer;
+
+impl CustomizeConnection<Connection, rusqlite::Error> for SqliteReadOnlyConnectionCustomizer {
+    fn on_acquire(&self, conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            PRAGMA query_only = ON;
+            PRAGMA cache_size = -32000;
             PRAGMA temp_store = MEMORY;
             "#,
         )?;
@@ -56,7 +74,8 @@ impl SqliteIndex {
         generic_params_json, params_json, return_type";
 
     /// Standard symbol columns with table alias 's.'
-    const SYMBOL_COLUMNS_ALIASED: &'static str = "s.id, s.name, s.kind, s.file_path, s.start_line, \
+    const SYMBOL_COLUMNS_ALIASED: &'static str =
+        "s.id, s.name, s.kind, s.file_path, s.start_line, \
         s.start_column, s.end_line, s.end_column, s.language, s.visibility, s.signature, \
         s.doc_comment, s.parent, s.generic_params_json, s.params_json, s.return_type";
 
@@ -70,6 +89,21 @@ impl SqliteIndex {
 
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         Self::with_pool_size(db_path, Self::DEFAULT_POOL_SIZE)
+    }
+
+    /// Creates a read-only SqliteIndex optimized for query commands.
+    /// This path skips migrations and only verifies schema compatibility.
+    pub fn new_read_only(db_path: impl AsRef<Path>) -> Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let manager = SqliteConnectionManager::file(db_path).with_flags(flags);
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(SqliteReadOnlyConnectionCustomizer))
+            .build(manager)?;
+
+        let index = Self { pool };
+        index.verify_schema_compatibility()?;
+        Ok(index)
     }
 
     /// Creates a new SqliteIndex with a custom pool size.
@@ -115,7 +149,10 @@ impl SqliteIndex {
     /// ```
     pub fn with_write_queue(
         db_path: impl AsRef<Path>,
-    ) -> Result<(std::sync::Arc<Self>, crate::index::write_queue::WriteQueueHandle)> {
+    ) -> Result<(
+        std::sync::Arc<Self>,
+        crate::index::write_queue::WriteQueueHandle,
+    )> {
         let index = std::sync::Arc::new(Self::new(db_path)?);
         let write_queue = crate::index::write_queue::WriteQueueHandle::new(index.clone());
         Ok((index, write_queue))
@@ -126,10 +163,15 @@ impl SqliteIndex {
         db_path: impl AsRef<Path>,
         pool_size: u32,
         queue_buffer_size: usize,
-    ) -> Result<(std::sync::Arc<Self>, crate::index::write_queue::WriteQueueHandle)> {
+    ) -> Result<(
+        std::sync::Arc<Self>,
+        crate::index::write_queue::WriteQueueHandle,
+    )> {
         let index = std::sync::Arc::new(Self::with_pool_size(db_path, pool_size)?);
-        let write_queue =
-            crate::index::write_queue::WriteQueueHandle::with_buffer_size(index.clone(), queue_buffer_size);
+        let write_queue = crate::index::write_queue::WriteQueueHandle::with_buffer_size(
+            index.clone(),
+            queue_buffer_size,
+        );
         Ok((index, write_queue))
     }
 
@@ -142,6 +184,11 @@ impl SqliteIndex {
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn()?;
         migrations::run_migrations(&conn)
+    }
+
+    fn verify_schema_compatibility(&self) -> Result<()> {
+        let conn = self.conn()?;
+        migrations::verify_schema_compatibility(&conn)
     }
 
     // === Database Revision Methods (Summary-First Contract) ===
@@ -404,10 +451,15 @@ impl SqliteIndex {
         }
         let conn = self.conn()?;
         let placeholders = Self::generate_placeholders(dep_ids.len());
-        let params: Vec<&dyn rusqlite::ToSql> =
-            dep_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = dep_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
         conn.execute(
-            &format!("UPDATE dependencies SET is_indexed = 1 WHERE id IN ({})", placeholders),
+            &format!(
+                "UPDATE dependencies SET is_indexed = 1 WHERE id IN ({})",
+                placeholders
+            ),
             params.as_slice(),
         )?;
         Ok(())
@@ -475,9 +527,7 @@ impl SqliteIndex {
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
 
         if let Some(name) = dep_name {
-            sql.push_str(
-                " AND s.dependency_id IN (SELECT id FROM dependencies WHERE name = ?)",
-            );
+            sql.push_str(" AND s.dependency_id IN (SELECT id FROM dependencies WHERE name = ?)");
             params_vec.push(Box::new(name.to_string()));
         }
 
@@ -499,7 +549,8 @@ impl SqliteIndex {
 
         sql.push_str(&format!(" ORDER BY score LIMIT {}", limit));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let results = stmt
@@ -532,15 +583,14 @@ impl SqliteIndex {
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
 
         if let Some(dep) = dep_name {
-            sql.push_str(
-                " AND dependency_id IN (SELECT id FROM dependencies WHERE name = ?)",
-            );
+            sql.push_str(" AND dependency_id IN (SELECT id FROM dependencies WHERE name = ?)");
             params_vec.push(Box::new(dep.to_string()));
         }
 
         sql.push_str(" ORDER BY file_path, start_line");
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let symbols = stmt
@@ -703,7 +753,10 @@ impl SqliteIndex {
     /// Removes scopes for a file
     pub fn remove_file_scopes(&self, file_path: &str) -> Result<()> {
         let conn = self.conn()?;
-        conn.execute("DELETE FROM scopes WHERE file_path = ?1", params![file_path])?;
+        conn.execute(
+            "DELETE FROM scopes WHERE file_path = ?1",
+            params![file_path],
+        )?;
         Ok(())
     }
 
@@ -922,8 +975,10 @@ impl SqliteIndex {
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> =
-            symbol_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(SymbolMetrics {
@@ -972,23 +1027,64 @@ impl SqliteIndex {
     /// Batch insert all extraction results (symbols, references, imports) in a single transaction.
     /// Returns the total number of symbols inserted.
     pub fn add_extraction_results_batch(&self, results: Vec<ExtractionResult>) -> Result<usize> {
+        self.add_extraction_results_batch_with_durability(results, false)
+    }
+
+    /// Batch insert all extraction results with optional fast durability mode for bulk indexing.
+    /// When `fast_mode` is enabled, SQLite durability is relaxed for throughput.
+    pub fn add_extraction_results_batch_with_durability(
+        &self,
+        results: Vec<ExtractionResult>,
+        fast_mode: bool,
+    ) -> Result<usize> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
 
-        let mut total_symbols = 0;
+        if fast_mode {
+            Self::apply_bulk_fast_pragmas(&conn)?;
+        }
 
-        for result in results {
-            // Insert symbols
-            for symbol in result.symbols {
-                tx.execute(
-                    r#"
-                    INSERT OR REPLACE INTO symbols
-                    (id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                     language, visibility, signature, doc_comment, parent,
-                     generic_params_json, params_json, return_type)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-                    "#,
-                    params![
+        let operation = (|| -> Result<usize> {
+            let tx = conn.transaction()?;
+            let mut symbol_stmt = tx.prepare_cached(
+                r#"
+                INSERT OR REPLACE INTO symbols
+                (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                 language, visibility, signature, doc_comment, parent,
+                 generic_params_json, params_json, return_type)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "#,
+            )?;
+            let mut refs_stmt = tx.prepare_cached(
+                r#"
+                INSERT OR REPLACE INTO symbol_references
+                (symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )?;
+            let mut imports_stmt = tx.prepare_cached(
+                r#"
+                INSERT OR REPLACE INTO file_imports
+                (file_path, imported_path, imported_symbol, import_type)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+            )?;
+
+            let mut total_symbols = 0;
+
+            for result in results {
+                // Insert symbols
+                for symbol in result.symbols {
+                    let generic_params_json = if symbol.generic_params.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&symbol.generic_params).ok()
+                    };
+                    let params_json = if symbol.params.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&symbol.params).ok()
+                    };
+                    symbol_stmt.execute(params![
                         symbol.id,
                         symbol.name,
                         symbol.kind.as_str(),
@@ -1002,59 +1098,78 @@ impl SqliteIndex {
                         symbol.signature,
                         symbol.doc_comment,
                         symbol.parent,
-                        serde_json::to_string(&symbol.generic_params).ok(),
-                        serde_json::to_string(&symbol.params).ok(),
+                        generic_params_json,
+                        params_json,
                         symbol.return_type,
-                    ],
-                )?;
-                total_symbols += 1;
-            }
+                    ])?;
+                    total_symbols += 1;
+                }
 
-            // Insert references
-            for reference in result.references {
-                tx.execute(
-                    r#"
-                    INSERT OR REPLACE INTO symbol_references
-                    (symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    "#,
-                    params![
+                // Insert references
+                for reference in result.references {
+                    refs_stmt.execute(params![
                         reference.symbol_id,
                         reference.symbol_name,
                         reference.file_path,
                         reference.line,
                         reference.column,
                         reference.kind.as_str(),
-                    ],
-                )?;
-            }
+                    ])?;
+                }
 
-            // Insert imports
-            for import in result.imports {
-                tx.execute(
-                    r#"
-                    INSERT OR REPLACE INTO file_imports
-                    (file_path, imported_path, imported_symbol, import_type)
-                    VALUES (?1, ?2, ?3, ?4)
-                    "#,
-                    params![
+                // Insert imports
+                for import in result.imports {
+                    imports_stmt.execute(params![
                         import.file_path,
                         import.imported_path,
                         import.imported_symbol,
                         import.import_type.as_str(),
-                    ],
-                )?;
+                    ])?;
+                }
             }
+
+            // Increment db revision in same transaction
+            tx.execute(
+                "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
+                [],
+            )?;
+
+            drop(symbol_stmt);
+            drop(refs_stmt);
+            drop(imports_stmt);
+            tx.commit()?;
+            Ok(total_symbols)
+        })();
+
+        if fast_mode {
+            let _ = Self::apply_default_pragmas(&conn);
         }
 
-        // Increment db revision in same transaction
-        tx.execute(
-            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
-            [],
-        )?;
+        operation
+    }
 
-        tx.commit()?;
-        Ok(total_symbols)
+    #[inline]
+    fn apply_default_pragmas(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -64000;
+            PRAGMA temp_store = MEMORY;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    #[inline]
+    fn apply_bulk_fast_pragmas(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            PRAGMA synchronous = OFF;
+            PRAGMA cache_size = -128000;
+            PRAGMA temp_store = MEMORY;
+            "#,
+        )?;
+        Ok(())
     }
 
     fn symbol_from_row(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
@@ -1268,7 +1383,9 @@ impl SqliteIndex {
         // OPTIMIZATION: Batch load metrics for advanced ranking (avoids N+1 queries)
         let mut results: Vec<SearchResult> = if use_advanced && !preliminary.is_empty() {
             let symbol_ids: Vec<&str> = preliminary.iter().map(|(s, _)| s.id.as_str()).collect();
-            let metrics_map = self.get_symbol_metrics_batch(&symbol_ids).unwrap_or_default();
+            let metrics_map = self
+                .get_symbol_metrics_batch(&symbol_ids)
+                .unwrap_or_default();
 
             preliminary
                 .into_iter()
@@ -1292,7 +1409,11 @@ impl SqliteIndex {
                 .collect()
         };
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         Ok(results)
@@ -1657,15 +1778,23 @@ impl CodeIndex for SqliteIndex {
         // 2. Delete data referencing these symbols (batch with IN clause)
         if !symbol_ids.is_empty() {
             let placeholders = Self::generate_placeholders(symbol_ids.len());
-            let params: Vec<&dyn rusqlite::ToSql> =
-                symbol_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
 
             tx.execute(
-                &format!("DELETE FROM symbol_references WHERE symbol_id IN ({})", placeholders),
+                &format!(
+                    "DELETE FROM symbol_references WHERE symbol_id IN ({})",
+                    placeholders
+                ),
                 params.as_slice(),
             )?;
             tx.execute(
-                &format!("DELETE FROM symbol_metrics WHERE symbol_id IN ({})", placeholders),
+                &format!(
+                    "DELETE FROM symbol_metrics WHERE symbol_id IN ({})",
+                    placeholders
+                ),
                 params.as_slice(),
             )?;
 
@@ -1803,8 +1932,11 @@ impl CodeIndex for SqliteIndex {
 
         let mut results: Vec<SearchResult> = if use_advanced && !initial_results.is_empty() {
             // OPTIMIZATION: Batch load metrics to avoid N+1 queries
-            let symbol_ids: Vec<&str> = initial_results.iter().map(|(s, _)| s.id.as_str()).collect();
-            let metrics_map = self.get_symbol_metrics_batch(&symbol_ids).unwrap_or_default();
+            let symbol_ids: Vec<&str> =
+                initial_results.iter().map(|(s, _)| s.id.as_str()).collect();
+            let metrics_map = self
+                .get_symbol_metrics_batch(&symbol_ids)
+                .unwrap_or_default();
 
             initial_results
                 .into_iter()
@@ -1886,7 +2018,10 @@ impl CodeIndex for SqliteIndex {
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
                 Box::new(format!("{}%", prefix)),
                 Box::new(format!("_{}%", &prefix[..std::cmp::min(2, prefix.len())])),
-                Box::new(format!("%{}%", &query_lower[..std::cmp::min(4, query_lower.len())])),
+                Box::new(format!(
+                    "%{}%",
+                    &query_lower[..std::cmp::min(4, query_lower.len())]
+                )),
             ];
 
             if let Some(ref kinds) = options.kind_filter {
@@ -1943,7 +2078,9 @@ impl CodeIndex for SqliteIndex {
             let symbol_ids: Vec<&str> = preliminary.iter().map(|(s, _)| s.id.as_str()).collect();
 
             // Load all metrics in one query
-            let metrics_map = self.get_symbol_metrics_batch(&symbol_ids).unwrap_or_default();
+            let metrics_map = self
+                .get_symbol_metrics_batch(&symbol_ids)
+                .unwrap_or_default();
 
             // Calculate final scores with pre-loaded metrics
             preliminary
@@ -1974,7 +2111,11 @@ impl CodeIndex for SqliteIndex {
 
         // Sort by score descending and limit
         let mut scored = scored;
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit);
 
         Ok(scored)
@@ -2034,20 +2175,14 @@ impl CodeIndex for SqliteIndex {
                     "{} AND parent = ?2 ORDER BY file_path, start_line",
                     base_sql
                 ),
-                vec![
-                    Box::new(name.to_string()),
-                    Box::new(parent.to_string()),
-                ],
+                vec![Box::new(name.to_string()), Box::new(parent.to_string())],
             ),
             (None, Some(lang)) => (
                 format!(
                     "{} AND language = ?2 ORDER BY file_path, start_line",
                     base_sql
                 ),
-                vec![
-                    Box::new(name.to_string()),
-                    Box::new(lang.to_string()),
-                ],
+                vec![Box::new(name.to_string()), Box::new(lang.to_string())],
             ),
             (None, None) => (
                 format!("{} ORDER BY file_path, start_line", base_sql),
@@ -2097,7 +2232,8 @@ impl CodeIndex for SqliteIndex {
 
         sql.push_str(&format!(" ORDER BY file_path, start_line LIMIT {}", limit));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let symbols = stmt
@@ -2141,7 +2277,8 @@ impl CodeIndex for SqliteIndex {
 
         sql.push_str(&format!(" ORDER BY file_path, start_line LIMIT {}", limit));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let symbols = stmt
@@ -2194,9 +2331,8 @@ impl CodeIndex for SqliteIndex {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut stmt = conn.prepare(
-            "SELECT language, COUNT(DISTINCT file_path) FROM symbols GROUP BY language",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT language, COUNT(DISTINCT file_path) FROM symbols GROUP BY language")?;
         let files_by_language: Vec<(String, usize)> = stmt
             .query_map([], |row| {
                 let count: i64 = row.get(1)?;
@@ -2281,9 +2417,13 @@ impl CodeIndex for SqliteIndex {
             params_vec.push(Box::new(format!("%{}%", file)));
         }
 
-        sql.push_str(&format!(" ORDER BY referenced_in_file, line LIMIT {}", limit));
+        sql.push_str(&format!(
+            " ORDER BY referenced_in_file, line LIMIT {}",
+            limit
+        ));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let refs = stmt
@@ -2303,7 +2443,11 @@ impl CodeIndex for SqliteIndex {
         Ok(refs)
     }
 
-    fn find_callers(&self, function_name: &str, depth: Option<u32>) -> Result<Vec<SymbolReference>> {
+    fn find_callers(
+        &self,
+        function_name: &str,
+        depth: Option<u32>,
+    ) -> Result<Vec<SymbolReference>> {
         let conn = self.conn()?;
         let max_depth = depth.unwrap_or(1);
 
@@ -2445,7 +2589,8 @@ impl CodeIndex for SqliteIndex {
                     file_path: row.get(0)?,
                     imported_path: row.get(1)?,
                     imported_symbol: row.get(2)?,
-                    import_type: ImportType::from_str(&import_type_str).unwrap_or(ImportType::Symbol),
+                    import_type: ImportType::from_str(&import_type_str)
+                        .unwrap_or(ImportType::Symbol),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2804,7 +2949,10 @@ impl SqliteIndex {
                 file_placeholders
             ))?;
             let ids = stmt
-                .query_map(rusqlite::params_from_iter(file_params.iter().copied()), |row| row.get(0))?
+                .query_map(
+                    rusqlite::params_from_iter(file_params.iter().copied()),
+                    |row| row.get(0),
+                )?
                 .filter_map(|r| r.ok())
                 .collect();
             ids
@@ -2813,15 +2961,23 @@ impl SqliteIndex {
         // 2. Delete data referencing these symbols (batch with IN clause)
         if !symbol_ids.is_empty() {
             let placeholders = Self::generate_placeholders(symbol_ids.len());
-            let params: Vec<&dyn rusqlite::ToSql> =
-                symbol_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
 
             tx.execute(
-                &format!("DELETE FROM symbol_references WHERE symbol_id IN ({})", placeholders),
+                &format!(
+                    "DELETE FROM symbol_references WHERE symbol_id IN ({})",
+                    placeholders
+                ),
                 params.as_slice(),
             )?;
             tx.execute(
-                &format!("DELETE FROM symbol_metrics WHERE symbol_id IN ({})", placeholders),
+                &format!(
+                    "DELETE FROM symbol_metrics WHERE symbol_id IN ({})",
+                    placeholders
+                ),
                 params.as_slice(),
             )?;
 
@@ -2847,25 +3003,40 @@ impl SqliteIndex {
             .collect();
 
         tx.execute(
-            &format!("DELETE FROM symbol_references WHERE referenced_in_file IN ({})", file_placeholders),
+            &format!(
+                "DELETE FROM symbol_references WHERE referenced_in_file IN ({})",
+                file_placeholders
+            ),
             file_params.as_slice(),
         )?;
         tx.execute(
-            &format!("DELETE FROM file_imports WHERE file_path IN ({})", file_placeholders),
+            &format!(
+                "DELETE FROM file_imports WHERE file_path IN ({})",
+                file_placeholders
+            ),
             file_params.as_slice(),
         )?;
         tx.execute(
-            &format!("DELETE FROM scopes WHERE file_path IN ({})", file_placeholders),
+            &format!(
+                "DELETE FROM scopes WHERE file_path IN ({})",
+                file_placeholders
+            ),
             file_params.as_slice(),
         )?;
         tx.execute(
-            &format!("DELETE FROM call_edges WHERE file_path IN ({})", file_placeholders),
+            &format!(
+                "DELETE FROM call_edges WHERE file_path IN ({})",
+                file_placeholders
+            ),
             file_params.as_slice(),
         )?;
 
         // 4. Delete symbols and file entries
         tx.execute(
-            &format!("DELETE FROM symbols WHERE file_path IN ({})", file_placeholders),
+            &format!(
+                "DELETE FROM symbols WHERE file_path IN ({})",
+                file_placeholders
+            ),
             file_params.as_slice(),
         )?;
         tx.execute(
@@ -2959,7 +3130,8 @@ impl SqliteIndex {
 
         for digest in digests {
             let headings_json = serde_json::to_string(&digest.headings).unwrap_or_default();
-            let command_blocks_json = serde_json::to_string(&digest.command_blocks).unwrap_or_default();
+            let command_blocks_json =
+                serde_json::to_string(&digest.command_blocks).unwrap_or_default();
             let key_sections_json = serde_json::to_string(&digest.key_sections).unwrap_or_default();
 
             tx.execute(
@@ -2988,13 +3160,63 @@ impl SqliteIndex {
     pub fn get_doc_digest(&self, file_path: &str) -> Result<Option<crate::docs::DocDigest>> {
         let conn = self.conn()?;
 
-        let result = conn.query_row(
-            r#"
+        let result = conn
+            .query_row(
+                r#"
             SELECT file_path, doc_type, title, headings, command_blocks, key_sections
             FROM doc_digests WHERE file_path = ?1
             "#,
-            params![file_path],
-            |row| {
+                params![file_path],
+                |row| {
+                    let file_path: String = row.get(0)?;
+                    let doc_type_str: String = row.get(1)?;
+                    let title: Option<String> = row.get(2)?;
+                    let headings_json: String = row.get(3)?;
+                    let command_blocks_json: String = row.get(4)?;
+                    let key_sections_json: String = row.get(5)?;
+
+                    let doc_type = match doc_type_str.as_str() {
+                        "readme" => crate::docs::DocType::Readme,
+                        "contributing" => crate::docs::DocType::Contributing,
+                        "changelog" => crate::docs::DocType::Changelog,
+                        "license" => crate::docs::DocType::License,
+                        _ => crate::docs::DocType::Other,
+                    };
+
+                    let headings: Vec<crate::docs::Heading> =
+                        serde_json::from_str(&headings_json).unwrap_or_default();
+                    let command_blocks: Vec<crate::docs::CodeBlock> =
+                        serde_json::from_str(&command_blocks_json).unwrap_or_default();
+                    let key_sections: Vec<crate::docs::KeySection> =
+                        serde_json::from_str(&key_sections_json).unwrap_or_default();
+
+                    Ok(crate::docs::DocDigest {
+                        file_path,
+                        doc_type,
+                        title,
+                        headings,
+                        command_blocks,
+                        key_sections,
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(result)
+    }
+
+    /// Gets all documentation digests
+    pub fn get_all_doc_digests(&self) -> Result<Vec<crate::docs::DocDigest>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT file_path, doc_type, title, headings, command_blocks, key_sections
+            FROM doc_digests ORDER BY doc_type
+            "#,
+        )?;
+
+        let digests = stmt
+            .query_map([], |row| {
                 let file_path: String = row.get(0)?;
                 let doc_type_str: String = row.get(1)?;
                 let title: Option<String> = row.get(2)?;
@@ -3025,54 +3247,9 @@ impl SqliteIndex {
                     command_blocks,
                     key_sections,
                 })
-            },
-        ).optional()?;
-
-        Ok(result)
-    }
-
-    /// Gets all documentation digests
-    pub fn get_all_doc_digests(&self) -> Result<Vec<crate::docs::DocDigest>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT file_path, doc_type, title, headings, command_blocks, key_sections
-            FROM doc_digests ORDER BY doc_type
-            "#,
-        )?;
-
-        let digests = stmt.query_map([], |row| {
-            let file_path: String = row.get(0)?;
-            let doc_type_str: String = row.get(1)?;
-            let title: Option<String> = row.get(2)?;
-            let headings_json: String = row.get(3)?;
-            let command_blocks_json: String = row.get(4)?;
-            let key_sections_json: String = row.get(5)?;
-
-            let doc_type = match doc_type_str.as_str() {
-                "readme" => crate::docs::DocType::Readme,
-                "contributing" => crate::docs::DocType::Contributing,
-                "changelog" => crate::docs::DocType::Changelog,
-                "license" => crate::docs::DocType::License,
-                _ => crate::docs::DocType::Other,
-            };
-
-            let headings: Vec<crate::docs::Heading> =
-                serde_json::from_str(&headings_json).unwrap_or_default();
-            let command_blocks: Vec<crate::docs::CodeBlock> =
-                serde_json::from_str(&command_blocks_json).unwrap_or_default();
-            let key_sections: Vec<crate::docs::KeySection> =
-                serde_json::from_str(&key_sections_json).unwrap_or_default();
-
-            Ok(crate::docs::DocDigest {
-                file_path,
-                doc_type,
-                title,
-                headings,
-                command_blocks,
-                key_sections,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(digests)
     }
@@ -3175,45 +3352,48 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let digests = stmt.query_map([], |row| {
-            let file_path: String = row.get(0)?;
-            let config_type_str: String = row.get(1)?;
-            let name: Option<String> = row.get(2)?;
-            let version: Option<String> = row.get(3)?;
-            let scripts_json: String = row.get(4)?;
-            let build_targets_json: String = row.get(5)?;
-            let test_commands_json: String = row.get(6)?;
-            let run_commands_json: String = row.get(7)?;
+        let digests = stmt
+            .query_map([], |row| {
+                let file_path: String = row.get(0)?;
+                let config_type_str: String = row.get(1)?;
+                let name: Option<String> = row.get(2)?;
+                let version: Option<String> = row.get(3)?;
+                let scripts_json: String = row.get(4)?;
+                let build_targets_json: String = row.get(5)?;
+                let test_commands_json: String = row.get(6)?;
+                let run_commands_json: String = row.get(7)?;
 
-            let config_type = match config_type_str.as_str() {
-                "package_json" => crate::docs::ConfigType::PackageJson,
-                "cargo_toml" => crate::docs::ConfigType::CargoToml,
-                "makefile" => crate::docs::ConfigType::Makefile,
-                "pyproject_toml" => crate::docs::ConfigType::PyProjectToml,
-                "go_mod" => crate::docs::ConfigType::GoMod,
-                _ => crate::docs::ConfigType::Other,
-            };
+                let config_type = match config_type_str.as_str() {
+                    "package_json" => crate::docs::ConfigType::PackageJson,
+                    "cargo_toml" => crate::docs::ConfigType::CargoToml,
+                    "makefile" => crate::docs::ConfigType::Makefile,
+                    "pyproject_toml" => crate::docs::ConfigType::PyProjectToml,
+                    "go_mod" => crate::docs::ConfigType::GoMod,
+                    _ => crate::docs::ConfigType::Other,
+                };
 
-            let scripts: std::collections::HashMap<String, String> =
-                serde_json::from_str(&scripts_json).unwrap_or_default();
-            let build_targets: Vec<String> =
-                serde_json::from_str(&build_targets_json).unwrap_or_default();
-            let test_commands: Vec<String> =
-                serde_json::from_str(&test_commands_json).unwrap_or_default();
-            let run_commands: Vec<String> =
-                serde_json::from_str(&run_commands_json).unwrap_or_default();
+                let scripts: std::collections::HashMap<String, String> =
+                    serde_json::from_str(&scripts_json).unwrap_or_default();
+                let build_targets: Vec<String> =
+                    serde_json::from_str(&build_targets_json).unwrap_or_default();
+                let test_commands: Vec<String> =
+                    serde_json::from_str(&test_commands_json).unwrap_or_default();
+                let run_commands: Vec<String> =
+                    serde_json::from_str(&run_commands_json).unwrap_or_default();
 
-            Ok(crate::docs::ConfigDigest {
-                file_path,
-                config_type,
-                name,
-                version,
-                scripts,
-                build_targets,
-                test_commands,
-                run_commands,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::docs::ConfigDigest {
+                    file_path,
+                    config_type,
+                    name,
+                    version,
+                    scripts,
+                    build_targets,
+                    test_commands,
+                    run_commands,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(digests)
     }
@@ -3228,16 +3408,19 @@ impl SqliteIndex {
 
         for digest in digests {
             run.extend(digest.run_commands);
-            build.extend(digest.build_targets.iter().map(|t| {
-                match digest.config_type {
-                    crate::docs::ConfigType::PackageJson => format!("npm run {}", t),
-                    crate::docs::ConfigType::CargoToml => format!("cargo build"),
-                    crate::docs::ConfigType::Makefile => format!("make {}", t),
-                    crate::docs::ConfigType::PyProjectToml => format!("python -m build"),
-                    crate::docs::ConfigType::GoMod => format!("go build"),
-                    crate::docs::ConfigType::Other => t.clone(),
-                }
-            }));
+            build.extend(
+                digest
+                    .build_targets
+                    .iter()
+                    .map(|t| match digest.config_type {
+                        crate::docs::ConfigType::PackageJson => format!("npm run {}", t),
+                        crate::docs::ConfigType::CargoToml => format!("cargo build"),
+                        crate::docs::ConfigType::Makefile => format!("make {}", t),
+                        crate::docs::ConfigType::PyProjectToml => format!("python -m build"),
+                        crate::docs::ConfigType::GoMod => format!("go build"),
+                        crate::docs::ConfigType::Other => t.clone(),
+                    }),
+            );
             test.extend(digest.test_commands);
         }
 
@@ -3255,7 +3438,11 @@ impl SqliteIndex {
     // === Project Compass Methods ===
 
     /// Saves a project profile
-    pub fn save_project_profile(&self, project_path: &str, profile: &crate::compass::ProjectProfile) -> Result<()> {
+    pub fn save_project_profile(
+        &self,
+        project_path: &str,
+        profile: &crate::compass::ProjectProfile,
+    ) -> Result<()> {
         let conn = self.conn()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3285,45 +3472,50 @@ impl SqliteIndex {
     }
 
     /// Gets the project profile
-    pub fn get_project_profile(&self, project_path: &str) -> Result<Option<(crate::compass::ProjectProfile, u64)>> {
+    pub fn get_project_profile(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<(crate::compass::ProjectProfile, u64)>> {
         let conn = self.conn()?;
 
-        let result = conn.query_row(
-            r#"
+        let result = conn
+            .query_row(
+                r#"
             SELECT languages, frameworks, build_tools, workspace_type, profile_rev
             FROM project_profile WHERE project_path = ?1
             "#,
-            params![project_path],
-            |row| {
-                let languages_json: String = row.get(0)?;
-                let frameworks_json: String = row.get(1)?;
-                let build_tools_json: String = row.get(2)?;
-                let workspace_type: Option<String> = row.get(3)?;
-                let profile_rev: i64 = row.get(4)?;
+                params![project_path],
+                |row| {
+                    let languages_json: String = row.get(0)?;
+                    let frameworks_json: String = row.get(1)?;
+                    let build_tools_json: String = row.get(2)?;
+                    let workspace_type: Option<String> = row.get(3)?;
+                    let profile_rev: i64 = row.get(4)?;
 
-                let languages: Vec<crate::compass::LanguageStats> =
-                    serde_json::from_str(&languages_json).unwrap_or_default();
-                let frameworks: Vec<crate::compass::FrameworkInfo> =
-                    serde_json::from_str(&frameworks_json).unwrap_or_default();
-                let build_tools: Vec<String> =
-                    serde_json::from_str(&build_tools_json).unwrap_or_default();
+                    let languages: Vec<crate::compass::LanguageStats> =
+                        serde_json::from_str(&languages_json).unwrap_or_default();
+                    let frameworks: Vec<crate::compass::FrameworkInfo> =
+                        serde_json::from_str(&frameworks_json).unwrap_or_default();
+                    let build_tools: Vec<String> =
+                        serde_json::from_str(&build_tools_json).unwrap_or_default();
 
-                let total_files = languages.iter().map(|l| l.file_count).sum();
-                let total_symbols = languages.iter().map(|l| l.symbol_count).sum();
+                    let total_files = languages.iter().map(|l| l.file_count).sum();
+                    let total_symbols = languages.iter().map(|l| l.symbol_count).sum();
 
-                Ok((
-                    crate::compass::ProjectProfile {
-                        languages,
-                        frameworks,
-                        build_tools,
-                        workspace_type,
-                        total_files,
-                        total_symbols,
-                    },
-                    profile_rev as u64,
-                ))
-            },
-        ).optional()?;
+                    Ok((
+                        crate::compass::ProjectProfile {
+                            languages,
+                            frameworks,
+                            build_tools,
+                            workspace_type,
+                            total_files,
+                            total_symbols,
+                        },
+                        profile_rev as u64,
+                    ))
+                },
+            )
+            .optional()?;
 
         Ok(result)
     }
@@ -3371,38 +3563,41 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let nodes = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let parent_id: Option<String> = row.get(1)?;
-            let node_type_str: String = row.get(2)?;
-            let name: String = row.get(3)?;
-            let path: String = row.get(4)?;
-            let symbol_count: i64 = row.get(5)?;
-            let public_symbol_count: i64 = row.get(6)?;
-            let file_count: i64 = row.get(7)?;
-            let centrality_score: f64 = row.get(8)?;
+        let nodes = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let parent_id: Option<String> = row.get(1)?;
+                let node_type_str: String = row.get(2)?;
+                let name: String = row.get(3)?;
+                let path: String = row.get(4)?;
+                let symbol_count: i64 = row.get(5)?;
+                let public_symbol_count: i64 = row.get(6)?;
+                let file_count: i64 = row.get(7)?;
+                let centrality_score: f64 = row.get(8)?;
 
-            let node_type = match node_type_str.as_str() {
-                "module" => crate::compass::NodeType::Module,
-                "directory" => crate::compass::NodeType::Directory,
-                "package" => crate::compass::NodeType::Package,
-                "layer" => crate::compass::NodeType::Layer,
-                _ => crate::compass::NodeType::Directory,
-            };
+                let node_type = match node_type_str.as_str() {
+                    "module" => crate::compass::NodeType::Module,
+                    "directory" => crate::compass::NodeType::Directory,
+                    "package" => crate::compass::NodeType::Package,
+                    "layer" => crate::compass::NodeType::Layer,
+                    _ => crate::compass::NodeType::Directory,
+                };
 
-            Ok(crate::compass::ProjectNode {
-                id,
-                parent_id,
-                node_type,
-                name,
-                path,
-                symbol_count: symbol_count as usize,
-                public_symbol_count: public_symbol_count as usize,
-                file_count: file_count as usize,
-                centrality_score: centrality_score as f32,
-                children: Vec::new(), // Will be populated separately
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::compass::ProjectNode {
+                    id,
+                    parent_id,
+                    node_type,
+                    name,
+                    path,
+                    symbol_count: symbol_count as usize,
+                    public_symbol_count: public_symbol_count as usize,
+                    file_count: file_count as usize,
+                    centrality_score: centrality_score as f32,
+                    children: Vec::new(), // Will be populated separately
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(nodes)
     }
@@ -3464,38 +3659,41 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let nodes = stmt.query_map(params![parent_id], |row| {
-            let id: String = row.get(0)?;
-            let parent_id: Option<String> = row.get(1)?;
-            let node_type_str: String = row.get(2)?;
-            let name: String = row.get(3)?;
-            let path: String = row.get(4)?;
-            let symbol_count: i64 = row.get(5)?;
-            let public_symbol_count: i64 = row.get(6)?;
-            let file_count: i64 = row.get(7)?;
-            let centrality_score: f64 = row.get(8)?;
+        let nodes = stmt
+            .query_map(params![parent_id], |row| {
+                let id: String = row.get(0)?;
+                let parent_id: Option<String> = row.get(1)?;
+                let node_type_str: String = row.get(2)?;
+                let name: String = row.get(3)?;
+                let path: String = row.get(4)?;
+                let symbol_count: i64 = row.get(5)?;
+                let public_symbol_count: i64 = row.get(6)?;
+                let file_count: i64 = row.get(7)?;
+                let centrality_score: f64 = row.get(8)?;
 
-            let node_type = match node_type_str.as_str() {
-                "module" => crate::compass::NodeType::Module,
-                "directory" => crate::compass::NodeType::Directory,
-                "package" => crate::compass::NodeType::Package,
-                "layer" => crate::compass::NodeType::Layer,
-                _ => crate::compass::NodeType::Directory,
-            };
+                let node_type = match node_type_str.as_str() {
+                    "module" => crate::compass::NodeType::Module,
+                    "directory" => crate::compass::NodeType::Directory,
+                    "package" => crate::compass::NodeType::Package,
+                    "layer" => crate::compass::NodeType::Layer,
+                    _ => crate::compass::NodeType::Directory,
+                };
 
-            Ok(crate::compass::ProjectNode {
-                id,
-                parent_id,
-                node_type,
-                name,
-                path,
-                symbol_count: symbol_count as usize,
-                public_symbol_count: public_symbol_count as usize,
-                file_count: file_count as usize,
-                centrality_score: centrality_score as f32,
-                children: Vec::new(),
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::compass::ProjectNode {
+                    id,
+                    parent_id,
+                    node_type,
+                    name,
+                    path,
+                    symbol_count: symbol_count as usize,
+                    public_symbol_count: public_symbol_count as usize,
+                    file_count: file_count as usize,
+                    centrality_score: centrality_score as f32,
+                    children: Vec::new(),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(nodes)
     }
@@ -3540,37 +3738,40 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let entries = stmt.query_map([], |row| {
-            let symbol_id: Option<String> = row.get(0)?;
-            let entry_type_str: String = row.get(1)?;
-            let file_path: String = row.get(2)?;
-            let line: i64 = row.get(3)?;
-            let name: String = row.get(4)?;
-            let evidence: Option<String> = row.get(5)?;
+        let entries = stmt
+            .query_map([], |row| {
+                let symbol_id: Option<String> = row.get(0)?;
+                let entry_type_str: String = row.get(1)?;
+                let file_path: String = row.get(2)?;
+                let line: i64 = row.get(3)?;
+                let name: String = row.get(4)?;
+                let evidence: Option<String> = row.get(5)?;
 
-            let entry_type = match entry_type_str.as_str() {
-                "main" => crate::compass::EntryType::Main,
-                "tokio_main" => crate::compass::EntryType::TokioMain,
-                "actix_main" => crate::compass::EntryType::ActixMain,
-                "server" => crate::compass::EntryType::Server,
-                "cli" => crate::compass::EntryType::Cli,
-                "rest_endpoint" => crate::compass::EntryType::RestEndpoint,
-                "graphql_resolver" => crate::compass::EntryType::GraphqlResolver,
-                "grpc_service" => crate::compass::EntryType::GrpcService,
-                "test" => crate::compass::EntryType::Test,
-                "benchmark" => crate::compass::EntryType::Benchmark,
-                _ => crate::compass::EntryType::Main,
-            };
+                let entry_type = match entry_type_str.as_str() {
+                    "main" => crate::compass::EntryType::Main,
+                    "tokio_main" => crate::compass::EntryType::TokioMain,
+                    "actix_main" => crate::compass::EntryType::ActixMain,
+                    "server" => crate::compass::EntryType::Server,
+                    "cli" => crate::compass::EntryType::Cli,
+                    "rest_endpoint" => crate::compass::EntryType::RestEndpoint,
+                    "graphql_resolver" => crate::compass::EntryType::GraphqlResolver,
+                    "grpc_service" => crate::compass::EntryType::GrpcService,
+                    "test" => crate::compass::EntryType::Test,
+                    "benchmark" => crate::compass::EntryType::Benchmark,
+                    _ => crate::compass::EntryType::Main,
+                };
 
-            Ok(crate::compass::EntryPoint {
-                symbol_id,
-                entry_type,
-                file_path,
-                line: line as u32,
-                name,
-                evidence: evidence.unwrap_or_default(),
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::compass::EntryPoint {
+                    symbol_id,
+                    entry_type,
+                    file_path,
+                    line: line as u32,
+                    name,
+                    evidence: evidence.unwrap_or_default(),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(entries)
     }
@@ -3673,9 +3874,15 @@ impl SqliteIndex {
     /// Deletes file metadata
     pub fn delete_file_meta(&self, file_path: &str) -> Result<()> {
         let conn = self.conn()?;
-        conn.execute("DELETE FROM file_meta WHERE file_path = ?1", params![file_path])?;
+        conn.execute(
+            "DELETE FROM file_meta WHERE file_path = ?1",
+            params![file_path],
+        )?;
         // Also delete associated tags
-        conn.execute("DELETE FROM file_tags WHERE file_path = ?1", params![file_path])?;
+        conn.execute(
+            "DELETE FROM file_tags WHERE file_path = ?1",
+            params![file_path],
+        )?;
         Ok(())
     }
 
@@ -3686,24 +3893,27 @@ impl SqliteIndex {
             "SELECT id, canonical_name, category, display_name, synonyms FROM tag_dictionary ORDER BY category, canonical_name",
         )?;
 
-        let tags = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let canonical_name: String = row.get(1)?;
-            let category: String = row.get(2)?;
-            let display_name: Option<String> = row.get(3)?;
-            let synonyms_json: Option<String> = row.get(4)?;
+        let tags = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let canonical_name: String = row.get(1)?;
+                let category: String = row.get(2)?;
+                let display_name: Option<String> = row.get(3)?;
+                let synonyms_json: Option<String> = row.get(4)?;
 
-            let synonyms: Option<Vec<String>> = synonyms_json
-                .and_then(|s| serde_json::from_str(&s).ok());
+                let synonyms: Option<Vec<String>> =
+                    synonyms_json.and_then(|s| serde_json::from_str(&s).ok());
 
-            Ok(crate::index::TagDictionary {
-                id,
-                canonical_name,
-                category,
-                display_name,
-                synonyms,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::index::TagDictionary {
+                    id,
+                    canonical_name,
+                    category,
+                    display_name,
+                    synonyms,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(tags)
     }
@@ -3761,7 +3971,9 @@ impl SqliteIndex {
     /// Adds or updates a tag in the dictionary
     pub fn upsert_tag(&self, tag: &crate::index::TagDictionary) -> Result<i64> {
         let conn = self.conn()?;
-        let synonyms_json = tag.synonyms.as_ref()
+        let synonyms_json = tag
+            .synonyms
+            .as_ref()
             .map(|s| serde_json::to_string(s).unwrap_or_default());
 
         conn.execute(
@@ -3769,7 +3981,12 @@ impl SqliteIndex {
             INSERT OR REPLACE INTO tag_dictionary (canonical_name, category, display_name, synonyms)
             VALUES (?1, ?2, ?3, ?4)
             "#,
-            params![tag.canonical_name, tag.category, tag.display_name, synonyms_json],
+            params![
+                tag.canonical_name,
+                tag.category,
+                tag.display_name,
+                synonyms_json
+            ],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -3787,7 +4004,13 @@ impl SqliteIndex {
                 INSERT OR REPLACE INTO file_tags (file_path, tag_id, source, confidence, reason)
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 "#,
-                params![file_path, tag.tag_id, tag.source.as_str(), tag.confidence, tag.reason],
+                params![
+                    file_path,
+                    tag.tag_id,
+                    tag.source.as_str(),
+                    tag.confidence,
+                    tag.reason
+                ],
             )?;
         }
 
@@ -3809,30 +4032,33 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let tags = stmt.query_map(params![file_path], |row| {
-            let id: i64 = row.get(0)?;
-            let file_path: String = row.get(1)?;
-            let tag_id: i64 = row.get(2)?;
-            let tag_name: String = row.get(3)?;
-            let tag_category: String = row.get(4)?;
-            let source_str: String = row.get(5)?;
-            let confidence: f64 = row.get(6)?;
-            let reason: Option<String> = row.get(7)?;
+        let tags = stmt
+            .query_map(params![file_path], |row| {
+                let id: i64 = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let tag_id: i64 = row.get(2)?;
+                let tag_name: String = row.get(3)?;
+                let tag_category: String = row.get(4)?;
+                let source_str: String = row.get(5)?;
+                let confidence: f64 = row.get(6)?;
+                let reason: Option<String> = row.get(7)?;
 
-            let source = crate::index::MetaSource::from_str(&source_str)
-                .unwrap_or(crate::index::MetaSource::Inferred);
+                let source = crate::index::MetaSource::from_str(&source_str)
+                    .unwrap_or(crate::index::MetaSource::Inferred);
 
-            Ok(crate::index::FileTag {
-                id: Some(id),
-                file_path,
-                tag_id,
-                tag_name: Some(tag_name),
-                tag_category: Some(tag_category),
-                source,
-                confidence,
-                reason,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::index::FileTag {
+                    id: Some(id),
+                    file_path,
+                    tag_id,
+                    tag_name: Some(tag_name),
+                    tag_category: Some(tag_category),
+                    source,
+                    confidence,
+                    reason,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(tags)
     }
@@ -3886,7 +4112,8 @@ impl SqliteIndex {
             conditions.join(" AND ")
         );
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
 
         let files: Vec<String> = stmt
@@ -3898,7 +4125,10 @@ impl SqliteIndex {
     }
 
     /// Gets file metadata with tags combined
-    pub fn get_file_meta_with_tags(&self, file_path: &str) -> Result<Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>> {
+    pub fn get_file_meta_with_tags(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>> {
         let meta = self.get_file_meta(file_path)?;
         if let Some(m) = meta {
             let tags = self.get_file_tags(file_path)?;
@@ -3909,7 +4139,11 @@ impl SqliteIndex {
     }
 
     /// Searches file metadata using FTS on doc1/purpose
-    pub fn search_file_meta(&self, query: &str, limit: usize) -> Result<Vec<crate::index::FileMeta>> {
+    pub fn search_file_meta(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::index::FileMeta>> {
         let conn = self.conn()?;
         let fts_query = format!("{}*", query.replace(['*', '"', '\''], ""));
 
@@ -3925,46 +4159,52 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let results = stmt.query_map(params![fts_query, limit as i64], |row| {
-            let file_path: String = row.get(0)?;
-            let doc1: Option<String> = row.get(1)?;
-            let purpose: Option<String> = row.get(2)?;
-            let capabilities_json: String = row.get(3)?;
-            let invariants_json: String = row.get(4)?;
-            let non_goals_json: String = row.get(5)?;
-            let security_notes: Option<String> = row.get(6)?;
-            let owner: Option<String> = row.get(7)?;
-            let stability_str: Option<String> = row.get(8)?;
-            let exported_hash: Option<String> = row.get(9)?;
-            let last_extracted: i64 = row.get(10)?;
-            let source_str: String = row.get(11)?;
-            let confidence: f64 = row.get(12)?;
+        let results = stmt
+            .query_map(params![fts_query, limit as i64], |row| {
+                let file_path: String = row.get(0)?;
+                let doc1: Option<String> = row.get(1)?;
+                let purpose: Option<String> = row.get(2)?;
+                let capabilities_json: String = row.get(3)?;
+                let invariants_json: String = row.get(4)?;
+                let non_goals_json: String = row.get(5)?;
+                let security_notes: Option<String> = row.get(6)?;
+                let owner: Option<String> = row.get(7)?;
+                let stability_str: Option<String> = row.get(8)?;
+                let exported_hash: Option<String> = row.get(9)?;
+                let last_extracted: i64 = row.get(10)?;
+                let source_str: String = row.get(11)?;
+                let confidence: f64 = row.get(12)?;
 
-            let capabilities: Vec<String> = serde_json::from_str(&capabilities_json).unwrap_or_default();
-            let invariants: Vec<String> = serde_json::from_str(&invariants_json).unwrap_or_default();
-            let non_goals: Vec<String> = serde_json::from_str(&non_goals_json).unwrap_or_default();
+                let capabilities: Vec<String> =
+                    serde_json::from_str(&capabilities_json).unwrap_or_default();
+                let invariants: Vec<String> =
+                    serde_json::from_str(&invariants_json).unwrap_or_default();
+                let non_goals: Vec<String> =
+                    serde_json::from_str(&non_goals_json).unwrap_or_default();
 
-            let stability = stability_str.and_then(|s| crate::index::Stability::from_str(&s));
-            let source = crate::index::MetaSource::from_str(&source_str)
-                .unwrap_or(crate::index::MetaSource::Inferred);
+                let stability = stability_str.and_then(|s| crate::index::Stability::from_str(&s));
+                let source = crate::index::MetaSource::from_str(&source_str)
+                    .unwrap_or(crate::index::MetaSource::Inferred);
 
-            Ok(crate::index::FileMeta {
-                file_path,
-                doc1,
-                purpose,
-                capabilities,
-                invariants,
-                non_goals,
-                security_notes,
-                owner,
-                stability,
-                exported_hash,
-                last_extracted,
-                source,
-                confidence,
-                is_stale: false,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+                Ok(crate::index::FileMeta {
+                    file_path,
+                    doc1,
+                    purpose,
+                    capabilities,
+                    invariants,
+                    non_goals,
+                    security_notes,
+                    owner,
+                    stability,
+                    exported_hash,
+                    last_extracted,
+                    source,
+                    confidence,
+                    is_stale: false,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(results)
     }
@@ -3983,12 +4223,15 @@ impl SqliteIndex {
             "#,
         )?;
 
-        let stats = stmt.query_map([], |row| {
-            let category: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let count: i64 = row.get(2)?;
-            Ok((category, name, count as usize))
-        })?.filter_map(|r| r.ok()).collect();
+        let stats = stmt
+            .query_map([], |row| {
+                let category: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let count: i64 = row.get(2)?;
+                Ok((category, name, count as usize))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(stats)
     }
@@ -4059,7 +4302,9 @@ mod tests {
 
         index.add_symbols(vec![symbol1, symbol2]).unwrap();
 
-        let results = index.search("calculate", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("calculate", &SearchOptions::default())
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -4246,7 +4491,12 @@ mod tests {
         let symbols = vec![
             create_test_symbol("MyStruct", SymbolKind::Struct, "test.rs", "rust"),
             create_test_symbol("MyClass", SymbolKind::Class, "Test.java", "java"),
-            create_test_symbol("MyInterface", SymbolKind::Interface, "test.ts", "typescript"),
+            create_test_symbol(
+                "MyInterface",
+                SymbolKind::Interface,
+                "test.ts",
+                "typescript",
+            ),
             create_test_symbol("MyTrait", SymbolKind::Trait, "test.rs", "rust"),
             create_test_symbol("MyEnum", SymbolKind::Enum, "test.rs", "rust"),
             create_test_symbol("MyAlias", SymbolKind::TypeAlias, "test.rs", "rust"),
@@ -4330,9 +4580,18 @@ mod tests {
         let stats = index.get_stats().unwrap();
         assert_eq!(stats.total_symbols, 4);
         assert_eq!(stats.total_files, 2);
-        assert!(stats.symbols_by_kind.iter().any(|(k, c)| k == "function" && *c == 2));
-        assert!(stats.symbols_by_language.iter().any(|(l, c)| l == "rust" && *c == 3));
-        assert!(stats.files_by_language.iter().any(|(l, c)| l == "rust" && *c == 1));
+        assert!(stats
+            .symbols_by_kind
+            .iter()
+            .any(|(k, c)| k == "function" && *c == 2));
+        assert!(stats
+            .symbols_by_language
+            .iter()
+            .any(|(l, c)| l == "rust" && *c == 3));
+        assert!(stats
+            .files_by_language
+            .iter()
+            .any(|(l, c)| l == "rust" && *c == 1));
     }
 
     #[test]
@@ -4487,7 +4746,9 @@ mod tests {
         let symbol = create_test_symbol("my_function", SymbolKind::Function, "test.rs", "rust");
         index.add_symbol(symbol).unwrap();
 
-        let results = index.search("nonexistent", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("nonexistent", &SearchOptions::default())
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -4503,7 +4764,9 @@ mod tests {
         );
         index.add_symbol(symbol).unwrap();
 
-        let results = index.search("calculate", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("calculate", &SearchOptions::default())
+            .unwrap();
         assert!(!results.is_empty());
         assert!(results[0].score > 0.0);
     }
@@ -4829,11 +5092,17 @@ mod tests {
 
         // Set initial hash
         index.set_file_content_hash("test.rs", "hash_v1").unwrap();
-        assert_eq!(index.get_file_content_hash("test.rs").unwrap(), Some("hash_v1".to_string()));
+        assert_eq!(
+            index.get_file_content_hash("test.rs").unwrap(),
+            Some("hash_v1".to_string())
+        );
 
         // Update hash
         index.set_file_content_hash("test.rs", "hash_v2").unwrap();
-        assert_eq!(index.get_file_content_hash("test.rs").unwrap(), Some("hash_v2".to_string()));
+        assert_eq!(
+            index.get_file_content_hash("test.rs").unwrap(),
+            Some("hash_v2".to_string())
+        );
     }
 
     #[test]
@@ -4881,7 +5150,10 @@ mod tests {
 
         let retrieved = index.get_file_meta("src/auth/service.rs").unwrap().unwrap();
         assert_eq!(retrieved.file_path, "src/auth/service.rs");
-        assert_eq!(retrieved.doc1, Some("Authentication service with JWT and OAuth2".to_string()));
+        assert_eq!(
+            retrieved.doc1,
+            Some("Authentication service with JWT and OAuth2".to_string())
+        );
         assert_eq!(retrieved.capabilities.len(), 2);
         assert_eq!(retrieved.stability, Some(Stability::Stable));
         assert_eq!(retrieved.source, MetaSource::Sidecar);
@@ -4949,11 +5221,9 @@ mod tests {
         // Get auth tag id
         let auth_tag = index.get_tag_by_name("auth").unwrap().unwrap();
 
-        let tags = vec![
-            FileTag::new("src/auth.rs", auth_tag.id)
-                .with_source(MetaSource::Sidecar)
-                .with_confidence(1.0),
-        ];
+        let tags = vec![FileTag::new("src/auth.rs", auth_tag.id)
+            .with_source(MetaSource::Sidecar)
+            .with_confidence(1.0)];
 
         index.add_file_tags("src/auth.rs", &tags).unwrap();
 
@@ -4976,14 +5246,24 @@ mod tests {
         let api_tag = index.get_tag_by_name("api").unwrap().unwrap();
 
         // Add tags to files
-        index.add_file_tags("src/auth/service.rs", &[
-            FileTag::new("src/auth/service.rs", auth_tag.id).with_source(MetaSource::Sidecar),
-            FileTag::new("src/auth/service.rs", service_tag.id).with_source(MetaSource::Sidecar),
-        ]).unwrap();
+        index
+            .add_file_tags(
+                "src/auth/service.rs",
+                &[
+                    FileTag::new("src/auth/service.rs", auth_tag.id)
+                        .with_source(MetaSource::Sidecar),
+                    FileTag::new("src/auth/service.rs", service_tag.id)
+                        .with_source(MetaSource::Sidecar),
+                ],
+            )
+            .unwrap();
 
-        index.add_file_tags("src/api/handler.rs", &[
-            FileTag::new("src/api/handler.rs", api_tag.id).with_source(MetaSource::Sidecar),
-        ]).unwrap();
+        index
+            .add_file_tags(
+                "src/api/handler.rs",
+                &[FileTag::new("src/api/handler.rs", api_tag.id).with_source(MetaSource::Sidecar)],
+            )
+            .unwrap();
 
         // Search by single tag
         let auth_files = index.search_files_by_tags(&["auth".to_string()]).unwrap();
@@ -4991,15 +5271,21 @@ mod tests {
         assert_eq!(auth_files[0], "src/auth/service.rs");
 
         // Search by category:name format
-        let domain_auth = index.search_files_by_tags(&["domain:auth".to_string()]).unwrap();
+        let domain_auth = index
+            .search_files_by_tags(&["domain:auth".to_string()])
+            .unwrap();
         assert_eq!(domain_auth.len(), 1);
 
         // Search by multiple tags (AND)
-        let auth_service = index.search_files_by_tags(&["auth".to_string(), "service".to_string()]).unwrap();
+        let auth_service = index
+            .search_files_by_tags(&["auth".to_string(), "service".to_string()])
+            .unwrap();
         assert_eq!(auth_service.len(), 1);
 
         // Search by non-matching combination
-        let auth_api = index.search_files_by_tags(&["auth".to_string(), "api".to_string()]).unwrap();
+        let auth_api = index
+            .search_files_by_tags(&["auth".to_string(), "api".to_string()])
+            .unwrap();
         assert!(auth_api.is_empty());
     }
 
@@ -5017,12 +5303,18 @@ mod tests {
 
         // Add tags
         let auth_tag = index.get_tag_by_name("auth").unwrap().unwrap();
-        index.add_file_tags("src/auth.rs", &[
-            FileTag::new("src/auth.rs", auth_tag.id).with_source(MetaSource::Sidecar),
-        ]).unwrap();
+        index
+            .add_file_tags(
+                "src/auth.rs",
+                &[FileTag::new("src/auth.rs", auth_tag.id).with_source(MetaSource::Sidecar)],
+            )
+            .unwrap();
 
         // Get combined
-        let (retrieved_meta, tags) = index.get_file_meta_with_tags("src/auth.rs").unwrap().unwrap();
+        let (retrieved_meta, tags) = index
+            .get_file_meta_with_tags("src/auth.rs")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved_meta.doc1, Some("Auth module".to_string()));
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].tag_name, Some("auth".to_string()));
@@ -5035,17 +5327,29 @@ mod tests {
         let index = SqliteIndex::in_memory().unwrap();
 
         // Add multiple file metas
-        index.upsert_file_meta(&FileMeta::new("src/auth/jwt.rs")
-            .with_doc1("JWT token generation and validation")
-            .with_purpose("Handle JWT tokens")).unwrap();
+        index
+            .upsert_file_meta(
+                &FileMeta::new("src/auth/jwt.rs")
+                    .with_doc1("JWT token generation and validation")
+                    .with_purpose("Handle JWT tokens"),
+            )
+            .unwrap();
 
-        index.upsert_file_meta(&FileMeta::new("src/auth/oauth.rs")
-            .with_doc1("OAuth2 flow implementation")
-            .with_purpose("Handle OAuth2 authentication")).unwrap();
+        index
+            .upsert_file_meta(
+                &FileMeta::new("src/auth/oauth.rs")
+                    .with_doc1("OAuth2 flow implementation")
+                    .with_purpose("Handle OAuth2 authentication"),
+            )
+            .unwrap();
 
-        index.upsert_file_meta(&FileMeta::new("src/payments/stripe.rs")
-            .with_doc1("Stripe payment processing")
-            .with_purpose("Process payments via Stripe")).unwrap();
+        index
+            .upsert_file_meta(
+                &FileMeta::new("src/payments/stripe.rs")
+                    .with_doc1("Stripe payment processing")
+                    .with_purpose("Process payments via Stripe"),
+            )
+            .unwrap();
 
         // Search for JWT-related files
         let jwt_results = index.search_file_meta("JWT", 10).unwrap();
@@ -5092,14 +5396,22 @@ mod tests {
         let auth_tag = index.get_tag_by_name("auth").unwrap().unwrap();
         let service_tag = index.get_tag_by_name("service").unwrap().unwrap();
 
-        index.add_file_tags("src/auth1.rs", &[
-            FileTag::new("src/auth1.rs", auth_tag.id).with_source(MetaSource::Sidecar),
-        ]).unwrap();
+        index
+            .add_file_tags(
+                "src/auth1.rs",
+                &[FileTag::new("src/auth1.rs", auth_tag.id).with_source(MetaSource::Sidecar)],
+            )
+            .unwrap();
 
-        index.add_file_tags("src/auth2.rs", &[
-            FileTag::new("src/auth2.rs", auth_tag.id).with_source(MetaSource::Sidecar),
-            FileTag::new("src/auth2.rs", service_tag.id).with_source(MetaSource::Sidecar),
-        ]).unwrap();
+        index
+            .add_file_tags(
+                "src/auth2.rs",
+                &[
+                    FileTag::new("src/auth2.rs", auth_tag.id).with_source(MetaSource::Sidecar),
+                    FileTag::new("src/auth2.rs", service_tag.id).with_source(MetaSource::Sidecar),
+                ],
+            )
+            .unwrap();
 
         let stats = index.get_tag_stats().unwrap();
 
@@ -5172,12 +5484,23 @@ mod tests {
         index.add_dependencies(project_id, &deps).unwrap();
 
         // Get dep IDs
-        let dep1_id = index.get_dependency_id(project_id, "dep1").unwrap().unwrap();
-        let _dep2_id = index.get_dependency_id(project_id, "dep2").unwrap().unwrap();
-        let dep3_id = index.get_dependency_id(project_id, "dep3").unwrap().unwrap();
+        let dep1_id = index
+            .get_dependency_id(project_id, "dep1")
+            .unwrap()
+            .unwrap();
+        let _dep2_id = index
+            .get_dependency_id(project_id, "dep2")
+            .unwrap()
+            .unwrap();
+        let dep3_id = index
+            .get_dependency_id(project_id, "dep3")
+            .unwrap()
+            .unwrap();
 
         // Mark two dependencies as indexed in batch
-        index.mark_dependencies_indexed_batch(&[dep1_id, dep3_id]).unwrap();
+        index
+            .mark_dependencies_indexed_batch(&[dep1_id, dep3_id])
+            .unwrap();
 
         // Verify: dep1 and dep3 should be indexed, dep2 should not
         let all_deps = index.get_dependencies(project_id, false).unwrap();
