@@ -12,11 +12,15 @@
 
 ## Основные зоны кода
 - `src/cli` — CLI команды и аргументы.
+  - `index` по умолчанию инкрементальный: hash-based skip unchanged + cleanup stale files.
+  - `serve` поддерживает `--transport stdio|unix` и `--socket` для daemon режима.
 - `src/indexer` — индексирование и извлечение символов.
   - `sidecar.rs` — парсинг `.code-indexer.yml`, staleness detection.
   - `progress.rs` — shared progress state (atomic counters) для CLI progress bar и MCP `get_indexing_status`.
 - `src/index` — SQLite слой и схема (12 таблиц, включая tag_dictionary, file_meta, file_tags).
+  - `sqlite.rs` — `files` tracking (`content_hash`) для persisted incremental indexing.
 - `src/mcp` — MCP server и tools (tag, include_file_meta параметры).
+  - `index_workspace` инкрементально пропускает unchanged файлы по hash.
 - `src/languages` — registry и tree-sitter грамматики.
 - `src/workspace` и `src/dependencies` — workspace и deps indexing.
 - `tests/` — интеграционные тесты и сценарии MCP/CLI.
@@ -29,6 +33,7 @@
 ## Команды (базовые)
 - Сборка: `cargo build --release`
 - Тесты: `cargo test`
+- Полный rebuild индекса: удалить `.code-index.db` и запустить `code-indexer index`.
 
 ## Принципы работы
 - Сначала изучить `.memory-bank/index.md`.

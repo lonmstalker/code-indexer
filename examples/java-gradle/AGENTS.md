@@ -7,3 +7,4 @@
 
 Локальный контекст:
 Пример Gradle‑проекта. Есть `build.gradle`, `settings.gradle` и `src/`.
+Для локальных прогонов помни: `code-indexer index` теперь инкрементальный по `content_hash`; для полного rebuild удаляй `.code-index.db`.

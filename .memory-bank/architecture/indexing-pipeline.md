@@ -8,17 +8,21 @@ description: "Пайплайн индексирования: от FileWalker д�
 
 ## Основная цепочка
 1. File discovery: `FileWalker::new(LanguageRegistry)` собирает поддерживаемые файлы.
-2. Progress init: `IndexingProgress::start(files.len())` — shared atomic state для tracking.
-3. Parsing: `Parser::parse_file` строит AST через tree-sitter (rayon `map_init`: parser/extractor создаются один раз на worker thread).
-4. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports. Queries берутся из cache (`cached_*_query`) при наличии.
-5. Persist: `SqliteIndex::add_extraction_results_batch_with_durability` сохраняет данные в SQLite (`--durability fast|safe` для bulk index).
-6. Finish: `progress.finish()` — финализация прогресса.
+2. Incremental precheck: для каждого файла вычисляется `content_hash`; unchanged файлы пропускаются через `file_needs_reindex`.
+3. Stale cleanup: из индекса удаляются tracked-файлы, которых больше нет в workspace (`remove_files_batch`).
+4. Progress init: `IndexingProgress::start(files_to_index.len())` — shared atomic state для tracking.
+5. Parsing: `Parser::parse_file` строит AST через tree-sitter (rayon `map_init`: parser/extractor создаются один раз на worker thread).
+6. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports. Queries берутся из cache (`cached_*_query`) при наличии.
+7. Persist: сначала удаляются старые записи для changed-файлов, затем `SqliteIndex::add_extraction_results_batch_with_durability` сохраняет новые символы (`--durability fast|safe` для bulk index).
+8. File tracking persist: `upsert_file_records_batch` обновляет `files(path, language, symbol_count, content_hash)` для следующего incremental-run.
+9. Finish: `progress.finish()` — финализация прогресса.
 
 CLI использует `indicatif::ProgressBar` для визуализации. MCP предоставляет `get_indexing_status` tool для polling.
 
 ## Watch mode
 - `FileWatcher` отслеживает изменения.
 - На Modified/Created: удаление старых данных по файлу и повторная индексация.
+- Для changed-файла обновляется `content_hash` в `files` через `upsert_file_records_batch`.
 - На Deleted: удаление файла из индекса.
 
 ## Дополнительные анализаторы

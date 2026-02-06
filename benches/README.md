@@ -19,6 +19,7 @@
 - strict parity precheck: `code_indexer_count == rg_count`;
 - метрики `median`, `p95`, `cv%`;
 - два режима: `query-only` и `first-run`.
+- учитывает, что `code-indexer index` по умолчанию инкрементальный (skip unchanged по `content_hash`).
 
 Ограничение: page-cache flush не выполняется (process-cold, не guaranteed disk-cold).
 
@@ -51,6 +52,10 @@ python3 benches/speed/run_speed_bench.py \
   --out-json benches/results/speed/latest.json \
   --out-md benches/results/speed/latest.md
 ```
+
+Примечание по режимам:
+- `query-only`: использует уже построенный индекс;
+- `first-run`: runner принудительно удаляет DB перед каждой итерацией для полного cold-пайплайна (`index + query`), без инкрементального skip.
 
 ## CI smoke
 

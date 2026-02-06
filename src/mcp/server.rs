@@ -1995,10 +1995,11 @@ impl ServerHandler for McpServer {
         let result = match tool_name {
             // === 1. index_workspace ===
             "index_workspace" => {
-                use crate::index::sqlite::SqliteIndex;
+                use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
                 use crate::indexer::{FileWalker, Parser, SymbolExtractor};
                 use crate::languages::LanguageRegistry;
                 use rayon::prelude::*;
+                use std::collections::HashSet;
 
                 let params: IndexWorkspaceParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -2017,6 +2018,26 @@ impl ServerHandler for McpServer {
                 })?;
 
                 let files_count = files.len();
+                let current_files: HashSet<String> = files
+                    .iter()
+                    .map(|file| file.to_string_lossy().to_string())
+                    .collect();
+                let tracked_files = self.index.get_tracked_files().map_err(|e| {
+                    McpError::internal_error(format!("Failed to list tracked files: {}", e), None)
+                })?;
+                let stale_files: Vec<String> = tracked_files
+                    .into_iter()
+                    .filter(|tracked| !current_files.contains(tracked))
+                    .collect();
+                if !stale_files.is_empty() {
+                    let stale_refs: Vec<&str> = stale_files.iter().map(|s| s.as_str()).collect();
+                    self.index.remove_files_batch(&stale_refs).map_err(|e| {
+                        McpError::internal_error(
+                            format!("Failed to remove stale files: {}", e),
+                            None,
+                        )
+                    })?;
+                }
 
                 // Incremental indexing: filter out files that haven't changed
                 let files_to_index: Vec<_> = files
@@ -2046,7 +2067,7 @@ impl ServerHandler for McpServer {
 
                 // Parallel parsing and extraction using rayon
                 let parse_cache = self.parse_cache.clone();
-                let results: Vec<(std::path::PathBuf, String, crate::indexer::ExtractionResult)> =
+                let results: Vec<(IndexedFileRecord, crate::indexer::ExtractionResult)> =
                     files_to_index
                         .into_par_iter()
                         .map_init(
@@ -2059,8 +2080,17 @@ impl ServerHandler for McpServer {
                                 match parse_cache.parse_source_cached(file, &content, parser) {
                                     Ok(parsed) => match extractor.extract_all(&parsed, file) {
                                         Ok(result) => {
-                                            progress_ref.inc(result.symbols.len());
-                                            Some((file.clone(), hash, result))
+                                            let symbol_count = result.symbols.len();
+                                            progress_ref.inc(symbol_count);
+                                            Some((
+                                                IndexedFileRecord {
+                                                    path: file.to_string_lossy().to_string(),
+                                                    language: parsed.language.clone(),
+                                                    symbol_count,
+                                                    content_hash: hash,
+                                                },
+                                                result,
+                                            ))
                                         }
                                         Err(_) => {
                                             progress_ref.inc_error();
@@ -2081,22 +2111,17 @@ impl ServerHandler for McpServer {
                 let files_updated = results.len();
 
                 // Remove old data for files that will be updated (batch operation)
-                let file_paths: Vec<String> = results
-                    .iter()
-                    .map(|(f, _, _)| f.to_string_lossy().to_string())
-                    .collect();
+                let file_paths: Vec<String> = results.iter().map(|(f, _)| f.path.clone()).collect();
                 let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
                 let _ = self.index.remove_files_batch(&file_refs);
 
-                // Extract hashes first (before moving results)
-                let file_hashes: Vec<_> = results
-                    .iter()
-                    .map(|(f, h, _)| (f.to_string_lossy().to_string(), h.clone()))
-                    .collect();
-
-                // Extract results for batch insert
-                let extraction_results: Vec<crate::indexer::ExtractionResult> =
-                    results.into_iter().map(|(_, _, r)| r).collect();
+                // Split records and extracted symbols for storage.
+                let mut file_records = Vec::with_capacity(results.len());
+                let mut extraction_results = Vec::with_capacity(results.len());
+                for (file_record, extraction_result) in results {
+                    file_records.push(file_record);
+                    extraction_results.push(extraction_result);
+                }
 
                 // Batch insert all results
                 let total_symbols = self
@@ -2106,10 +2131,15 @@ impl ServerHandler for McpServer {
                         McpError::internal_error(format!("Failed to store results: {}", e), None)
                     })?;
 
-                // Update content hashes for indexed files
-                for (file_path, hash) in file_hashes {
-                    let _ = self.index.set_file_content_hash(&file_path, &hash);
-                }
+                // Persist file metadata/content hashes for incremental updates.
+                self.index
+                    .upsert_file_records_batch(&file_records)
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("Failed to update file records: {}", e),
+                            None,
+                        )
+                    })?;
 
                 self.indexing_progress.finish();
 

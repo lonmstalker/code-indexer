@@ -61,6 +61,14 @@ pub struct SqliteIndex {
     pool: Pool<SqliteConnectionManager>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexedFileRecord {
+    pub path: String,
+    pub language: String,
+    pub symbol_count: usize,
+    pub content_hash: String,
+}
+
 impl SqliteIndex {
     /// Default pool size for concurrent connections.
     const DEFAULT_POOL_SIZE: u32 = 4;
@@ -241,10 +249,24 @@ impl SqliteIndex {
     /// Updates the content hash for a file.
     pub fn set_file_content_hash(&self, file_path: &str, content_hash: &str) -> Result<()> {
         let conn = self.conn()?;
-        conn.execute(
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let updated = conn.execute(
             "UPDATE files SET content_hash = ?1 WHERE path = ?2",
             params![content_hash, file_path],
         )?;
+        if updated == 0 {
+            conn.execute(
+                r#"
+                INSERT INTO files (path, language, last_modified, symbol_count, content_hash)
+                VALUES (?1, 'unknown', ?2, 0, ?3)
+                "#,
+                params![file_path, now, content_hash],
+            )?;
+        }
         Ok(())
     }
 
@@ -268,6 +290,56 @@ impl SqliteIndex {
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+
+    /// Upserts file tracking records used by incremental indexing.
+    pub fn upsert_file_records_batch(&self, records: &[IndexedFileRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let mut stmt = tx.prepare_cached(
+            r#"
+            INSERT INTO files (path, language, last_modified, symbol_count, content_hash)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(path) DO UPDATE SET
+                language = excluded.language,
+                last_modified = excluded.last_modified,
+                symbol_count = excluded.symbol_count,
+                content_hash = excluded.content_hash
+            "#,
+        )?;
+
+        for record in records {
+            stmt.execute(params![
+                &record.path,
+                &record.language,
+                now,
+                record.symbol_count as i64,
+                &record.content_hash,
+            ])?;
+        }
+
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gets all tracked files from the `files` table.
+    pub fn get_tracked_files(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path")?;
+        let files = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(files)
     }
 
     // === Project and Dependency Methods ===
@@ -5009,6 +5081,52 @@ mod tests {
         let index = SqliteIndex::in_memory().unwrap();
         let hash = index.get_file_content_hash("nonexistent.rs").unwrap();
         assert!(hash.is_none());
+    }
+
+    #[test]
+    fn test_set_file_content_hash_upserts_when_file_missing() {
+        let index = SqliteIndex::in_memory().unwrap();
+        index.set_file_content_hash("new.rs", "hash-1").unwrap();
+
+        assert_eq!(
+            index.get_file_content_hash("new.rs").unwrap(),
+            Some("hash-1".to_string())
+        );
+        assert!(index
+            .get_tracked_files()
+            .unwrap()
+            .contains(&"new.rs".to_string()));
+    }
+
+    #[test]
+    fn test_upsert_file_records_batch_updates_tracked_files() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let records = vec![
+            IndexedFileRecord {
+                path: "a.rs".to_string(),
+                language: "rust".to_string(),
+                symbol_count: 2,
+                content_hash: "h1".to_string(),
+            },
+            IndexedFileRecord {
+                path: "b.rs".to_string(),
+                language: "rust".to_string(),
+                symbol_count: 0,
+                content_hash: "h2".to_string(),
+            },
+        ];
+        index.upsert_file_records_batch(&records).unwrap();
+
+        let tracked = index.get_tracked_files().unwrap();
+        assert_eq!(tracked, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(
+            index.get_file_content_hash("a.rs").unwrap(),
+            Some("h1".to_string())
+        );
+        assert_eq!(
+            index.get_file_content_hash("b.rs").unwrap(),
+            Some("h2".to_string())
+        );
     }
 
     // Helper to add a file entry to the files table

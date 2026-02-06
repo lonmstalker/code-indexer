@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 
 use crate::error::Result;
-use crate::index::sqlite::SqliteIndex;
+use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
 use crate::index::{CodeIndex, CompactSymbol, FileMeta, MetaSource, OutputFormat, SearchOptions};
 use crate::indexer::watcher::FileEvent;
 use crate::indexer::{
@@ -506,6 +506,12 @@ pub fn index_directory(
 ) -> Result<()> {
     use code_indexer::indexer::ExtractionResult;
 
+    #[derive(Clone)]
+    struct FileWorkItem {
+        path: PathBuf,
+        content_hash: String,
+    }
+
     // If db_path is the default value, place the database inside the indexed directory
     let effective_db = if db_path == Path::new(".code-index.db") {
         path.join(".code-index.db")
@@ -523,18 +529,57 @@ pub fn index_directory(
     }
 
     let files = walker.walk(path)?;
+    let current_files: HashSet<String> = files
+        .iter()
+        .map(|file| file.to_string_lossy().to_string())
+        .collect();
+
+    let tracked_files = index.get_tracked_files()?;
+    let stale_files: Vec<String> = tracked_files
+        .into_iter()
+        .filter(|tracked| !current_files.contains(tracked))
+        .collect();
+    if !stale_files.is_empty() {
+        let stale_refs: Vec<&str> = stale_files.iter().map(|p| p.as_str()).collect();
+        index.remove_files_batch(&stale_refs)?;
+        println!("Removed {} stale files from index", stale_files.len());
+    }
 
     // === Phase 1: Process sidecar files ===
     let sidecar_meta = process_sidecar_files(&files, path, &index)?;
+
+    let mut files_to_index = Vec::new();
+    for file in &files {
+        match fs::read_to_string(file) {
+            Ok(content) => {
+                let file_path = file.to_string_lossy().to_string();
+                let content_hash = SqliteIndex::compute_content_hash(&content);
+                if index.file_needs_reindex(&file_path, &content_hash)? {
+                    files_to_index.push(FileWorkItem {
+                        path: file.clone(),
+                        content_hash,
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading {}: {}", file.display(), e);
+            }
+        }
+    }
+
+    let unchanged_files = files.len().saturating_sub(files_to_index.len());
+    if unchanged_files > 0 {
+        println!("Skipping {} unchanged files", unchanged_files);
+    }
 
     // Set up progress tracking
     use crate::indexer::IndexingProgress;
     use indicatif::{ProgressBar, ProgressStyle};
 
     let progress = IndexingProgress::new();
-    progress.start(files.len());
+    progress.start(files_to_index.len());
 
-    let pb = ProgressBar::new(files.len() as u64);
+    let pb = ProgressBar::new(files_to_index.len() as u64);
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {elapsed_precise} ETA {eta} | {msg}",
@@ -547,10 +592,10 @@ pub fn index_directory(
     // Parallel parsing and extraction using rayon
     let progress_ref = &progress;
     let pb_ref = &pb;
-    let total_files = files.len();
+    let total_files = files_to_index.len();
     let files_done = AtomicUsize::new(0);
     let progress_batch_size = 32usize;
-    let results: Vec<ExtractionResult> = files
+    let results: Vec<(IndexedFileRecord, ExtractionResult)> = files_to_index
         .par_iter()
         .map_init(
             || {
@@ -559,18 +604,29 @@ pub fn index_directory(
                     SymbolExtractor::new(),
                 )
             },
-            |(parser, extractor), file| match parser.parse_file(file) {
-                Ok(parsed) => match extractor.extract_all(&parsed, file) {
+            |(parser, extractor), file| match parser.parse_file(&file.path) {
+                Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
                     Ok(result) => {
-                        progress_ref.inc(result.symbols.len());
+                        let symbol_count = result.symbols.len();
+                        let file_record = IndexedFileRecord {
+                            path: file.path.to_string_lossy().to_string(),
+                            language: parsed.language.clone(),
+                            symbol_count,
+                            content_hash: file.content_hash.clone(),
+                        };
+                        progress_ref.inc(symbol_count);
                         let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                         if completed % progress_batch_size == 0 || completed == total_files {
                             pb_ref.set_position(completed as u64);
                         }
-                        Some(result)
+                        Some((file_record, result))
                     }
                     Err(e) => {
-                        eprintln!("Error extracting symbols from {}: {}", file.display(), e);
+                        eprintln!(
+                            "Error extracting symbols from {}: {}",
+                            file.path.display(),
+                            e
+                        );
                         progress_ref.inc_error();
                         let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                         if completed % progress_batch_size == 0 || completed == total_files {
@@ -580,7 +636,7 @@ pub fn index_directory(
                     }
                 },
                 Err(e) => {
-                    eprintln!("Error parsing {}: {}", file.display(), e);
+                    eprintln!("Error parsing {}: {}", file.path.display(), e);
                     progress_ref.inc_error();
                     let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                     if completed % progress_batch_size == 0 || completed == total_files {
@@ -593,18 +649,30 @@ pub fn index_directory(
         .filter_map(|r| r)
         .collect();
 
+    let mut file_records = Vec::with_capacity(results.len());
+    let mut extraction_results = Vec::with_capacity(results.len());
+    for (file_record, extraction_result) in results {
+        file_records.push(file_record);
+        extraction_results.push(extraction_result);
+    }
+
     // === Phase 2: Compute exported_hash for staleness detection ===
     // Do this before batch insert to avoid moving results
-    update_exported_hashes(&results, &sidecar_meta, &index)?;
+    update_exported_hashes(&extraction_results, &sidecar_meta, &index)?;
 
-    // Batch insert all results
+    // Remove stale rows for changed files before batch insert.
+    let changed_paths: Vec<&str> = file_records.iter().map(|r| r.path.as_str()).collect();
+    index.remove_files_batch(&changed_paths)?;
+
+    // Batch insert all changed results.
     let total_symbols =
-        index.add_extraction_results_batch_with_durability(results, use_fast_bulk)?;
+        index.add_extraction_results_batch_with_durability(extraction_results, use_fast_bulk)?;
+    index.upsert_file_records_batch(&file_records)?;
 
     pb.finish_with_message(format!(
-        "{} symbols from {} files",
+        "{} symbols from {} changed files",
         total_symbols,
-        files.len()
+        file_records.len()
     ));
     progress.finish();
 
@@ -648,6 +716,15 @@ pub fn index_directory(
                                     if let Ok(result) = extractor.extract_all(&parsed, &file_path) {
                                         let count = result.symbols.len();
                                         index.add_extraction_results_batch(vec![result])?;
+                                        let content_hash =
+                                            SqliteIndex::compute_content_hash(&parsed.source);
+                                        let file_record = IndexedFileRecord {
+                                            path: file_path.to_string_lossy().to_string(),
+                                            language: parsed.language.clone(),
+                                            symbol_count: count,
+                                            content_hash,
+                                        };
+                                        index.upsert_file_records_batch(&[file_record])?;
 
                                         // Re-apply sidecar metadata for this file
                                         if let Err(e) =
@@ -2582,4 +2659,111 @@ pub fn show_tag_stats(db_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::CodeIndex;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn index_directory_persists_content_hash_for_incremental_runs() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let source_path = temp_dir.path().join("lib.rs");
+        let source = "pub fn alpha() {}\n";
+        fs::write(&source_path, source).expect("write source");
+
+        index_directory(
+            temp_dir.path(),
+            Path::new(".code-index.db"),
+            false,
+            IndexDurability::Safe,
+        )
+        .expect("index first run");
+
+        let db_path = temp_dir.path().join(".code-index.db");
+        let index = SqliteIndex::new(&db_path).expect("open db");
+        let file_path = source_path.to_string_lossy().to_string();
+        let expected_hash = SqliteIndex::compute_content_hash(source);
+
+        assert_eq!(
+            index.get_file_content_hash(&file_path).expect("read hash"),
+            Some(expected_hash.clone())
+        );
+        assert!(!index
+            .file_needs_reindex(&file_path, &expected_hash)
+            .expect("hash compare"));
+
+        index_directory(
+            temp_dir.path(),
+            Path::new(".code-index.db"),
+            false,
+            IndexDurability::Safe,
+        )
+        .expect("index second run");
+
+        let index = SqliteIndex::new(&db_path).expect("reopen db");
+        let defs = index.find_definition("alpha").expect("find definition");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            index
+                .get_file_content_hash(&file_path)
+                .expect("read hash again"),
+            Some(expected_hash)
+        );
+    }
+
+    #[test]
+    fn index_directory_removes_deleted_files_from_tracking() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let removed_path = temp_dir.path().join("removed.rs");
+        let kept_path = temp_dir.path().join("kept.rs");
+        fs::write(&removed_path, "pub fn removed() {}\n").expect("write removed");
+        fs::write(&kept_path, "pub fn kept() {}\n").expect("write kept");
+
+        index_directory(
+            temp_dir.path(),
+            Path::new(".code-index.db"),
+            false,
+            IndexDurability::Safe,
+        )
+        .expect("index first run");
+
+        fs::remove_file(&removed_path).expect("remove source file");
+
+        index_directory(
+            temp_dir.path(),
+            Path::new(".code-index.db"),
+            false,
+            IndexDurability::Safe,
+        )
+        .expect("index second run");
+
+        let db_path = temp_dir.path().join(".code-index.db");
+        let index = SqliteIndex::new(&db_path).expect("open db");
+        let removed_str = removed_path.to_string_lossy().to_string();
+
+        assert!(
+            index
+                .find_definition("removed")
+                .expect("query removed")
+                .is_empty(),
+            "deleted file symbols must be removed from index"
+        );
+        assert_eq!(
+            index
+                .get_file_content_hash(&removed_str)
+                .expect("removed hash lookup"),
+            None
+        );
+        assert!(
+            !index
+                .get_tracked_files()
+                .expect("tracked files")
+                .contains(&removed_str),
+            "deleted file must be removed from tracked files table"
+        );
+    }
 }

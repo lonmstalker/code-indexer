@@ -14,6 +14,8 @@
 - `query-only`: один `index`, затем многократные query-замеры.
 - `first-run`: на каждую итерацию `rm db + index + query` для `code-indexer`; для `rg` только query.
 
+Важно: `code-indexer index` по умолчанию инкрементальный (skip unchanged + cleanup stale files), поэтому в `first-run` runner специально удаляет DB перед каждым прогоном.
+
 ## Ограничения
 
 На macOS не делается принудительный page-cache flush, поэтому это process-cold benchmark, а не guaranteed disk-cold benchmark.

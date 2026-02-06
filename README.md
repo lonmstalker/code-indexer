@@ -17,6 +17,7 @@ CLI-инструмент и MCP-сервер для индексации и се
 - **Dependency indexing** — индексация зависимостей
 - **Virtual documents** — поддержка несохранённых изменений (LSP overlay)
 - **File Tags & Intent Layer** — метаданные файлов через sidecar `.code-indexer.yml`
+- **Incremental indexing by default** — skip unchanged файлов по `content_hash` + cleanup stale файлов
 
 ## Производительность (честный speed-check v2)
 
@@ -78,6 +79,11 @@ CLI показывает реалтайм progress bar с ETA:
 ⠋ [################>-----------------------] 847/2160 (39%) | 00:01:23 ETA 00:02:05 | indexing...
 ```
 
+По умолчанию `index` работает инкрементально:
+- unchanged файлы пропускаются (`content_hash` parity);
+- удалённые из workspace файлы удаляются из индекса;
+- полный rebuild можно принудительно сделать удалением `.code-index.db`.
+
 ```bash
 # Индексация текущей директории
 code-indexer index
@@ -90,6 +96,10 @@ code-indexer index --watch
 
 # Индексация с зависимостями
 code-indexer index --deep-deps
+
+# Профиль durability для bulk-индексации
+code-indexer index --durability fast
+code-indexer index --durability safe
 ```
 
 ### Поиск символов
@@ -112,12 +122,18 @@ code-indexer definition "SymbolName"
 
 # Найти ссылки на символ
 code-indexer references "UserService" --callers
+
+# Выполнить query через запущенный daemon
+code-indexer definition "SymbolName" --remote /tmp/code-indexer.sock
 ```
 
 ### Запуск MCP сервера
 
 ```bash
 code-indexer serve
+
+# daemon на unix socket
+code-indexer serve --transport unix --socket /tmp/code-indexer.sock
 ```
 
 ## CLI Commands
@@ -126,16 +142,16 @@ code-indexer serve
 
 | Команда | Описание | Ключевые флаги |
 |---------|----------|----------------|
-| `index [path]` | Индексация директории | `--watch`, `--deep-deps` |
-| `serve` | Запуск MCP сервера | — |
-| `symbols [query]` | Поиск и список символов | `--kind`, `--fuzzy`, `--format` |
-| `definition <name>` | Найти определение | `--include-deps`, `--dep` |
-| `references <name>` | Найти ссылки | `--callers`, `--depth` |
-| `call-graph <func>` | Анализ графа вызовов | `--direction`, `--depth` |
-| `outline <file>` | Структура файла | `--scopes`, `--start-line` |
-| `imports <file>` | Импорты файла | `--resolve` |
+| `index [path]` | Индексация директории | `--watch`, `--deep-deps`, `--durability` |
+| `serve` | Запуск MCP сервера | `--transport`, `--socket` |
+| `symbols [query]` | Поиск и список символов | `--kind`, `--fuzzy`, `--format`, `--remote` |
+| `definition <name>` | Найти определение | `--include-deps`, `--dep`, `--remote` |
+| `references <name>` | Найти ссылки | `--callers`, `--depth`, `--remote` |
+| `call-graph <func>` | Анализ графа вызовов | `--direction`, `--depth`, `--remote` |
+| `outline <file>` | Структура файла | `--scopes`, `--start-line`, `--remote` |
+| `imports <file>` | Импорты файла | `--resolve`, `--remote` |
 | `changed` | Изменённые символы (git) | `--base`, `--staged` |
-| `stats` | Статистика индекса | — |
+| `stats` | Статистика индекса | `--remote` |
 | `clear` | Очистка индекса | — |
 | `deps <subcmd>` | Работа с зависимостями | `list`, `index`, `find`, `info` |
 | `tags <subcmd>` | Управление тегами | `add-rule`, `remove-rule`, `list-rules`, `preview`, `apply`, `stats` |

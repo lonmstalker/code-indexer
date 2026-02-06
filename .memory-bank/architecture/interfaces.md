@@ -5,7 +5,7 @@ description: "Поверхности CLI и MCP tools, их назначение
 # Interfaces (Architecture)
 
 ## CLI Surface
-- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`.
+- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`; по умолчанию работает инкрементально (skip unchanged + cleanup stale files по `content_hash`/tracked files).
 - `serve` — запуск MCP server (`--transport stdio|unix`, `--socket <path>` для unix daemon).
 - `symbols` — список символов с фильтрами, поддерживает `--remote <unix-socket>`.
 - `definition` — поиск определений, поддерживает `--remote <unix-socket>`.
