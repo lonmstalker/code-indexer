@@ -76,6 +76,10 @@ pub struct InferredTag {
 /// Root sidecar data with tag rules (for project root .code-indexer.yml)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RootSidecarData {
+    /// Internal agent routing defaults used by prepare-context / prepare_context
+    #[serde(default)]
+    pub agent: Option<AgentConfig>,
+
     /// Global tag inference rules
     #[serde(default)]
     pub tag_rules: Vec<TagRule>,
@@ -87,6 +91,85 @@ pub struct RootSidecarData {
     /// Per-file metadata (same as regular sidecar)
     #[serde(default)]
     pub files: HashMap<String, FileMetadata>,
+}
+
+/// Internal LLM agent defaults stored in root .code-indexer.yml
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Provider name: openai, anthropic, openrouter, local
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Provider-specific model ID
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional custom endpoint/base URL
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Optional raw API token (not recommended; prefer api_key_env)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional env var name with API token (preferred)
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Optional routing mode (default planner)
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// Normalizes agent provider name and validates it is enabled.
+pub fn normalize_agent_provider(provider: Option<&str>) -> Option<String> {
+    let provider = provider?.trim().to_lowercase();
+    if provider.is_empty() || provider == "none" {
+        return None;
+    }
+    Some(provider)
+}
+
+/// Returns default token env var for known providers.
+pub fn default_agent_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "local" => Some("LOCAL_LLM_API_KEY"),
+        _ => None,
+    }
+}
+
+/// Resolves API key and effective env var for agent config.
+///
+/// Priority:
+/// 1) `agent.api_key`
+/// 2) env var from `agent.api_key_env`
+/// 3) provider default env var (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
+pub fn resolve_agent_api_key(
+    config: &AgentConfig,
+    provider: &str,
+) -> (Option<String>, Option<String>) {
+    let explicit_token = config
+        .api_key
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    let explicit_env = config
+        .api_key_env
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    let effective_env =
+        explicit_env.or_else(|| default_agent_api_key_env(provider).map(|v| v.to_string()));
+
+    let env_token = effective_env
+        .as_deref()
+        .and_then(|env_name| std::env::var(env_name).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    (explicit_token.or(env_token), effective_env)
 }
 
 impl RootSidecarData {
@@ -951,6 +1034,11 @@ use crate::something;
     #[test]
     fn test_root_sidecar_data_parse() {
         let content = r#"
+agent:
+  provider: openrouter
+  model: openrouter/auto
+  api_key_env: OPENROUTER_API_KEY
+
 tag_rules:
   - pattern: "**/auth/**"
     tags:
@@ -973,8 +1061,57 @@ files:
         assert_eq!(data.tag_rules[0].pattern, "**/auth/**");
         assert_eq!(data.tag_rules[0].confidence, 0.8);
         assert_eq!(data.tag_rules[1].confidence, 0.7); // default
+        let agent = data.agent.expect("agent config");
+        assert_eq!(agent.provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(agent.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
         assert_eq!(data.directory_tags.len(), 1);
         assert!(data.files.contains_key("main.rs"));
+    }
+
+    #[test]
+    fn test_default_agent_api_key_env() {
+        assert_eq!(default_agent_api_key_env("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(
+            default_agent_api_key_env("anthropic"),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            default_agent_api_key_env("openrouter"),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(default_agent_api_key_env("unknown"), None);
+    }
+
+    #[test]
+    fn test_resolve_agent_api_key_with_explicit_token() {
+        let cfg = AgentConfig {
+            provider: Some("openai".to_string()),
+            api_key: Some("  sk-explicit  ".to_string()),
+            ..Default::default()
+        };
+
+        let (token, env_name) = resolve_agent_api_key(&cfg, "openai");
+        assert_eq!(token.as_deref(), Some("sk-explicit"));
+        assert_eq!(env_name.as_deref(), Some("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn test_resolve_agent_api_key_from_custom_env() {
+        let env_name = "CODE_INDEXER_TEST_AGENT_TOKEN";
+        std::env::set_var(env_name, "tok-from-env");
+
+        let cfg = AgentConfig {
+            provider: Some("openrouter".to_string()),
+            api_key_env: Some(env_name.to_string()),
+            ..Default::default()
+        };
+
+        let (token, used_env_name) = resolve_agent_api_key(&cfg, "openrouter");
+        assert_eq!(token.as_deref(), Some("tok-from-env"));
+        assert_eq!(used_env_name.as_deref(), Some(env_name));
+
+        std::env::remove_var(env_name);
     }
 
     #[test]

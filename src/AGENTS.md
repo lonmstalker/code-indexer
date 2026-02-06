@@ -14,5 +14,5 @@
 - `index/migrations.rs` — миграции V1-V8, включая tag_dictionary, file_meta, file_tags, generic_params, `idx_symbols_def_lookup`.
 - `index/models.rs` — FileMeta, FileTag, TagDictionary, Stability, MetaSource.
 - `index/sqlite.rs` — `files` tracking (`content_hash`) и batch-upsert file records для persisted incremental indexing.
-- `cli/commands.rs` — incremental `index` по умолчанию (skip unchanged + stale cleanup), термопрофили `--profile eco|balanced|max`, `--threads`, `--throttle-ms`, плюс `prepare-context` для AI-ready context bundle.
-- `mcp/server.rs` + `mcp/consolidated.rs` — `prepare_context`/`get_context_bundle` и типы агентного routing (`provider/model/endpoint`).
+- `cli/commands.rs` — incremental `index` по умолчанию (skip unchanged + stale cleanup), термопрофили `--profile eco|balanced|max`, `--threads`, `--throttle-ms`, плюс `prepare-context` (agent routing из `.code-indexer.yml`).
+- `mcp/server.rs` + `mcp/consolidated.rs` — `prepare_context`/`get_context_bundle` и типы агентного routing (`provider/model/endpoint/api_key[_env]`).

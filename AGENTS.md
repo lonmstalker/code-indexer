@@ -14,7 +14,7 @@
 - `src/cli` — CLI команды и аргументы.
   - `index` по умолчанию инкрементальный: hash-based skip unchanged + cleanup stale files.
   - `index` имеет термопрофили ресурсов: `--profile eco|balanced|max` (default: `balanced`), override через `--threads`, дополнительный `--throttle-ms`.
-  - `prepare-context` собирает AI-ready контекст из NL-запроса; поддерживает `--provider openai|anthropic|openrouter|local` + budget/file/task-hint.
+  - `prepare-context` собирает AI-ready контекст из NL-запроса; agent routing берётся из корневого `.code-indexer.yml` (`agent.provider/model/endpoint/api_key[_env]`) + budget/file/task-hint.
   - `serve` поддерживает `--transport stdio|unix` и `--socket` для daemon режима.
 - `src/indexer` — индексирование и извлечение символов.
   - `sidecar.rs` — парсинг `.code-indexer.yml`, staleness detection.
