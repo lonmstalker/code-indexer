@@ -113,8 +113,9 @@ code-indexer index --threads 2 --throttle-ms 8 --durability safe
 code-indexer prepare-context "where is auth token validated?" \
   --file src/auth/middleware.rs \
   --task-hint debugging \
-  --provider openrouter \
-  --model openrouter/auto
+  --agent-timeout-sec 60 \
+  --agent-max-steps 6
+# токен/провайдер берутся из .code-indexer.yml -> agent.*, токен можно через env
 ```
 
 ### Поиск символов
@@ -158,7 +159,7 @@ code-indexer serve --transport unix --socket /tmp/code-indexer.sock
 | Команда | Описание | Ключевые флаги |
 |---------|----------|----------------|
 | `index [path]` | Индексация директории | `--watch`, `--deep-deps`, `--durability`, `--profile`, `--threads`, `--throttle-ms` |
-| `prepare-context <query>` | AI-ready контекст-пакет | `--file`, `--task-hint`, `--max-items`, `--provider`, `--model`, `--remote` |
+| `prepare-context <query>` | Agent-only сбор контекста по задаче | `--file`, `--task-hint`, `--max-items`, `--agent-timeout-sec`, `--agent-max-steps`, `--agent-include-trace`, `--remote` |
 | `serve` | Запуск MCP сервера | `--transport`, `--socket` |
 | `symbols [query]` | Поиск и список символов | `--kind`, `--fuzzy`, `--format`, `--remote` |
 | `definition <name>` | Найти определение | `--include-deps`, `--dep`, `--remote` |
@@ -354,7 +355,7 @@ UserService:cls@src/UserService.java:10
 | 11 | `get_diagnostics` | Dead code, метрики | `kind`, `file`, `include_metrics`, `target` |
 | 12 | `get_stats` | Статистика индекса | `detailed`, `include_workspace`, `include_deps` |
 | 13 | `get_context_bundle` | Summary-first контекст | `input`, `budget`, `format`, `agent` |
-| 14 | `prepare_context` | Agent-friendly single query | `query`, `file`, `task_hint`, `max_items`, `provider/model` |
+| 14 | `prepare_context` | Agent-only orchestration context collection | `query`, `file`, `task_hint`, `max_items`, `agent_timeout_ms`, `agent_max_steps`, `include_trace`, `agent` |
 | 22 | `manage_tags` | Управление tag inference | `action`, `pattern`, `tags`, `confidence`, `file`, `path` |
 | 24 | `get_indexing_status` | Прогресс индексации | — (без параметров) |
 
@@ -500,6 +501,13 @@ files:
 **Формат в корневом `.code-indexer.yml`:**
 
 ```yaml
+agent:
+  provider: openrouter
+  model: openrouter/auto
+  endpoint: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  mode: planner
+
 tag_rules:
   - pattern: "**/auth/**"
     tags: [domain:auth]
@@ -518,6 +526,81 @@ tag_rules:
 # Остальные поля sidecar
 directory_tags: []
 files: {}
+```
+
+`prepare-context` (CLI и MCP tool `prepare_context`) теперь работает только в agent-режиме и читает `agent.*` из корневого `.code-indexer.yml`.  
+Если валидный агент-конфиг не найден, вызов завершится ошибкой.  
+Детерминированный non-agent путь для контекста остаётся в отдельном tool `get_context_bundle`.
+
+`prepare_context` возвращает только собранный контекст и связи:
+- `task_context` (module/file/symbol/deps/docs слои)
+- `coverage` и `gaps` (без silent truncation)
+- `collection_meta` (шаги/время/usage, опционально trace)
+
+План/summary от агента не формируется и не возвращается.
+
+Токен аутентификации поддерживается двумя способами:
+- `agent.api_key_env` (рекомендуется)
+- `agent.api_key` (прямо в config, менее безопасно)
+
+Для `provider: local` (включая vibeproxy-gateway) auth может быть опциональным, если endpoint не требует bearer token.
+
+Если `api_key_env` не указан, используется provider-default:
+- `openai` -> `OPENAI_API_KEY`
+- `anthropic` -> `ANTHROPIC_API_KEY`
+- `openrouter` -> `OPENROUTER_API_KEY`
+- `local` -> `LOCAL_LLM_API_KEY`
+
+### Примеры agent-конфига для провайдеров
+
+```yaml
+# OpenAI
+agent:
+  provider: openai
+  model: gpt-4o-mini
+  endpoint: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  mode: planner
+```
+
+```yaml
+# Anthropic
+agent:
+  provider: anthropic
+  model: claude-3-5-sonnet-latest
+  endpoint: https://api.anthropic.com
+  api_key_env: ANTHROPIC_API_KEY
+  mode: planner
+```
+
+```yaml
+# OpenRouter
+agent:
+  provider: openrouter
+  model: openrouter/auto
+  endpoint: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  mode: planner
+```
+
+```yaml
+# Local gateway (Ollama/vLLM/TGI/proxy)
+agent:
+  provider: local
+  model: gpt-5.2
+  endpoint: http://127.0.0.1:11434/v1
+  api_key_env: LOCAL_LLM_API_KEY
+  mode: planner
+```
+
+```yaml
+# Vibeproxy (OpenAI-compatible routing)
+agent:
+  provider: local
+  model: gpt-5.2
+  endpoint: https://<your-vibeproxy-endpoint>/v1
+  api_key_env: VIBEPROXY_API_KEY
+  mode: planner
 ```
 
 **CLI команды:**

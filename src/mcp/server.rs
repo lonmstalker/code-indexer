@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -16,6 +17,10 @@ use tracing::warn;
 use crate::index::overlay::DocumentOverlay;
 use crate::index::sqlite::SqliteIndex;
 use crate::index::{CodeIndex, SearchOptions, SearchResult, SymbolKind};
+use crate::mcp::agent_client::{AgentClient, AgentClientConfig};
+use crate::mcp::agent_orchestrator::{
+    run_agent_context_collection, AgentCollectionRequest, AgentCollectionResult,
+};
 use crate::mcp::consolidated::*;
 
 /// Diversifies search results by limiting the number of results per directory.
@@ -108,6 +113,14 @@ impl McpServer {
         params: GetContextBundleParams,
     ) -> crate::error::Result<crate::index::ResponseEnvelope<ContextBundle>> {
         self.get_context_bundle_impl(params)
+    }
+
+    /// Agent-orchestrated prepare_context entrypoint.
+    pub async fn prepare_context_with_agent(
+        &self,
+        params: PrepareContextParams,
+    ) -> crate::error::Result<crate::index::ResponseEnvelope<ContextBundle>> {
+        self.prepare_context_agent_impl(params).await
     }
 
     // === Write Queue Helper Methods ===
@@ -877,7 +890,11 @@ impl McpServer {
         let sample_k = budget.sample_k.unwrap_or(5);
         let include_snippets = budget.include_snippets.unwrap_or(false);
         let snippet_lines = budget.snippet_lines.unwrap_or(3);
-        let agent_info = normalize_agent_config(params.agent.clone());
+        let requested_agent = params
+            .agent
+            .clone()
+            .or_else(|| load_internal_agent_config_from_root(Path::new(".")));
+        let agent_info = normalize_agent_config(requested_agent);
 
         let mut symbol_cards: Vec<SymbolCard> = Vec::new();
         let mut top_usages: Vec<UsageRef> = Vec::new();
@@ -1138,6 +1155,10 @@ impl McpServer {
             imports_relevant,
             agent: agent_info.clone(),
             suggested_tool_calls,
+            task_context: None,
+            coverage: None,
+            gaps: Vec::new(),
+            collection_meta: None,
         };
 
         // Build response envelope
@@ -1162,6 +1183,602 @@ impl McpServer {
 
         Ok(envelope.with_next(next_actions))
     }
+
+    async fn prepare_context_agent_impl(
+        &self,
+        params: PrepareContextParams,
+    ) -> crate::error::Result<crate::index::ResponseEnvelope<ContextBundle>> {
+        use crate::index::{OutputFormat, ResponseEnvelope};
+
+        let requested_agent = params
+            .agent
+            .clone()
+            .or_else(|| load_internal_agent_config_from_root(Path::new(".")));
+
+        let internal_agent = requested_agent.ok_or_else(|| {
+            crate::error::IndexerError::Mcp(
+                "prepare_context requires a valid agent configuration (provider/model/endpoint/api_key)".to_string(),
+            )
+        })?;
+
+        let agent_info = normalize_agent_config(Some(internal_agent.clone())).ok_or_else(|| {
+            crate::error::IndexerError::Mcp(
+                "prepare_context requires a valid agent provider in configuration".to_string(),
+            )
+        })?;
+        let runtime = resolve_agent_runtime_config(internal_agent)?;
+
+        let timeout_ms = params.agent_timeout_ms.unwrap_or(60_000).max(1);
+        let max_steps = params.agent_max_steps.unwrap_or(6).max(1);
+        let include_trace = params.include_trace.unwrap_or(false);
+        let client = AgentClient::new(AgentClientConfig {
+            provider: runtime.provider.clone(),
+            model: runtime.model.clone(),
+            endpoint: runtime.endpoint.clone(),
+            api_key: runtime.api_key,
+            timeout: Duration::from_millis(timeout_ms),
+        })?;
+
+        let format = params
+            .format
+            .as_deref()
+            .and_then(OutputFormat::from_str)
+            .unwrap_or(OutputFormat::Minimal);
+
+        let bundle_params: GetContextBundleParams = params.clone().into();
+        let mut base_envelope = self.get_context_bundle_impl(bundle_params)?;
+        let mut bundle = base_envelope
+            .items
+            .as_ref()
+            .and_then(|items| items.first().cloned())
+            .or_else(|| {
+                base_envelope
+                    .sample
+                    .as_ref()
+                    .and_then(|items| items.first().cloned())
+            })
+            .unwrap_or_else(|| ContextBundle {
+                symbol_cards: Vec::new(),
+                top_usages: Vec::new(),
+                call_neighborhood: None,
+                imports_relevant: Vec::new(),
+                agent: None,
+                suggested_tool_calls: Vec::new(),
+                task_context: None,
+                coverage: None,
+                gaps: Vec::new(),
+                collection_meta: None,
+            });
+
+        let query = params.query.clone();
+        let file = params.file.clone();
+        let task_hint = params.task_hint.clone();
+
+        let collection: AgentCollectionResult = run_agent_context_collection(
+            &client,
+            AgentCollectionRequest {
+                query: query.clone(),
+                file: file.clone(),
+                task_hint: task_hint.clone(),
+                timeout_ms: Some(timeout_ms),
+                max_steps: Some(max_steps),
+                include_trace,
+                provider: runtime.provider.clone(),
+                model: Some(runtime.model),
+                endpoint: Some(runtime.endpoint),
+            },
+            |tool, args| self.execute_agent_collection_tool(tool, args),
+        )
+        .await?;
+
+        bundle.agent = Some(agent_info.clone());
+        bundle.task_context = Some(collection.task_context);
+        bundle.coverage = Some(collection.coverage.clone());
+        bundle.gaps = collection.gaps;
+        bundle.collection_meta = Some(collection.collection_meta);
+        bundle.suggested_tool_calls = merge_suggested_calls(
+            bundle.suggested_tool_calls,
+            collection.suggested_tool_calls,
+        );
+
+        let mut envelope = ResponseEnvelope::with_items(vec![bundle], format);
+        for warning in base_envelope.meta.warnings.drain(..) {
+            envelope = envelope.with_warning(warning);
+        }
+        envelope = envelope.with_warning(format!(
+            "prepare_context collected context via internal agent orchestration: provider={}, mode={}",
+            agent_info.provider, agent_info.mode
+        ));
+
+        if !collection.coverage.complete {
+            envelope = envelope.with_warning(
+                "prepare_context returned partial context; inspect coverage and gaps".to_string(),
+            );
+        }
+
+        let next_actions = merge_next_actions(base_envelope.next, collection.next_actions);
+        Ok(envelope.with_next(next_actions))
+    }
+
+    fn execute_agent_collection_tool(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        match tool {
+            "search_symbols" => {
+                let query = args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "search_symbols requires 'query'".to_string())?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+                let file_filter = args
+                    .get("file")
+                    .or_else(|| args.get("in_file"))
+                    .or_else(|| args.get("path"))
+                    .or_else(|| args.get("file_glob"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let options = SearchOptions {
+                    limit: limit.or(Some(20)),
+                    file_filter,
+                    use_advanced_ranking: Some(true),
+                    ..Default::default()
+                };
+                let results = self.index.search(query, &options).map_err(|e| e.to_string())?;
+                serde_json::to_value(results).map_err(|e| e.to_string())
+            }
+            "find_references" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "find_references requires 'name'".to_string())?;
+                let options = SearchOptions {
+                    limit: args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize),
+                    file_filter: args
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string()),
+                    ..Default::default()
+                };
+
+                let mut output = serde_json::Map::new();
+                let refs = self
+                    .index
+                    .find_references(name, &options)
+                    .map_err(|e| e.to_string())?;
+                output.insert(
+                    "references".to_string(),
+                    serde_json::to_value(refs).map_err(|e| e.to_string())?,
+                );
+
+                if args
+                    .get("include_callers")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let depth = args.get("depth").and_then(|v| v.as_u64()).map(|v| v as u32);
+                    let callers = self
+                        .index
+                        .find_callers(name, depth)
+                        .map_err(|e| e.to_string())?;
+                    output.insert(
+                        "callers".to_string(),
+                        serde_json::to_value(callers).map_err(|e| e.to_string())?,
+                    );
+                }
+
+                Ok(serde_json::Value::Object(output))
+            }
+            "analyze_call_graph" => {
+                let function = args
+                    .get("function")
+                    .or_else(|| args.get("name"))
+                    .or_else(|| args.get("symbol_name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "analyze_call_graph requires 'function'".to_string())?;
+                let direction = args
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("out");
+                let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+                let mut output = serde_json::Map::new();
+
+                if direction == "out" || direction == "both" {
+                    let graph = self
+                        .index
+                        .get_call_graph(function, depth)
+                        .map_err(|e| e.to_string())?;
+                    output.insert(
+                        "call_graph".to_string(),
+                        serde_json::to_value(graph).map_err(|e| e.to_string())?,
+                    );
+                }
+                if direction == "in" || direction == "both" {
+                    let callers = self
+                        .index
+                        .find_callers(function, Some(depth))
+                        .map_err(|e| e.to_string())?;
+                    output.insert(
+                        "callers".to_string(),
+                        serde_json::to_value(callers).map_err(|e| e.to_string())?,
+                    );
+                }
+
+                Ok(serde_json::Value::Object(output))
+            }
+            "get_file_outline" => {
+                let file = args
+                    .get("file")
+                    .or_else(|| args.get("path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "get_file_outline requires 'file'".to_string())?;
+                let symbols = self.index.get_file_symbols(file).map_err(|e| e.to_string())?;
+                let mut output = serde_json::Map::new();
+                output.insert(
+                    "symbols".to_string(),
+                    serde_json::to_value(symbols).map_err(|e| e.to_string())?,
+                );
+                if args
+                    .get("include_scopes")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Ok(scopes) = self.index.get_file_scopes(file) {
+                        output.insert(
+                            "scopes".to_string(),
+                            serde_json::to_value(scopes).map_err(|e| e.to_string())?,
+                        );
+                    }
+                }
+                if let Ok(Some((meta, tags))) = self.index.get_file_meta_with_tags(file) {
+                    let mut file_meta = serde_json::Map::new();
+                    if let Some(ref doc1) = meta.doc1 {
+                        file_meta.insert("doc1".to_string(), serde_json::json!(doc1));
+                    }
+                    if let Some(ref purpose) = meta.purpose {
+                        file_meta.insert("purpose".to_string(), serde_json::json!(purpose));
+                    }
+                    let tag_values: Vec<String> = tags
+                        .iter()
+                        .filter_map(|t| {
+                            t.tag_category
+                                .as_ref()
+                                .zip(t.tag_name.as_ref())
+                                .map(|(c, n)| format!("{}:{}", c, n))
+                        })
+                        .collect();
+                    if !tag_values.is_empty() {
+                        file_meta.insert("tags".to_string(), serde_json::json!(tag_values));
+                    }
+                    output.insert("file_meta".to_string(), serde_json::Value::Object(file_meta));
+                }
+                Ok(serde_json::Value::Object(output))
+            }
+            "get_imports" => {
+                let file = args
+                    .get("file")
+                    .or_else(|| args.get("path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "get_imports requires 'file'".to_string())?;
+                let imports = self.index.get_file_imports(file).map_err(|e| e.to_string())?;
+                let mut output = serde_json::Map::new();
+                output.insert(
+                    "imports".to_string(),
+                    serde_json::to_value(&imports).map_err(|e| e.to_string())?,
+                );
+                Ok(serde_json::Value::Object(output))
+            }
+            "list_modules" => {
+                let workspace_path = args
+                    .get("workspace_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let output = self
+                    .list_modules_impl(workspace_path)
+                    .map_err(|e| e.to_string())?;
+                parse_json_or_string_value(&output)
+            }
+            "find_module_dependencies" => {
+                let module_name = args
+                    .get("module_name")
+                    .or_else(|| args.get("module"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "find_module_dependencies requires 'module_name'".to_string())?;
+                let workspace_path = args
+                    .get("workspace_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let output = self
+                    .find_module_dependencies_impl(workspace_path, module_name)
+                    .map_err(|e| e.to_string())?;
+                parse_json_or_string_value(&output)
+            }
+            "get_architecture_summary" => {
+                let project_path = args
+                    .get("project_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let output = self
+                    .get_architecture_summary_impl(project_path)
+                    .map_err(|e| e.to_string())?;
+                parse_json_or_string_value(&output)
+            }
+            "get_stats" => {
+                let mut output =
+                    serde_json::to_value(self.index.get_stats().map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+
+                if args
+                    .get("include_workspace")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Ok(modules_output) = self.list_modules_impl(".") {
+                        if let Ok(modules_json) = parse_json_or_string_value(&modules_output) {
+                            if let serde_json::Value::Object(ref mut map) = output {
+                                map.insert("workspace".to_string(), modules_json);
+                            }
+                        }
+                    }
+                }
+
+                if args
+                    .get("include_architecture")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Ok(arch_output) = self.get_architecture_summary_impl(".") {
+                        if let Ok(arch_json) = parse_json_or_string_value(&arch_output) {
+                            if let serde_json::Value::Object(ref mut map) = output {
+                                map.insert("architecture".to_string(), arch_json);
+                            }
+                        }
+                    }
+                }
+
+                Ok(output)
+            }
+            "list_dependencies" => {
+                let project_path = args
+                    .get("project_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let include_dev = args
+                    .get("include_dev")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let output = self
+                    .list_dependencies_impl(project_path, include_dev)
+                    .map_err(|e| e.to_string())?;
+                parse_json_or_string_value(&output)
+            }
+            "get_dependency_info" => {
+                let dep_name = args
+                    .get("name")
+                    .or_else(|| args.get("dep_name"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "get_dependency_info requires 'name'".to_string())?;
+                let project_path = args
+                    .get("project_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let output = self
+                    .get_dependency_info_impl(project_path, dep_name)
+                    .map_err(|e| e.to_string())?;
+                parse_json_or_string_value(&output)
+            }
+            "get_dependency_source" => {
+                let symbol_name = args
+                    .get("symbol_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "get_dependency_source requires 'symbol_name'".to_string())?;
+                let dependency = args.get("dependency").and_then(|v| v.as_str());
+                let context_lines = args
+                    .get("context_lines")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as usize;
+                let output = self
+                    .get_dependency_source_impl(symbol_name, dependency, context_lines)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::String(output))
+            }
+            "get_doc_section" => {
+                let target = args
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "get_doc_section requires 'target'".to_string())?;
+                let digest = if target.contains('/') || target.contains('.') {
+                    self.index
+                        .get_doc_digest(target)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    let target_lower = target.to_lowercase();
+                    let all_docs = self.index.get_all_doc_digests().map_err(|e| e.to_string())?;
+                    all_docs
+                        .into_iter()
+                        .find(|d| d.doc_type.as_str() == target_lower)
+                };
+                if let Some(doc) = digest {
+                    serde_json::to_value(doc).map_err(|e| e.to_string())
+                } else {
+                    Err(format!("document '{}' not found", target))
+                }
+            }
+            "get_project_compass" => {
+                let db_rev = self.index.get_db_revision().map_err(|e| e.to_string())?;
+                let profile = self
+                    .index
+                    .get_project_profile(".")
+                    .map_err(|e| e.to_string())?
+                    .map(|(p, _)| p)
+                    .ok_or_else(|| "project profile is not available".to_string())?;
+                Ok(serde_json::json!({
+                    "db_rev": db_rev,
+                    "workspace_type": profile.workspace_type,
+                    "languages": profile.languages,
+                    "frameworks": profile.frameworks,
+                    "build_tools": profile.build_tools,
+                }))
+            }
+            "get_project_commands" => {
+                let commands = self.index.get_project_commands().map_err(|e| e.to_string())?;
+                serde_json::to_value(commands).map_err(|e| e.to_string())
+            }
+            _ => Err(format!("tool '{}' is not supported in prepare_context orchestrator", tool)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAgentRuntimeConfig {
+    provider: String,
+    model: String,
+    endpoint: String,
+    api_key: Option<String>,
+}
+
+fn parse_json_or_string_value(value: &str) -> std::result::Result<serde_json::Value, String> {
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(json) => Ok(json),
+        Err(_) => Ok(serde_json::Value::String(value.to_string())),
+    }
+}
+
+fn merge_suggested_calls(
+    mut existing: Vec<SuggestedToolCall>,
+    additional: Vec<SuggestedToolCall>,
+) -> Vec<SuggestedToolCall> {
+    let mut seen = std::collections::HashSet::new();
+    for call in existing.iter() {
+        let key = format!(
+            "{}:{}",
+            call.tool,
+            serde_json::to_string(&call.args).unwrap_or_default()
+        );
+        seen.insert(key);
+    }
+    for call in additional {
+        let key = format!(
+            "{}:{}",
+            call.tool,
+            serde_json::to_string(&call.args).unwrap_or_default()
+        );
+        if seen.insert(key) {
+            existing.push(call);
+        }
+    }
+    existing
+}
+
+fn merge_next_actions(
+    mut existing: Vec<crate::index::NextAction>,
+    additional: Vec<crate::index::NextAction>,
+) -> Vec<crate::index::NextAction> {
+    let mut seen = std::collections::HashSet::new();
+    for action in existing.iter() {
+        let key = format!(
+            "{}:{}",
+            action.tool,
+            serde_json::to_string(&action.args).unwrap_or_default()
+        );
+        seen.insert(key);
+    }
+    for action in additional {
+        let key = format!(
+            "{}:{}",
+            action.tool,
+            serde_json::to_string(&action.args).unwrap_or_default()
+        );
+        if seen.insert(key) {
+            existing.push(action);
+        }
+    }
+    existing
+}
+
+fn resolve_agent_runtime_config(
+    config: InternalAgentConfig,
+) -> crate::error::Result<ResolvedAgentRuntimeConfig> {
+    let provider =
+        crate::indexer::normalize_agent_provider(config.provider.as_deref()).ok_or_else(|| {
+            crate::error::IndexerError::Mcp(
+                "prepare_context agent config must define a valid provider".to_string(),
+            )
+        })?;
+
+    let model = config
+        .model
+        .as_deref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .ok_or_else(|| {
+            crate::error::IndexerError::Mcp(
+                "prepare_context agent config must define a model".to_string(),
+            )
+        })?;
+
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .or_else(|| default_openai_compatible_endpoint(&provider).map(|v| v.to_string()))
+        .ok_or_else(|| {
+            crate::error::IndexerError::Mcp(format!(
+                "prepare_context agent config must define endpoint for provider '{}'",
+                provider
+            ))
+        })?;
+
+    let inline_api_key = config
+        .api_key
+        .as_deref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    let explicit_env = config
+        .api_key_env
+        .as_deref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    let effective_env = explicit_env
+        .or_else(|| crate::indexer::default_agent_api_key_env(&provider).map(|v| v.to_string()));
+    let env_api_key = effective_env
+        .as_deref()
+        .and_then(|name| std::env::var(name).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let api_key = inline_api_key.or(env_api_key);
+    if api_key.is_none() && provider != "local" && provider != "vibeproxy" {
+        return Err(crate::error::IndexerError::Mcp(format!(
+            "prepare_context agent auth is not configured for provider '{}' (set api_key or api_key_env)",
+            provider
+        )));
+    }
+
+    Ok(ResolvedAgentRuntimeConfig {
+        provider,
+        model,
+        endpoint,
+        api_key,
+    })
+}
+
+fn default_openai_compatible_endpoint(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("https://api.openai.com/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "local" => Some("http://127.0.0.1:8317/v1"),
+        "vibeproxy" => Some("https://api.vibeproxy.dev/v1"),
+        _ => None,
+    }
 }
 
 fn normalize_agent_config(config: Option<InternalAgentConfig>) -> Option<ContextAgentInfo> {
@@ -1175,11 +1792,61 @@ fn normalize_agent_config(config: Option<InternalAgentConfig>) -> Option<Context
         return None;
     }
 
+    let inline_token = cfg
+        .api_key
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let explicit_env = cfg
+        .api_key_env
+        .as_ref()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let effective_env = explicit_env.or_else(|| {
+        crate::indexer::default_agent_api_key_env(&provider).map(|v| v.to_string())
+    });
+    let env_token = effective_env
+        .as_deref()
+        .and_then(|env_name| std::env::var(env_name).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let auth_source = if let Some(env_name) = effective_env.as_ref() {
+        Some(format!("env:{}", env_name))
+    } else if inline_token.is_some() {
+        Some("inline".to_string())
+    } else {
+        None
+    };
+    let auth_configured = inline_token.is_some() || env_token.is_some();
+
     Some(ContextAgentInfo {
         provider,
         model: cfg.model,
         endpoint: cfg.endpoint,
+        auth_configured,
+        auth_source,
         mode: cfg.mode.unwrap_or_else(|| "planner".to_string()),
+    })
+}
+
+fn load_internal_agent_config_from_root(project_root: &Path) -> Option<InternalAgentConfig> {
+    let sidecar_path = project_root.join(crate::indexer::SIDECAR_FILENAME);
+    let content = fs::read_to_string(sidecar_path).ok()?;
+    let root = crate::indexer::RootSidecarData::parse(&content).ok()?;
+    let agent = root.agent?;
+    let provider = crate::indexer::normalize_agent_provider(agent.provider.as_deref())?;
+    let (api_key, api_key_env) = crate::indexer::resolve_agent_api_key(&agent, &provider);
+
+    Some(InternalAgentConfig {
+        provider: Some(provider),
+        model: agent.model,
+        endpoint: agent.endpoint,
+        api_key,
+        api_key_env,
+        mode: agent.mode.or_else(|| Some("planner".to_string())),
     })
 }
 
@@ -1864,7 +2531,8 @@ impl ServerHandler for McpServer {
                 title: Some("Prepare Context".to_string()),
                 description: Some(
                     "Codex/Claude-oriented single-query context tool. Accepts natural language query, \
-                     optional provider routing (openai/anthropic/openrouter/local), and returns a \
+                     agent routing from root .code-indexer.yml (agent.provider/model/endpoint/api_key[_env]) \
+                     with optional request override, and returns a \
                      packed context envelope with suggested follow-up tool calls."
                         .into(),
                 ),
@@ -3125,9 +3793,7 @@ impl ServerHandler for McpServer {
                 )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let bundle_params: GetContextBundleParams = params.into();
-
-                match self.get_context_bundle_impl(bundle_params) {
+                match self.prepare_context_agent_impl(params).await {
                     Ok(result) => {
                         let json = serde_json::to_string_pretty(&result).unwrap_or_default();
                         CallToolResult::success(vec![Content::text(json)])
@@ -4166,6 +4832,49 @@ impl ServerHandler for McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn completion_body(content: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": { "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        })
+        .to_string()
+    }
+
+    async fn spawn_mock_agent_server(bodies: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = vec![0_u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{}/v1", addr)
+    }
 
     // === enforce_max_bytes tests ===
 
@@ -4350,6 +5059,8 @@ mod tests {
             provider: Some("none".to_string()),
             model: Some("gpt-4o-mini".to_string()),
             endpoint: None,
+            api_key: None,
+            api_key_env: None,
             mode: None,
         }));
         assert!(info.is_none());
@@ -4357,10 +5068,15 @@ mod tests {
 
     #[test]
     fn test_normalize_agent_config_openrouter() {
+        let env_name = "CODE_INDEXER_TEST_OPENROUTER_TOKEN_NORMALIZE";
+        std::env::set_var(env_name, "normalize-env-token");
+
         let info = normalize_agent_config(Some(InternalAgentConfig {
             provider: Some("openrouter".to_string()),
             model: Some("openrouter/auto".to_string()),
             endpoint: Some("https://openrouter.ai/api/v1".to_string()),
+            api_key: None,
+            api_key_env: Some(env_name.to_string()),
             mode: Some("planner".to_string()),
         }))
         .expect("agent info");
@@ -4371,6 +5087,219 @@ mod tests {
             info.endpoint.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
+        assert!(info.auth_configured);
+        assert_eq!(info.auth_source.as_deref(), Some("env:CODE_INDEXER_TEST_OPENROUTER_TOKEN_NORMALIZE"));
         assert_eq!(info.mode, "planner");
+
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn test_load_internal_agent_config_from_root_sidecar() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let sidecar_path = temp_dir.path().join(crate::indexer::SIDECAR_FILENAME);
+        let env_name = "CODE_INDEXER_TEST_OPENROUTER_TOKEN_MCP";
+        std::env::set_var(env_name, "mcp-token-from-env");
+        fs::write(
+            &sidecar_path,
+            r#"
+agent:
+  provider: openrouter
+  model: openrouter/auto
+  endpoint: https://openrouter.ai/api/v1
+  api_key_env: CODE_INDEXER_TEST_OPENROUTER_TOKEN_MCP
+"#,
+        )
+        .expect("write sidecar");
+
+        let config = load_internal_agent_config_from_root(temp_dir.path())
+            .expect("agent config from sidecar");
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(config.api_key_env.as_deref(), Some(env_name));
+        assert_eq!(config.api_key.as_deref(), Some("mcp-token-from-env"));
+        assert_eq!(config.mode.as_deref(), Some("planner"));
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn test_load_internal_agent_config_requires_provider() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let sidecar_path = temp_dir.path().join(crate::indexer::SIDECAR_FILENAME);
+        fs::write(
+            &sidecar_path,
+            r#"
+agent:
+  model: openrouter/auto
+"#,
+        )
+        .expect("write sidecar");
+
+        assert!(load_internal_agent_config_from_root(temp_dir.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_context_with_agent_requires_valid_config() {
+        let index = Arc::new(crate::index::sqlite::SqliteIndex::in_memory().expect("in-memory db"));
+        let server = McpServer::new(index);
+
+        let err = server
+            .prepare_context_with_agent(PrepareContextParams {
+                query: "collect context".to_string(),
+                file: None,
+                line: None,
+                column: None,
+                task_hint: None,
+                max_items: Some(10),
+                approx_tokens: None,
+                include_snippets: Some(false),
+                snippet_lines: Some(3),
+                format: Some("minimal".to_string()),
+                envelope: Some(true),
+                agent: Some(InternalAgentConfig {
+                    provider: Some("none".to_string()),
+                    model: Some("gpt-5.2".to_string()),
+                    endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+                    api_key: Some("test".to_string()),
+                    api_key_env: None,
+                    mode: Some("planner".to_string()),
+                }),
+                agent_timeout_ms: Some(2000),
+                agent_max_steps: Some(1),
+                include_trace: Some(false),
+            })
+            .await
+            .expect_err("invalid provider must fail");
+
+        assert!(err.to_string().contains("valid agent provider"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_context_with_agent_fails_on_invalid_json_response() {
+        let index = Arc::new(crate::index::sqlite::SqliteIndex::in_memory().expect("in-memory db"));
+        let server = McpServer::new(index);
+
+        let endpoint = spawn_mock_agent_server(vec![completion_body("not-json-command")]).await;
+        let err = server
+            .prepare_context_with_agent(PrepareContextParams {
+                query: "collect context".to_string(),
+                file: Some("src/lib.rs".to_string()),
+                line: None,
+                column: None,
+                task_hint: Some("debugging".to_string()),
+                max_items: Some(10),
+                approx_tokens: None,
+                include_snippets: Some(false),
+                snippet_lines: Some(3),
+                format: Some("minimal".to_string()),
+                envelope: Some(true),
+                agent: Some(InternalAgentConfig {
+                    provider: Some("local".to_string()),
+                    model: Some("gpt-5.2".to_string()),
+                    endpoint: Some(endpoint),
+                    api_key: Some("test-token".to_string()),
+                    api_key_env: None,
+                    mode: Some("planner".to_string()),
+                }),
+                agent_timeout_ms: Some(4000),
+                agent_max_steps: Some(1),
+                include_trace: Some(false),
+            })
+            .await
+            .expect_err("invalid json command must fail");
+
+        assert!(err
+            .to_string()
+            .contains("agent response is not valid JSON command"));
+    }
+
+    #[test]
+    fn test_prepare_context_bundle_includes_agent_and_suggested_calls() {
+        use crate::index::{CodeIndex, Location, Symbol, SymbolKind};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let index = Arc::new(crate::index::sqlite::SqliteIndex::in_memory().expect("in-memory db"));
+        index
+            .add_symbol(Symbol::new(
+                "auth_flow",
+                SymbolKind::Function,
+                Location::new("src/auth/service.rs", 10, 0, 20, 0),
+                "rust",
+            ))
+            .expect("add test symbol");
+
+        let server = McpServer::new(index);
+        let env_name = "CODE_INDEXER_TEST_LOCAL_TOKEN_PREPARE_CONTEXT";
+        std::env::set_var(env_name, "local-test-token");
+
+        let envelope = server
+            .prepare_context_bundle(GetContextBundleParams {
+                input: Some(ContextInput {
+                    query: Some("auth_flow".to_string()),
+                    file: Some("src/auth/service.rs".to_string()),
+                    position: None,
+                    symbol_ids: None,
+                    task_hint: Some("refactor auth flow".to_string()),
+                }),
+                budget: Some(ContextBudget {
+                    max_items: Some(10),
+                    include_snippets: Some(false),
+                    snippet_lines: Some(3),
+                    ..Default::default()
+                }),
+                format: Some("compact".to_string()),
+                envelope: Some(true),
+                agent: Some(InternalAgentConfig {
+                    provider: Some("local".to_string()),
+                    model: Some("gpt-5.2".to_string()),
+                    endpoint: Some("http://127.0.0.1:8317/v1".to_string()),
+                    api_key: None,
+                    api_key_env: Some(env_name.to_string()),
+                    mode: Some("planner".to_string()),
+                }),
+            })
+            .expect("prepare context bundle");
+
+        assert!(
+            envelope.meta.warnings.iter().any(|w| w
+                .contains("internal agent routing configured: provider=local, mode=planner"))
+        );
+
+        let items = envelope.items.expect("items");
+        assert_eq!(items.len(), 1);
+        let bundle = &items[0];
+
+        assert!(
+            !bundle.symbol_cards.is_empty(),
+            "expected at least one symbol card for query"
+        );
+
+        let agent = bundle.agent.as_ref().expect("agent info");
+        assert_eq!(agent.provider, "local");
+        assert_eq!(agent.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(agent.endpoint.as_deref(), Some("http://127.0.0.1:8317/v1"));
+        assert!(agent.auth_configured);
+        assert_eq!(
+            agent.auth_source.as_deref(),
+            Some("env:CODE_INDEXER_TEST_LOCAL_TOKEN_PREPARE_CONTEXT")
+        );
+        assert_eq!(agent.mode, "planner");
+
+        let tools: HashSet<&str> = bundle
+            .suggested_tool_calls
+            .iter()
+            .map(|call| call.tool.as_str())
+            .collect();
+        assert!(tools.contains("search_symbols"));
+        assert!(tools.contains("get_file_outline"));
+        assert!(tools.contains("get_imports"));
+        assert!(tools.contains("analyze_call_graph"));
+
+        std::env::remove_var(env_name);
     }
 }

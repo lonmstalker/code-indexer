@@ -161,10 +161,10 @@ async fn main() -> anyhow::Result<()> {
             approx_tokens,
             include_snippets,
             snippet_lines,
-            provider,
-            model,
-            endpoint,
             format,
+            agent_timeout_sec,
+            agent_max_steps,
+            agent_include_trace,
             remote,
         } => {
             cli::prepare_context(
@@ -178,10 +178,10 @@ async fn main() -> anyhow::Result<()> {
                 approx_tokens,
                 include_snippets,
                 snippet_lines,
-                provider,
-                model,
-                endpoint,
                 &format,
+                agent_timeout_sec,
+                agent_max_steps,
+                agent_include_trace,
                 remote.as_deref(),
             )
             .await?;

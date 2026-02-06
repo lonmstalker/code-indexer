@@ -36,6 +36,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 schemars = "1.2.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Database
 rusqlite = { version = "0.38.0", features = ["bundled"] }

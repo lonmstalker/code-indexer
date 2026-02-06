@@ -398,6 +398,12 @@ pub struct InternalAgentConfig {
     /// Custom endpoint/base URL (optional)
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Raw API key/token for provider auth (prefer api_key_env in config)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Env var name with API key/token (e.g. OPENAI_API_KEY)
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     /// Agent mode: planner, reranker, synthesizer (default: planner)
     #[serde(default)]
     pub mode: Option<String>,
@@ -441,6 +447,15 @@ pub struct PrepareContextParams {
     /// Optional internal agent routing configuration
     #[serde(default)]
     pub agent: Option<InternalAgentConfig>,
+    /// Agent orchestration timeout in milliseconds
+    #[serde(default)]
+    pub agent_timeout_ms: Option<u64>,
+    /// Maximum number of agent orchestration steps
+    #[serde(default)]
+    pub agent_max_steps: Option<u32>,
+    /// Include per-step collection trace (debug only)
+    #[serde(default)]
+    pub include_trace: Option<bool>,
 }
 
 impl From<PrepareContextParams> for GetContextBundleParams {
@@ -576,6 +591,18 @@ pub struct ContextBundle {
     /// Recommended follow-up tool calls for orchestrating agents
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggested_tool_calls: Vec<SuggestedToolCall>,
+    /// Unified task-centric context digest collected by agent orchestration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_context: Option<TaskContextDigest>,
+    /// Coverage status for context layers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ContextCoverage>,
+    /// Explicit collection gaps (never silently truncated)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<CoverageGap>,
+    /// Agent collection metadata and optional trace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection_meta: Option<AgentCollectionMeta>,
 }
 
 /// Internal agent details reflected in context bundle
@@ -589,6 +616,11 @@ pub struct ContextAgentInfo {
     /// Endpoint/base URL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Whether auth token is configured (token value is never exposed)
+    pub auth_configured: bool,
+    /// Auth source hint: inline or env:<VAR_NAME>
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
     /// Agent mode
     pub mode: String,
 }
@@ -602,6 +634,140 @@ pub struct SuggestedToolCall {
     pub args: serde_json::Value,
     /// Why this call is recommended
     pub reason: String,
+}
+
+/// Structured task-level context digest collected by the agent orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct TaskContextDigest {
+    /// Module-to-module dependency edges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_graph: Vec<ModuleDependencyEdge>,
+    /// File-level import graph edges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_import_graph: Vec<FileImportEdge>,
+    /// Symbol-level interaction graph edges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbol_interactions: Vec<SymbolInteractionEdge>,
+    /// Dependency API touchpoints discovered for the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps_touchpoints: Vec<DependencyTouchpoint>,
+    /// Documentation/config/architecture digest entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs_config_digest: Vec<DocConfigDigestEntry>,
+}
+
+/// Module dependency edge.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleDependencyEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+}
+
+/// File import edge.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FileImportEdge {
+    pub from_file: String,
+    pub imported_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_symbol: Option<String>,
+}
+
+/// Symbol interaction edge.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SymbolInteractionEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+/// Dependency touchpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DependencyTouchpoint {
+    pub dependency: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Docs/config digest entry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DocConfigDigestEntry {
+    pub source: String,
+    pub summary: String,
+}
+
+/// Coverage status for required/optional layers.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ContextCoverage {
+    pub module_graph: bool,
+    pub file_import_graph: bool,
+    pub symbol_interaction_graph: bool,
+    pub deps_touchpoints: bool,
+    pub docs_config_digest: bool,
+    pub complete: bool,
+}
+
+/// Explicitly reported gap in context coverage.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CoverageGap {
+    pub layer: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_tool_call: Option<SuggestedToolCall>,
+}
+
+/// Aggregated metadata for agent context collection.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCollectionMeta {
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub steps_taken: u32,
+    pub elapsed_ms: u64,
+    pub timeout_reached: bool,
+    pub max_steps_reached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentTokenUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace: Vec<AgentTraceStep>,
+}
+
+/// Token usage reported by the upstream chat-completions endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Per-step trace entry for debugging orchestration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTraceStep {
+    pub step: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<AgentTraceCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Trace call entry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentTraceCall {
+    pub tool: String,
+    pub args: serde_json::Value,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // =====================================================
@@ -1111,8 +1277,13 @@ mod tests {
                 provider: Some("openai".to_string()),
                 model: Some("gpt-4o-mini".to_string()),
                 endpoint: None,
+                api_key: None,
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
                 mode: Some("planner".to_string()),
             }),
+            agent_timeout_ms: Some(120_000),
+            agent_max_steps: Some(8),
+            include_trace: Some(true),
         };
 
         let converted: GetContextBundleParams = params.into();

@@ -6,7 +6,7 @@ description: "Поверхности CLI и MCP tools, их назначение
 
 ## CLI Surface
 - `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`, `--profile eco|balanced|max`, `--threads N`, `--throttle-ms`; по умолчанию работает инкрементально (skip unchanged + cleanup stale files по `content_hash`/tracked files).
-- `prepare-context` — агент-ориентированная упаковка контекста из NL-запроса; поддерживает `--file`, `--task-hint`, budget-флаги и routing (`--provider openai|anthropic|openrouter|local`).
+- `prepare-context` — agent-only оркестрация сбора контекста из NL-запроса; поддерживает `--file`, `--task-hint`, budget-флаги и лимиты оркестрации (`--agent-timeout-sec`, `--agent-max-steps`, `--agent-include-trace`); routing читается из корневого `.code-indexer.yml` (`agent.provider/model/endpoint/api_key[_env]`). Без валидного agent-конфига команда завершается ошибкой.
 - `serve` — запуск MCP server (`--transport stdio|unix`, `--socket <path>` для unix daemon).
 - `symbols` — список символов с фильтрами, поддерживает `--remote <unix-socket>`.
 - `definition` — поиск определений, поддерживает `--remote <unix-socket>`.
@@ -33,7 +33,10 @@ description: "Поверхности CLI и MCP tools, их назначение
 - `get_imports` — импорты файла. Params: `file`, `resolve`.
 - `get_diagnostics` — dead code и метрики. Params: `kind`, `file`, `include_metrics`, `target`.
 - `get_stats` — статистика индекса. Params: `detailed`, `include_workspace`, `include_deps`.
-- `prepare_context` — единый entrypoint для Codex/Claude-подобных агентов. Params: `query`, `file`, `task_hint`, `max_items`, `approx_tokens`, `agent(provider/model/endpoint)`.
+- `prepare_context` — agent-only entrypoint для context collection. Params: `query`, `file`, `task_hint`, `max_items`, `approx_tokens`, `agent_timeout_ms`, `agent_max_steps`, `include_trace`, `agent` (optional override; по умолчанию routing из `.code-indexer.yml`, включая token env fallback).
+- Для `provider: local` auth может быть опциональным (если gateway не требует bearer token).
+- Возвращает контекст без agent-plan/summary: `task_context`, `coverage`, `gaps`, `collection_meta` (+ стандартный envelope/next/warnings).
+- Для deterministic/non-agent подготовки контекста используется отдельный `get_context_bundle`.
 - `manage_tags` — управление tag inference rules. Params: `action`, `pattern`, `tags`, `confidence`, `file`, `path`.
 - `get_indexing_status` — прогресс текущей индексации (files_processed, progress_pct, eta_ms). Без параметров.
 

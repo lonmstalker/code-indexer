@@ -77,15 +77,6 @@ pub enum IndexPowerProfile {
     Max,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-pub enum AgentProvider {
-    None,
-    Openai,
-    Anthropic,
-    Openrouter,
-    Local,
-}
-
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -128,14 +119,24 @@ fn profile_name(profile: IndexPowerProfile) -> &'static str {
     }
 }
 
-fn agent_provider_name(provider: AgentProvider) -> &'static str {
-    match provider {
-        AgentProvider::None => "none",
-        AgentProvider::Openai => "openai",
-        AgentProvider::Anthropic => "anthropic",
-        AgentProvider::Openrouter => "openrouter",
-        AgentProvider::Local => "local",
-    }
+fn load_internal_agent_config(
+    project_root: &Path,
+) -> Option<crate::mcp::consolidated::InternalAgentConfig> {
+    let sidecar_path = project_root.join(SIDECAR_FILENAME);
+    let content = fs::read_to_string(sidecar_path).ok()?;
+    let root = crate::indexer::RootSidecarData::parse(&content).ok()?;
+    let agent = root.agent?;
+    let provider = crate::indexer::normalize_agent_provider(agent.provider.as_deref())?;
+    let (api_key, api_key_env) = crate::indexer::resolve_agent_api_key(&agent, &provider);
+
+    Some(crate::mcp::consolidated::InternalAgentConfig {
+        provider: Some(provider),
+        model: agent.model,
+        endpoint: agent.endpoint,
+        api_key,
+        api_key_env,
+        mode: agent.mode.or_else(|| Some("planner".to_string())),
+    })
 }
 
 #[derive(Subcommand)]
@@ -346,6 +347,7 @@ pub enum Commands {
     },
 
     /// Prepare AI-ready context bundle from a natural-language query
+    /// (agent routing defaults are loaded from root .code-indexer.yml -> agent.*)
     PrepareContext {
         /// Query from external coding agent (Codex/Claude/etc.)
         query: String,
@@ -382,21 +384,21 @@ pub enum Commands {
         #[arg(long, default_value = "3")]
         snippet_lines: usize,
 
-        /// Internal agent provider backend
-        #[arg(long, value_enum, default_value = "none")]
-        provider: AgentProvider,
-
-        /// Internal agent model ID
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Custom backend endpoint/base URL
-        #[arg(long)]
-        endpoint: Option<String>,
-
         /// Output format: full, compact, minimal
         #[arg(long, default_value = "minimal")]
         format: String,
+
+        /// Agent orchestration timeout in seconds
+        #[arg(long, default_value = "60")]
+        agent_timeout_sec: u64,
+
+        /// Maximum number of agent orchestration steps
+        #[arg(long, default_value = "6")]
+        agent_max_steps: u32,
+
+        /// Include detailed per-step collection trace (debug only)
+        #[arg(long)]
+        agent_include_trace: bool,
 
         /// Use already running MCP daemon over unix socket
         #[arg(long)]
@@ -1389,27 +1391,15 @@ pub async fn prepare_context(
     approx_tokens: Option<usize>,
     include_snippets: bool,
     snippet_lines: usize,
-    provider: AgentProvider,
-    model: Option<String>,
-    endpoint: Option<String>,
     format: &str,
+    agent_timeout_sec: u64,
+    agent_max_steps: u32,
+    agent_include_trace: bool,
     remote: Option<&Path>,
 ) -> Result<()> {
-    use crate::mcp::consolidated::{
-        GetContextBundleParams, InternalAgentConfig, PrepareContextParams,
-    };
+    use crate::mcp::consolidated::PrepareContextParams;
 
-    let provider_name = agent_provider_name(provider);
-    let agent = if provider == AgentProvider::None {
-        None
-    } else {
-        Some(InternalAgentConfig {
-            provider: Some(provider_name.to_string()),
-            model,
-            endpoint,
-            mode: Some("planner".to_string()),
-        })
-    };
+    let agent = load_internal_agent_config(Path::new("."));
 
     let params = PrepareContextParams {
         query: query.to_string(),
@@ -1424,11 +1414,17 @@ pub async fn prepare_context(
         format: Some(format.to_string()),
         envelope: Some(true),
         agent,
+        agent_timeout_ms: Some(agent_timeout_sec.saturating_mul(1000)),
+        agent_max_steps: Some(agent_max_steps),
+        include_trace: Some(agent_include_trace),
     };
 
     if let Some(socket) = remote {
         let args_value = serde_json::to_value(&params).map_err(|e| {
-            crate::error::IndexerError::Index(format!("Failed to serialize prepare_context params: {}", e))
+            crate::error::IndexerError::Index(format!(
+                "Failed to serialize prepare_context params: {}",
+                e
+            ))
         })?;
         let args = match args_value {
             serde_json::Value::Object(map) => map,
@@ -1448,8 +1444,7 @@ pub async fn prepare_context(
 
     let index = Arc::new(open_query_index(db_path)?);
     let server = crate::mcp::McpServer::new(index);
-    let bundle_params: GetContextBundleParams = params.into();
-    let envelope = server.prepare_context_bundle(bundle_params)?;
+    let envelope = server.prepare_context_with_agent(params).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&envelope).unwrap_or_default()
@@ -3139,12 +3134,6 @@ mod tests {
             "--include-snippets",
             "--snippet-lines",
             "5",
-            "--provider",
-            "openrouter",
-            "--model",
-            "openrouter/auto",
-            "--endpoint",
-            "https://openrouter.ai/api/v1",
             "--format",
             "minimal",
         ])
@@ -3161,10 +3150,10 @@ mod tests {
                 approx_tokens,
                 include_snippets,
                 snippet_lines,
-                provider,
-                model,
-                endpoint,
                 format,
+                agent_timeout_sec,
+                agent_max_steps,
+                agent_include_trace,
                 remote,
             } => {
                 assert_eq!(query, "find auth flow");
@@ -3179,13 +3168,89 @@ mod tests {
                 assert_eq!(approx_tokens, Some(4096));
                 assert!(include_snippets);
                 assert_eq!(snippet_lines, 5);
-                assert_eq!(provider, AgentProvider::Openrouter);
-                assert_eq!(model.as_deref(), Some("openrouter/auto"));
-                assert_eq!(endpoint.as_deref(), Some("https://openrouter.ai/api/v1"));
                 assert_eq!(format, "minimal");
+                assert_eq!(agent_timeout_sec, 60);
+                assert_eq!(agent_max_steps, 6);
+                assert!(!agent_include_trace);
                 assert!(remote.is_none());
             }
             _ => panic!("expected prepare-context command"),
         }
+    }
+
+    #[test]
+    fn cli_prepare_context_agent_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "code-indexer",
+            "prepare-context",
+            "trace auth",
+            "--agent-timeout-sec",
+            "90",
+            "--agent-max-steps",
+            "9",
+            "--agent-include-trace",
+        ])
+        .expect("cli parse");
+
+        match cli.command {
+            Commands::PrepareContext {
+                agent_timeout_sec,
+                agent_max_steps,
+                agent_include_trace,
+                ..
+            } => {
+                assert_eq!(agent_timeout_sec, 90);
+                assert_eq!(agent_max_steps, 9);
+                assert!(agent_include_trace);
+            }
+            _ => panic!("expected prepare-context command"),
+        }
+    }
+
+    #[test]
+    fn load_internal_agent_config_from_root_sidecar() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let sidecar_path = temp_dir.path().join(SIDECAR_FILENAME);
+        let env_name = "CODE_INDEXER_TEST_OPENROUTER_TOKEN";
+        std::env::set_var(env_name, "test-token-from-env");
+        fs::write(
+            &sidecar_path,
+            r#"
+agent:
+  provider: openrouter
+  model: openrouter/auto
+  endpoint: https://openrouter.ai/api/v1
+  api_key_env: CODE_INDEXER_TEST_OPENROUTER_TOKEN
+"#,
+        )
+        .expect("write sidecar");
+
+        let agent = load_internal_agent_config(temp_dir.path()).expect("agent config");
+        assert_eq!(agent.provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(
+            agent.endpoint.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(agent.api_key_env.as_deref(), Some(env_name));
+        assert_eq!(agent.api_key.as_deref(), Some("test-token-from-env"));
+        assert_eq!(agent.mode.as_deref(), Some("planner"));
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn load_internal_agent_config_without_provider_returns_none() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let sidecar_path = temp_dir.path().join(SIDECAR_FILENAME);
+        fs::write(
+            &sidecar_path,
+            r#"
+agent:
+  model: openrouter/auto
+"#,
+        )
+        .expect("write sidecar");
+
+        assert!(load_internal_agent_config(temp_dir.path()).is_none());
     }
 }
