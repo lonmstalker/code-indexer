@@ -314,6 +314,9 @@ pub struct GetContextBundleParams {
     /// Whether to wrap response in envelope (default: true for this tool)
     #[serde(default)]
     pub envelope: Option<bool>,
+    /// Optional internal agent routing configuration
+    #[serde(default)]
+    pub agent: Option<InternalAgentConfig>,
 }
 
 /// Input specification for context retrieval
@@ -379,6 +382,95 @@ impl Default for ContextBudget {
             snippet_lines: Some(3),
             include_snippets: Some(false),
             sample_k: Some(5),
+        }
+    }
+}
+
+/// Internal LLM agent routing configuration
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InternalAgentConfig {
+    /// Provider name: openai, anthropic, openrouter, local, none
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model ID, provider-specific
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Custom endpoint/base URL (optional)
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Agent mode: planner, reranker, synthesizer (default: planner)
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// Agent-friendly context API (single-query input) for Codex/Claude-like clients
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PrepareContextParams {
+    /// Natural language query from external coding agent
+    pub query: String,
+    /// Current file path for locality-aware ranking
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Cursor line in current file
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// Cursor column in current file
+    #[serde(default)]
+    pub column: Option<u32>,
+    /// Task intent hint (e.g. refactoring/debugging/understanding/implementing)
+    #[serde(default)]
+    pub task_hint: Option<String>,
+    /// Maximum number of ranked symbols to return
+    #[serde(default)]
+    pub max_items: Option<usize>,
+    /// Approximate token budget for the resulting context package
+    #[serde(default)]
+    pub approx_tokens: Option<usize>,
+    /// Include code snippets in context cards
+    #[serde(default)]
+    pub include_snippets: Option<bool>,
+    /// Snippet lines to include around symbol start line
+    #[serde(default)]
+    pub snippet_lines: Option<usize>,
+    /// Response format: full, compact, minimal
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Whether to wrap in envelope (defaults to true)
+    #[serde(default)]
+    pub envelope: Option<bool>,
+    /// Optional internal agent routing configuration
+    #[serde(default)]
+    pub agent: Option<InternalAgentConfig>,
+}
+
+impl From<PrepareContextParams> for GetContextBundleParams {
+    fn from(value: PrepareContextParams) -> Self {
+        let position = value.line.map(|line| ContextPosition {
+            line,
+            column: value.column,
+        });
+
+        let budget = ContextBudget {
+            max_items: value.max_items,
+            max_bytes: None,
+            approx_tokens: value.approx_tokens,
+            snippet_lines: value.snippet_lines,
+            include_snippets: value.include_snippets,
+            sample_k: Some(5),
+        };
+
+        Self {
+            input: Some(ContextInput {
+                query: Some(value.query),
+                file: value.file,
+                position,
+                symbol_ids: None,
+                task_hint: value.task_hint,
+            }),
+            budget: Some(budget),
+            format: value.format,
+            envelope: Some(value.envelope.unwrap_or(true)),
+            agent: value.agent,
         }
     }
 }
@@ -478,6 +570,38 @@ pub struct ContextBundle {
     /// Relevant imports
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub imports_relevant: Vec<RelevantImport>,
+    /// Selected internal agent backend details (if configured)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ContextAgentInfo>,
+    /// Recommended follow-up tool calls for orchestrating agents
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_tool_calls: Vec<SuggestedToolCall>,
+}
+
+/// Internal agent details reflected in context bundle
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextAgentInfo {
+    /// Provider name
+    pub provider: String,
+    /// Model name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Endpoint/base URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Agent mode
+    pub mode: String,
+}
+
+/// Suggested follow-up tool call for context expansion
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SuggestedToolCall {
+    /// Tool name to call next
+    pub tool: String,
+    /// Recommended arguments
+    pub args: serde_json::Value,
+    /// Why this call is recommended
+    pub reason: String,
 }
 
 // =====================================================
@@ -963,5 +1087,46 @@ pub struct TagStatInfo {
     pub tag: String,
     /// Number of files with this tag
     pub count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_context_converts_to_context_bundle_params() {
+        let params = PrepareContextParams {
+            query: "find user auth flow".to_string(),
+            file: Some("src/auth/service.rs".to_string()),
+            line: Some(42),
+            column: Some(7),
+            task_hint: Some("debugging".to_string()),
+            max_items: Some(15),
+            approx_tokens: Some(4096),
+            include_snippets: Some(true),
+            snippet_lines: Some(5),
+            format: Some("minimal".to_string()),
+            envelope: Some(true),
+            agent: Some(InternalAgentConfig {
+                provider: Some("openai".to_string()),
+                model: Some("gpt-4o-mini".to_string()),
+                endpoint: None,
+                mode: Some("planner".to_string()),
+            }),
+        };
+
+        let converted: GetContextBundleParams = params.into();
+        let input = converted.input.expect("input");
+        let budget = converted.budget.expect("budget");
+
+        assert_eq!(input.query.as_deref(), Some("find user auth flow"));
+        assert_eq!(input.file.as_deref(), Some("src/auth/service.rs"));
+        assert_eq!(input.position.expect("position").line, 42);
+        assert_eq!(budget.max_items, Some(15));
+        assert_eq!(budget.approx_tokens, Some(4096));
+        assert_eq!(budget.include_snippets, Some(true));
+        assert_eq!(converted.format.as_deref(), Some("minimal"));
+        assert!(converted.agent.is_some());
+    }
 }
 

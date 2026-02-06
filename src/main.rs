@@ -28,8 +28,19 @@ async fn main() -> anyhow::Result<()> {
             watch,
             deep_deps,
             durability,
+            profile,
+            threads,
+            throttle_ms,
         } => {
-            cli::index_directory(&path, &cli.db, watch, durability)?;
+            cli::index_directory(
+                &path,
+                &cli.db,
+                watch,
+                durability,
+                profile,
+                threads,
+                throttle_ms,
+            )?;
             if deep_deps {
                 cli::index_dependencies(&path, &cli.db, None, false)?;
             }
@@ -139,6 +150,41 @@ async fn main() -> anyhow::Result<()> {
             format,
         } => {
             cli::get_changed_symbols(&cli.db, &base, staged, unstaged, &format)?;
+        }
+        Commands::PrepareContext {
+            query,
+            file,
+            line,
+            column,
+            task_hint,
+            max_items,
+            approx_tokens,
+            include_snippets,
+            snippet_lines,
+            provider,
+            model,
+            endpoint,
+            format,
+            remote,
+        } => {
+            cli::prepare_context(
+                &cli.db,
+                &query,
+                file,
+                line,
+                column,
+                task_hint,
+                max_items,
+                approx_tokens,
+                include_snippets,
+                snippet_lines,
+                provider,
+                model,
+                endpoint,
+                &format,
+                remote.as_deref(),
+            )
+            .await?;
         }
         Commands::Stats { remote } => {
             cli::show_stats(&cli.db, remote.as_deref()).await?;

@@ -4,7 +4,7 @@ CLI-инструмент и MCP-сервер для индексации и се
 
 ## Возможности
 
-- **23 MCP tools** для AI-агентов (Claude, GPT и др.)
+- **24 MCP tools** для AI-агентов (Claude, GPT, Codex и др.)
 - **17 языков программирования** с полной поддержкой синтаксиса
 - **Semantic analysis** — scope resolution, import resolution, FQDN computation
 - **Call graph с confidence** — различие между certain и possible вызовами
@@ -100,6 +100,21 @@ code-indexer index --deep-deps
 # Профиль durability для bulk-индексации
 code-indexer index --durability fast
 code-indexer index --durability safe
+
+# Термопрофили (по умолчанию: balanced, до 4 потоков)
+code-indexer index --profile eco
+code-indexer index --profile balanced
+code-indexer index --profile max
+
+# Ручное ограничение CPU-параллелизма и мягкий throttle
+code-indexer index --threads 2 --throttle-ms 8 --durability safe
+
+# Подготовка AI-ready контекста одной командой
+code-indexer prepare-context "where is auth token validated?" \
+  --file src/auth/middleware.rs \
+  --task-hint debugging \
+  --provider openrouter \
+  --model openrouter/auto
 ```
 
 ### Поиск символов
@@ -142,7 +157,8 @@ code-indexer serve --transport unix --socket /tmp/code-indexer.sock
 
 | Команда | Описание | Ключевые флаги |
 |---------|----------|----------------|
-| `index [path]` | Индексация директории | `--watch`, `--deep-deps`, `--durability` |
+| `index [path]` | Индексация директории | `--watch`, `--deep-deps`, `--durability`, `--profile`, `--threads`, `--throttle-ms` |
+| `prepare-context <query>` | AI-ready контекст-пакет | `--file`, `--task-hint`, `--max-items`, `--provider`, `--model`, `--remote` |
 | `serve` | Запуск MCP сервера | `--transport`, `--socket` |
 | `symbols [query]` | Поиск и список символов | `--kind`, `--fuzzy`, `--format`, `--remote` |
 | `definition <name>` | Найти определение | `--include-deps`, `--dep`, `--remote` |
@@ -321,7 +337,7 @@ JSON для программной обработки:
 UserService:cls@src/UserService.java:10
 ```
 
-## MCP Tools (23)
+## MCP Tools (24)
 
 | # | Tool | Описание | Ключевые параметры |
 |---|------|----------|-------------------|
@@ -337,8 +353,10 @@ UserService:cls@src/UserService.java:10
 | 10 | `get_imports` | Импорты файла | `file`, `resolve` |
 | 11 | `get_diagnostics` | Dead code, метрики | `kind`, `file`, `include_metrics`, `target` |
 | 12 | `get_stats` | Статистика индекса | `detailed`, `include_workspace`, `include_deps` |
+| 13 | `get_context_bundle` | Summary-first контекст | `input`, `budget`, `format`, `agent` |
+| 14 | `prepare_context` | Agent-friendly single query | `query`, `file`, `task_hint`, `max_items`, `provider/model` |
 | 22 | `manage_tags` | Управление tag inference | `action`, `pattern`, `tags`, `confidence`, `file`, `path` |
-| 23 | `get_indexing_status` | Прогресс индексации | — (без параметров) |
+| 24 | `get_indexing_status` | Прогресс индексации | — (без параметров) |
 
 ### Backward Compatibility
 

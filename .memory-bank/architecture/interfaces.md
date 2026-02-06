@@ -5,7 +5,8 @@ description: "Поверхности CLI и MCP tools, их назначение
 # Interfaces (Architecture)
 
 ## CLI Surface
-- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`; по умолчанию работает инкрементально (skip unchanged + cleanup stale files по `content_hash`/tracked files).
+- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`, `--profile eco|balanced|max`, `--threads N`, `--throttle-ms`; по умолчанию работает инкрементально (skip unchanged + cleanup stale files по `content_hash`/tracked files).
+- `prepare-context` — агент-ориентированная упаковка контекста из NL-запроса; поддерживает `--file`, `--task-hint`, budget-флаги и routing (`--provider openai|anthropic|openrouter|local`).
 - `serve` — запуск MCP server (`--transport stdio|unix`, `--socket <path>` для unix daemon).
 - `symbols` — список символов с фильтрами, поддерживает `--remote <unix-socket>`.
 - `definition` — поиск определений, поддерживает `--remote <unix-socket>`.
@@ -19,7 +20,7 @@ description: "Поверхности CLI и MCP tools, их назначение
 - `deps` — операции с зависимостями.
 - `query` — legacy namespace (deprecated).
 
-## MCP Surface (23 tools)
+## MCP Surface (24 tools)
 - `index_workspace` — индексация проекта. Params: `path`, `watch`, `include_deps`.
 - `update_files` — virtual documents. Params: `files[]` с `path`, `content`, `version`.
 - `list_symbols` — список символов. Params: `kind`, `language`, `file`, `pattern`, `limit`, `format`.
@@ -32,6 +33,7 @@ description: "Поверхности CLI и MCP tools, их назначение
 - `get_imports` — импорты файла. Params: `file`, `resolve`.
 - `get_diagnostics` — dead code и метрики. Params: `kind`, `file`, `include_metrics`, `target`.
 - `get_stats` — статистика индекса. Params: `detailed`, `include_workspace`, `include_deps`.
+- `prepare_context` — единый entrypoint для Codex/Claude-подобных агентов. Params: `query`, `file`, `task_hint`, `max_items`, `approx_tokens`, `agent(provider/model/endpoint)`.
 - `manage_tags` — управление tag inference rules. Params: `action`, `pattern`, `tags`, `confidence`, `file`, `path`.
 - `get_indexing_status` — прогресс текущей индексации (files_processed, progress_pct, eta_ms). Без параметров.
 

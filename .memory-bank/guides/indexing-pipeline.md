@@ -10,6 +10,21 @@ code-indexer index
 code-indexer index ./src
 ```
 
+## Термобезопасные профили (ноутбуки)
+```bash
+# минимальный нагрев
+code-indexer index --profile eco
+
+# дефолтный баланс (до 4 потоков)
+code-indexer index --profile balanced
+
+# максимум производительности
+code-indexer index --profile max
+
+# дополнительное снижение пиков
+code-indexer index --threads 2 --throttle-ms 8
+```
+
 ## Watch mode
 ```bash
 code-indexer index ./src --watch

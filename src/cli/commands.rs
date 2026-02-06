@@ -70,6 +70,74 @@ pub enum IndexDurability {
     Fast,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum IndexPowerProfile {
+    Eco,
+    Balanced,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum AgentProvider {
+    None,
+    Openai,
+    Anthropic,
+    Openrouter,
+    Local,
+}
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid usize value: {}", value))?;
+    if parsed == 0 {
+        return Err("Value must be >= 1".to_string());
+    }
+    Ok(parsed)
+}
+
+fn detect_available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn resolve_index_threads(
+    profile: IndexPowerProfile,
+    threads_override: Option<usize>,
+    available_parallelism: usize,
+) -> usize {
+    if let Some(value) = threads_override {
+        return value;
+    }
+
+    let available = available_parallelism.max(1);
+    match profile {
+        IndexPowerProfile::Eco => 1,
+        IndexPowerProfile::Balanced => available.min(4),
+        IndexPowerProfile::Max => available,
+    }
+}
+
+fn profile_name(profile: IndexPowerProfile) -> &'static str {
+    match profile {
+        IndexPowerProfile::Eco => "eco",
+        IndexPowerProfile::Balanced => "balanced",
+        IndexPowerProfile::Max => "max",
+    }
+}
+
+fn agent_provider_name(provider: AgentProvider) -> &'static str {
+    match provider {
+        AgentProvider::None => "none",
+        AgentProvider::Openai => "openai",
+        AgentProvider::Anthropic => "anthropic",
+        AgentProvider::Openrouter => "openrouter",
+        AgentProvider::Local => "local",
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Index a directory
@@ -89,6 +157,18 @@ pub enum Commands {
         /// Durability profile for bulk index write path
         #[arg(long, value_enum, default_value = "fast")]
         durability: IndexDurability,
+
+        /// Indexing resource profile (safe default for laptops)
+        #[arg(long, value_enum, default_value = "balanced")]
+        profile: IndexPowerProfile,
+
+        /// Limit rayon worker threads used for indexing
+        #[arg(long, value_parser = parse_positive_usize)]
+        threads: Option<usize>,
+
+        /// Sleep between file parses to reduce sustained CPU temperature
+        #[arg(long, default_value = "0")]
+        throttle_ms: u64,
     },
 
     /// Start MCP server
@@ -263,6 +343,64 @@ pub enum Commands {
         /// Output format: full, compact, minimal
         #[arg(long, default_value = "full")]
         format: String,
+    },
+
+    /// Prepare AI-ready context bundle from a natural-language query
+    PrepareContext {
+        /// Query from external coding agent (Codex/Claude/etc.)
+        query: String,
+
+        /// Current file for locality-aware ranking
+        #[arg(long)]
+        file: Option<PathBuf>,
+
+        /// Current cursor line in file
+        #[arg(long)]
+        line: Option<u32>,
+
+        /// Current cursor column in file
+        #[arg(long)]
+        column: Option<u32>,
+
+        /// Task hint (refactoring, debugging, understanding, implementing)
+        #[arg(long)]
+        task_hint: Option<String>,
+
+        /// Maximum context items
+        #[arg(long, default_value = "20")]
+        max_items: usize,
+
+        /// Approximate token budget for response
+        #[arg(long)]
+        approx_tokens: Option<usize>,
+
+        /// Include code snippets in symbol cards
+        #[arg(long)]
+        include_snippets: bool,
+
+        /// Snippet lines around symbol start
+        #[arg(long, default_value = "3")]
+        snippet_lines: usize,
+
+        /// Internal agent provider backend
+        #[arg(long, value_enum, default_value = "none")]
+        provider: AgentProvider,
+
+        /// Internal agent model ID
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Custom backend endpoint/base URL
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Output format: full, compact, minimal
+        #[arg(long, default_value = "minimal")]
+        format: String,
+
+        /// Use already running MCP daemon over unix socket
+        #[arg(long)]
+        remote: Option<PathBuf>,
     },
 
     /// Show index statistics
@@ -503,6 +641,9 @@ pub fn index_directory(
     db_path: &Path,
     watch: bool,
     durability: IndexDurability,
+    profile: IndexPowerProfile,
+    threads: Option<usize>,
+    throttle_ms: u64,
 ) -> Result<()> {
     use code_indexer::indexer::ExtractionResult;
 
@@ -523,9 +664,36 @@ pub fn index_directory(
     let walker = FileWalker::new(registry);
     let index = SqliteIndex::new(&effective_db)?;
     let use_fast_bulk = durability == IndexDurability::Fast && !watch;
+    let available_parallelism = detect_available_parallelism();
+    let worker_threads = resolve_index_threads(profile, threads, available_parallelism);
+    let index_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build()
+        .map_err(|e| {
+            crate::error::IndexerError::Index(format!(
+                "Failed to create rayon thread pool with {} threads: {}",
+                worker_threads, e
+            ))
+        })?;
 
     if durability == IndexDurability::Fast && watch {
         eprintln!("--durability fast is ignored in watch mode; using safe durability for updates.");
+    }
+    if threads.is_some() {
+        println!(
+            "Using {} indexing threads (manual override)",
+            worker_threads
+        );
+    } else {
+        println!(
+            "Indexing profile: {} (threads={}, available={})",
+            profile_name(profile),
+            worker_threads,
+            available_parallelism
+        );
+    }
+    if throttle_ms > 0 {
+        println!("Thermal throttle: {}ms sleep per file", throttle_ms);
     }
 
     let files = walker.walk(path)?;
@@ -595,59 +763,71 @@ pub fn index_directory(
     let total_files = files_to_index.len();
     let files_done = AtomicUsize::new(0);
     let progress_batch_size = 32usize;
-    let results: Vec<(IndexedFileRecord, ExtractionResult)> = files_to_index
-        .par_iter()
-        .map_init(
-            || {
-                (
-                    CodeParser::new(LanguageRegistry::new()),
-                    SymbolExtractor::new(),
-                )
-            },
-            |(parser, extractor), file| match parser.parse_file(&file.path) {
-                Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
-                    Ok(result) => {
-                        let symbol_count = result.symbols.len();
-                        let file_record = IndexedFileRecord {
-                            path: file.path.to_string_lossy().to_string(),
-                            language: parsed.language.clone(),
-                            symbol_count,
-                            content_hash: file.content_hash.clone(),
-                        };
-                        progress_ref.inc(symbol_count);
-                        let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if completed % progress_batch_size == 0 || completed == total_files {
-                            pb_ref.set_position(completed as u64);
-                        }
-                        Some((file_record, result))
+    let per_file_delay = std::time::Duration::from_millis(throttle_ms);
+    let collect_results = || {
+        files_to_index
+            .par_iter()
+            .map_init(
+                || {
+                    (
+                        CodeParser::new(LanguageRegistry::new()),
+                        SymbolExtractor::new(),
+                    )
+                },
+                |(parser, extractor), file| {
+                    if throttle_ms > 0 {
+                        std::thread::sleep(per_file_delay);
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "Error extracting symbols from {}: {}",
-                            file.path.display(),
-                            e
-                        );
-                        progress_ref.inc_error();
-                        let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if completed % progress_batch_size == 0 || completed == total_files {
-                            pb_ref.set_position(completed as u64);
+
+                    match parser.parse_file(&file.path) {
+                        Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
+                            Ok(result) => {
+                                let symbol_count = result.symbols.len();
+                                let file_record = IndexedFileRecord {
+                                    path: file.path.to_string_lossy().to_string(),
+                                    language: parsed.language.clone(),
+                                    symbol_count,
+                                    content_hash: file.content_hash.clone(),
+                                };
+                                progress_ref.inc(symbol_count);
+                                let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if completed % progress_batch_size == 0 || completed == total_files
+                                {
+                                    pb_ref.set_position(completed as u64);
+                                }
+                                Some((file_record, result))
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Error extracting symbols from {}: {}",
+                                    file.path.display(),
+                                    e
+                                );
+                                progress_ref.inc_error();
+                                let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if completed % progress_batch_size == 0 || completed == total_files
+                                {
+                                    pb_ref.set_position(completed as u64);
+                                }
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error parsing {}: {}", file.path.display(), e);
+                            progress_ref.inc_error();
+                            let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if completed % progress_batch_size == 0 || completed == total_files {
+                                pb_ref.set_position(completed as u64);
+                            }
+                            None
                         }
-                        None
                     }
                 },
-                Err(e) => {
-                    eprintln!("Error parsing {}: {}", file.path.display(), e);
-                    progress_ref.inc_error();
-                    let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if completed % progress_batch_size == 0 || completed == total_files {
-                        pb_ref.set_position(completed as u64);
-                    }
-                    None
-                }
-            },
-        )
-        .filter_map(|r| r)
-        .collect();
+            )
+            .filter_map(|r| r)
+            .collect::<Vec<(IndexedFileRecord, ExtractionResult)>>()
+    };
+    let results: Vec<(IndexedFileRecord, ExtractionResult)> = index_pool.install(collect_results);
 
     let mut file_records = Vec::with_capacity(results.len());
     let mut extraction_results = Vec::with_capacity(results.len());
@@ -1193,6 +1373,87 @@ pub async fn show_stats(db_path: &Path, remote: Option<&Path>) -> Result<()> {
             println!("    {}: {}", lang, count);
         }
     }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_context(
+    db_path: &Path,
+    query: &str,
+    file: Option<PathBuf>,
+    line: Option<u32>,
+    column: Option<u32>,
+    task_hint: Option<String>,
+    max_items: usize,
+    approx_tokens: Option<usize>,
+    include_snippets: bool,
+    snippet_lines: usize,
+    provider: AgentProvider,
+    model: Option<String>,
+    endpoint: Option<String>,
+    format: &str,
+    remote: Option<&Path>,
+) -> Result<()> {
+    use crate::mcp::consolidated::{
+        GetContextBundleParams, InternalAgentConfig, PrepareContextParams,
+    };
+
+    let provider_name = agent_provider_name(provider);
+    let agent = if provider == AgentProvider::None {
+        None
+    } else {
+        Some(InternalAgentConfig {
+            provider: Some(provider_name.to_string()),
+            model,
+            endpoint,
+            mode: Some("planner".to_string()),
+        })
+    };
+
+    let params = PrepareContextParams {
+        query: query.to_string(),
+        file: file.map(|p| p.to_string_lossy().to_string()),
+        line,
+        column,
+        task_hint,
+        max_items: Some(max_items),
+        approx_tokens,
+        include_snippets: Some(include_snippets),
+        snippet_lines: Some(snippet_lines),
+        format: Some(format.to_string()),
+        envelope: Some(true),
+        agent,
+    };
+
+    if let Some(socket) = remote {
+        let args_value = serde_json::to_value(&params).map_err(|e| {
+            crate::error::IndexerError::Index(format!("Failed to serialize prepare_context params: {}", e))
+        })?;
+        let args = match args_value {
+            serde_json::Value::Object(map) => map,
+            _ => {
+                return Err(crate::error::IndexerError::Index(
+                    "prepare_context params must serialize to object".to_string(),
+                ))
+            }
+        };
+
+        let output = call_remote_tool(socket, "prepare_context", args).await?;
+        if !output.is_empty() {
+            println!("{}", output);
+        }
+        return Ok(());
+    }
+
+    let index = Arc::new(open_query_index(db_path)?);
+    let server = crate::mcp::McpServer::new(index);
+    let bundle_params: GetContextBundleParams = params.into();
+    let envelope = server.prepare_context_bundle(bundle_params)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope).unwrap_or_default()
+    );
 
     Ok(())
 }
@@ -2680,6 +2941,9 @@ mod tests {
             Path::new(".code-index.db"),
             false,
             IndexDurability::Safe,
+            IndexPowerProfile::Balanced,
+            None,
+            0,
         )
         .expect("index first run");
 
@@ -2701,6 +2965,9 @@ mod tests {
             Path::new(".code-index.db"),
             false,
             IndexDurability::Safe,
+            IndexPowerProfile::Balanced,
+            None,
+            0,
         )
         .expect("index second run");
 
@@ -2728,6 +2995,9 @@ mod tests {
             Path::new(".code-index.db"),
             false,
             IndexDurability::Safe,
+            IndexPowerProfile::Balanced,
+            None,
+            0,
         )
         .expect("index first run");
 
@@ -2738,6 +3008,9 @@ mod tests {
             Path::new(".code-index.db"),
             false,
             IndexDurability::Safe,
+            IndexPowerProfile::Balanced,
+            None,
+            0,
         )
         .expect("index second run");
 
@@ -2765,5 +3038,154 @@ mod tests {
                 .contains(&removed_str),
             "deleted file must be removed from tracked files table"
         );
+    }
+
+    #[test]
+    fn cli_index_threads_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "code-indexer",
+            "index",
+            ".",
+            "--profile",
+            "eco",
+            "--threads",
+            "3",
+            "--throttle-ms",
+            "10",
+            "--durability",
+            "safe",
+        ])
+        .expect("cli parse must succeed");
+
+        match cli.command {
+            Commands::Index {
+                profile,
+                threads,
+                throttle_ms,
+                ..
+            } => {
+                assert_eq!(profile, IndexPowerProfile::Eco);
+                assert_eq!(threads, Some(3));
+                assert_eq!(throttle_ms, 10);
+            }
+            _ => panic!("expected index command"),
+        }
+    }
+
+    #[test]
+    fn cli_index_threads_rejects_zero() {
+        let parsed = Cli::try_parse_from(["code-indexer", "index", ".", "--threads", "0"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn cli_index_profile_defaults_to_balanced() {
+        let cli = Cli::try_parse_from(["code-indexer", "index", "."]).expect("cli parse");
+
+        match cli.command {
+            Commands::Index {
+                profile,
+                threads,
+                throttle_ms,
+                ..
+            } => {
+                assert_eq!(profile, IndexPowerProfile::Balanced);
+                assert_eq!(threads, None);
+                assert_eq!(throttle_ms, 0);
+            }
+            _ => panic!("expected index command"),
+        }
+    }
+
+    #[test]
+    fn resolve_index_threads_balanced_caps_to_four() {
+        assert_eq!(
+            resolve_index_threads(IndexPowerProfile::Balanced, None, 10),
+            4
+        );
+        assert_eq!(
+            resolve_index_threads(IndexPowerProfile::Balanced, None, 2),
+            2
+        );
+    }
+
+    #[test]
+    fn resolve_index_threads_override_wins() {
+        assert_eq!(
+            resolve_index_threads(IndexPowerProfile::Eco, Some(3), 16),
+            3
+        );
+        assert_eq!(resolve_index_threads(IndexPowerProfile::Max, Some(2), 1), 2);
+    }
+
+    #[test]
+    fn cli_prepare_context_parses() {
+        let cli = Cli::try_parse_from([
+            "code-indexer",
+            "prepare-context",
+            "find auth flow",
+            "--file",
+            "src/auth/mod.rs",
+            "--line",
+            "10",
+            "--column",
+            "3",
+            "--task-hint",
+            "debugging",
+            "--max-items",
+            "15",
+            "--approx-tokens",
+            "4096",
+            "--include-snippets",
+            "--snippet-lines",
+            "5",
+            "--provider",
+            "openrouter",
+            "--model",
+            "openrouter/auto",
+            "--endpoint",
+            "https://openrouter.ai/api/v1",
+            "--format",
+            "minimal",
+        ])
+        .expect("cli parse");
+
+        match cli.command {
+            Commands::PrepareContext {
+                query,
+                file,
+                line,
+                column,
+                task_hint,
+                max_items,
+                approx_tokens,
+                include_snippets,
+                snippet_lines,
+                provider,
+                model,
+                endpoint,
+                format,
+                remote,
+            } => {
+                assert_eq!(query, "find auth flow");
+                assert_eq!(
+                    file.map(|p| p.to_string_lossy().to_string()),
+                    Some("src/auth/mod.rs".to_string())
+                );
+                assert_eq!(line, Some(10));
+                assert_eq!(column, Some(3));
+                assert_eq!(task_hint.as_deref(), Some("debugging"));
+                assert_eq!(max_items, 15);
+                assert_eq!(approx_tokens, Some(4096));
+                assert!(include_snippets);
+                assert_eq!(snippet_lines, 5);
+                assert_eq!(provider, AgentProvider::Openrouter);
+                assert_eq!(model.as_deref(), Some("openrouter/auto"));
+                assert_eq!(endpoint.as_deref(), Some("https://openrouter.ai/api/v1"));
+                assert_eq!(format, "minimal");
+                assert!(remote.is_none());
+            }
+            _ => panic!("expected prepare-context command"),
+        }
     }
 }

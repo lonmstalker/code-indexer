@@ -102,6 +102,14 @@ impl McpServer {
         self.write_queue.is_some()
     }
 
+    /// Public entrypoint for CLI/MCP shared context packaging.
+    pub fn prepare_context_bundle(
+        &self,
+        params: GetContextBundleParams,
+    ) -> crate::error::Result<crate::index::ResponseEnvelope<ContextBundle>> {
+        self.get_context_bundle_impl(params)
+    }
+
     // === Write Queue Helper Methods ===
     // These methods use the write queue if available, otherwise fall back to direct writes.
 
@@ -869,15 +877,28 @@ impl McpServer {
         let sample_k = budget.sample_k.unwrap_or(5);
         let include_snippets = budget.include_snippets.unwrap_or(false);
         let snippet_lines = budget.snippet_lines.unwrap_or(3);
+        let agent_info = normalize_agent_config(params.agent.clone());
 
         let mut symbol_cards: Vec<SymbolCard> = Vec::new();
         let mut top_usages: Vec<UsageRef> = Vec::new();
         let mut call_neighborhood: Option<CallNeighborhood> = None;
         let mut imports_relevant: Vec<RelevantImport> = Vec::new();
+        let mut suggested_tool_calls: Vec<SuggestedToolCall> = Vec::new();
         let mut next_actions: Vec<NextAction> = Vec::new();
+        let mut lead_symbol_name: Option<String> = None;
 
         // Search by query if provided
         if let Some(ref query) = input.query {
+            suggested_tool_calls.push(SuggestedToolCall {
+                tool: "search_symbols".to_string(),
+                args: serde_json::json!({
+                    "query": query,
+                    "limit": max_items,
+                    "fuzzy": true
+                }),
+                reason: "Initial semantic symbol retrieval for the query".to_string(),
+            });
+
             let options = SearchOptions {
                 limit: Some(max_items),
                 current_file: input.file.clone(),
@@ -918,6 +939,7 @@ impl McpServer {
             // Get top usages (diversified: 1-2 per file)
             if !symbol_cards.is_empty() {
                 let first_symbol_name = &results[0].symbol.name;
+                lead_symbol_name = Some(first_symbol_name.clone());
                 if let Ok(refs) = self
                     .index
                     .find_references(first_symbol_name, &SearchOptions::default())
@@ -1031,6 +1053,16 @@ impl McpServer {
                 if !callers.is_empty() || !callees.is_empty() {
                     call_neighborhood = Some(CallNeighborhood { callers, callees });
                 }
+
+                suggested_tool_calls.push(SuggestedToolCall {
+                    tool: "get_snippet".to_string(),
+                    args: serde_json::json!({
+                        "target": first_card.id,
+                        "context_lines": snippet_lines,
+                        "max_lines": 120
+                    }),
+                    reason: "Expand top-ranked symbol into code for direct reasoning".to_string(),
+                });
             }
         }
 
@@ -1045,6 +1077,57 @@ impl McpServer {
                     });
                 }
             }
+
+            suggested_tool_calls.push(SuggestedToolCall {
+                tool: "get_file_outline".to_string(),
+                args: serde_json::json!({
+                    "file": file,
+                    "include_scopes": true
+                }),
+                reason: "Capture local structure around the current file".to_string(),
+            });
+
+            suggested_tool_calls.push(SuggestedToolCall {
+                tool: "get_imports".to_string(),
+                args: serde_json::json!({
+                    "file": file,
+                    "resolve": true
+                }),
+                reason: "Resolve dependency edges for the current file".to_string(),
+            });
+        }
+
+        if let Some(symbol_name) = lead_symbol_name {
+            suggested_tool_calls.push(SuggestedToolCall {
+                tool: "find_references".to_string(),
+                args: serde_json::json!({
+                    "name": symbol_name,
+                    "include_callers": true,
+                    "depth": 2,
+                    "limit": 50
+                }),
+                reason: "Collect usage and caller context for impact analysis".to_string(),
+            });
+        }
+
+        if let Some(task_hint) = input.task_hint.clone() {
+            let lowered = task_hint.to_lowercase();
+            if lowered.contains("refactor") || lowered.contains("debug") {
+                if let Some(query) = input.query.clone() {
+                    suggested_tool_calls.push(SuggestedToolCall {
+                        tool: "analyze_call_graph".to_string(),
+                        args: serde_json::json!({
+                            "function": query,
+                            "direction": "both",
+                            "depth": 3,
+                            "include_possible": true
+                        }),
+                        reason:
+                            "Task hint suggests dependency-impact analysis before modifications"
+                                .to_string(),
+                    });
+                }
+            }
         }
 
         // Build the bundle
@@ -1053,6 +1136,8 @@ impl McpServer {
             top_usages,
             call_neighborhood,
             imports_relevant,
+            agent: agent_info.clone(),
+            suggested_tool_calls,
         };
 
         // Build response envelope
@@ -1066,9 +1151,36 @@ impl McpServer {
         } else {
             ResponseEnvelope::with_items(vec![bundle], format)
         };
+        let envelope = if let Some(agent) = agent_info {
+            envelope.with_warning(format!(
+                "internal agent routing configured: provider={}, mode={}",
+                agent.provider, agent.mode
+            ))
+        } else {
+            envelope
+        };
 
         Ok(envelope.with_next(next_actions))
     }
+}
+
+fn normalize_agent_config(config: Option<InternalAgentConfig>) -> Option<ContextAgentInfo> {
+    let cfg = config?;
+    let provider = cfg
+        .provider
+        .unwrap_or_else(|| "none".to_string())
+        .trim()
+        .to_lowercase();
+    if provider.is_empty() || provider == "none" {
+        return None;
+    }
+
+    Some(ContextAgentInfo {
+        provider,
+        model: cfg.model,
+        endpoint: cfg.endpoint,
+        mode: cfg.mode.unwrap_or_else(|| "planner".to_string()),
+    })
 }
 
 // === Helper Functions for Envelope Support ===
@@ -1746,7 +1858,23 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 14. get_snippet - Retrieve code snippets with budget control
+            // 14. prepare_context - Agent-friendly context entrypoint
+            Tool {
+                name: "prepare_context".into(),
+                title: Some("Prepare Context".to_string()),
+                description: Some(
+                    "Codex/Claude-oriented single-query context tool. Accepts natural language query, \
+                     optional provider routing (openai/anthropic/openrouter/local), and returns a \
+                     packed context envelope with suggested follow-up tool calls."
+                        .into(),
+                ),
+                input_schema: schema_for::<PrepareContextParams>(),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            // 15. get_snippet - Retrieve code snippets with budget control
             Tool {
                 name: "get_snippet".into(),
                 title: Some("Get Snippet".to_string()),
@@ -1762,7 +1890,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 15. get_doc_section - Get documentation section from README/docs
+            // 16. get_doc_section - Get documentation section from README/docs
             Tool {
                 name: "get_doc_section".into(),
                 title: Some("Get Doc Section".to_string()),
@@ -1778,7 +1906,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 16. get_project_commands - Get run/build/test commands from config files
+            // 17. get_project_commands - Get run/build/test commands from config files
             Tool {
                 name: "get_project_commands".into(),
                 title: Some("Get Project Commands".to_string()),
@@ -1794,7 +1922,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 17. get_project_compass - Macro-level project overview
+            // 18. get_project_compass - Macro-level project overview
             Tool {
                 name: "get_project_compass".into(),
                 title: Some("Get Project Compass".to_string()),
@@ -1810,7 +1938,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 18. expand_project_node - Drill-down into modules
+            // 19. expand_project_node - Drill-down into modules
             Tool {
                 name: "expand_project_node".into(),
                 title: Some("Expand Project Node".to_string()),
@@ -1825,7 +1953,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 19. get_compass - Task-oriented diversified search
+            // 20. get_compass - Task-oriented diversified search
             Tool {
                 name: "get_compass".into(),
                 title: Some("Get Compass".to_string()),
@@ -1841,7 +1969,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 20. open_session - Open a session for token optimization
+            // 21. open_session - Open a session for token optimization
             Tool {
                 name: "open_session".into(),
                 title: Some("Open Session".to_string()),
@@ -1856,7 +1984,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 21. close_session - Close a session
+            // 22. close_session - Close a session
             Tool {
                 name: "close_session".into(),
                 title: Some("Close Session".to_string()),
@@ -1870,7 +1998,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 22. manage_tags - Manage tag inference rules
+            // 23. manage_tags - Manage tag inference rules
             Tool {
                 name: "manage_tags".into(),
                 title: Some("Manage Tags".to_string()),
@@ -1886,7 +2014,7 @@ impl ServerHandler for McpServer {
                 icons: None,
                 meta: None,
             },
-            // 23. get_indexing_status - Check indexing progress
+            // 24. get_indexing_status - Check indexing progress
             Tool {
                 name: "get_indexing_status".into(),
                 title: Some("Get Indexing Status".to_string()),
@@ -2982,6 +3110,24 @@ impl ServerHandler for McpServer {
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 match self.get_context_bundle_impl(params) {
+                    Ok(result) => {
+                        let json = serde_json::to_string_pretty(&result).unwrap_or_default();
+                        CallToolResult::success(vec![Content::text(json)])
+                    }
+                    Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+                }
+            }
+
+            // === 14. prepare_context (Agent-friendly Context API) ===
+            "prepare_context" => {
+                let params: PrepareContextParams = serde_json::from_value(
+                    serde_json::Value::Object(request.arguments.unwrap_or_default()),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+                let bundle_params: GetContextBundleParams = params.into();
+
+                match self.get_context_bundle_impl(bundle_params) {
                     Ok(result) => {
                         let json = serde_json::to_string_pretty(&result).unwrap_or_default();
                         CallToolResult::success(vec![Content::text(json)])
@@ -4196,5 +4342,35 @@ mod tests {
         let content = r#"DATABASE_URL = "postgres://user:secret_password@localhost:5432/db""#;
         let result = redact_secrets(content);
         assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_normalize_agent_config_none_provider() {
+        let info = normalize_agent_config(Some(InternalAgentConfig {
+            provider: Some("none".to_string()),
+            model: Some("gpt-4o-mini".to_string()),
+            endpoint: None,
+            mode: None,
+        }));
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_normalize_agent_config_openrouter() {
+        let info = normalize_agent_config(Some(InternalAgentConfig {
+            provider: Some("openrouter".to_string()),
+            model: Some("openrouter/auto".to_string()),
+            endpoint: Some("https://openrouter.ai/api/v1".to_string()),
+            mode: Some("planner".to_string()),
+        }))
+        .expect("agent info");
+
+        assert_eq!(info.provider, "openrouter");
+        assert_eq!(info.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(
+            info.endpoint.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(info.mode, "planner");
     }
 }

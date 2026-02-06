@@ -13,6 +13,8 @@
 ## Основные зоны кода
 - `src/cli` — CLI команды и аргументы.
   - `index` по умолчанию инкрементальный: hash-based skip unchanged + cleanup stale files.
+  - `index` имеет термопрофили ресурсов: `--profile eco|balanced|max` (default: `balanced`), override через `--threads`, дополнительный `--throttle-ms`.
+  - `prepare-context` собирает AI-ready контекст из NL-запроса; поддерживает `--provider openai|anthropic|openrouter|local` + budget/file/task-hint.
   - `serve` поддерживает `--transport stdio|unix` и `--socket` для daemon режима.
 - `src/indexer` — индексирование и извлечение символов.
   - `sidecar.rs` — парсинг `.code-indexer.yml`, staleness detection.
@@ -21,6 +23,7 @@
   - `sqlite.rs` — `files` tracking (`content_hash`) для persisted incremental indexing.
 - `src/mcp` — MCP server и tools (tag, include_file_meta параметры).
   - `index_workspace` инкрементально пропускает unchanged файлы по hash.
+  - `prepare_context`/`get_context_bundle` — единые entrypoints для агентного retrieval-пакета.
 - `src/languages` — registry и tree-sitter грамматики.
 - `src/workspace` и `src/dependencies` — workspace и deps indexing.
 - `tests/` — интеграционные тесты и сценарии MCP/CLI.
