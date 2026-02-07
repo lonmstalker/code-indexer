@@ -12,7 +12,7 @@ description: "SQLite схема индекса, FTS и параметры хра
 - `file_imports` — imports и их тип (`import_type`).
 - `call_edges` — ребра графа вызовов с `CallConfidence`.
 - `scopes` — дерево scopes для scope-aware анализа.
-- `files` — метаданные файлов, hash и counts.
+- `files` — метаданные файлов, hash и counts (`content_hash`, `last_size`, `last_mtime_ns` для incremental prefilter).
 - `file_meta`, `file_tags`, `tag_dictionary` — Intent Layer (doc1/purpose/capabilities + теги).
 - `projects` и `dependencies` — metadata по deps.
 
@@ -35,6 +35,9 @@ Batch/scale-path:
   - `fast_mode` profile: `synchronous=OFF`, `cache_size=-128000`.
   - `fast_mode + cold_run` profile: агрессивный one-shot bulk (`journal_mode=MEMORY`, `locking_mode=EXCLUSIVE`, `synchronous=OFF`, `temp_store=MEMORY`, `cache_size=-256000`) с обязательным restore к дефолтному профилю после batch insert.
   - если cold-fast профиль не может быть включён из-за SQLite lock/busy, ingest автоматически fallback на обычный fast profile, чтобы избежать hard-fail индексации.
+  - bulk-write использует `busy_timeout` + bounded retry/backoff на `SQLITE_BUSY/LOCKED`, чтобы снизить флапы на больших cold-run.
+- `content_hash` вычисляется стабильным быстрым `xxh3_64` (вместо process-dependent `DefaultHasher`).
+- Для no-op incremental есть metadata-refresh API: `update_file_tracking_metadata_batch` (обновляет `last_size/last_mtime_ns` без reindex symbols).
 
 ## Связанные материалы
 [.memory-bank/guides/data-store.md](../guides/data-store.md): эксплуатация БД и команды обслуживания.

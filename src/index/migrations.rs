@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use crate::error::{IndexerError, Result};
 
 /// Current schema version. Increment when adding new migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 /// Migration function type.
 type MigrationFn = fn(&Connection) -> Result<()>;
@@ -23,6 +23,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migration_v6_file_tags_intent,
     migration_v7_p2_fields,
     migration_v8_definition_lookup_index,
+    migration_v9_file_prefilter_metadata,
 ];
 
 /// Runs all pending migrations on the database.
@@ -81,6 +82,12 @@ fn get_schema_version(conn: &Connection) -> Result<u32> {
 /// Detects schema version by checking which columns exist.
 /// Used for backward compatibility with databases created before versioning.
 fn detect_version_from_schema(conn: &Connection) -> Result<u32> {
+    // Check for incremental prefilter metadata columns (v9)
+    if column_exists(conn, "files", "last_size")? && column_exists(conn, "files", "last_mtime_ns")?
+    {
+        return Ok(9);
+    }
+
     // Check for definition lookup index (v8)
     if index_exists(conn, "idx_symbols_def_lookup")? {
         return Ok(8);
@@ -676,6 +683,17 @@ fn migration_v8_definition_lookup_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// V9: Add cheap incremental prefilter metadata to files table.
+fn migration_v9_file_prefilter_metadata(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "files", "last_size")? {
+        conn.execute("ALTER TABLE files ADD COLUMN last_size INTEGER", [])?;
+    }
+    if !column_exists(conn, "files", "last_mtime_ns")? {
+        conn.execute("ALTER TABLE files ADD COLUMN last_mtime_ns INTEGER", [])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +713,8 @@ mod tests {
         assert!(table_exists(&conn, "symbols").unwrap());
         assert!(table_exists(&conn, "files").unwrap());
         assert!(table_exists(&conn, "meta").unwrap());
+        assert!(column_exists(&conn, "files", "last_size").unwrap());
+        assert!(column_exists(&conn, "files", "last_mtime_ns").unwrap());
     }
 
     #[test]

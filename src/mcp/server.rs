@@ -64,11 +64,40 @@ fn build_next_offset_cursor(offset: usize, limit: usize, totals: &[usize]) -> Op
     }
 }
 
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    if value > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        value as i64
+    }
+}
+
+fn metadata_size_i64(metadata: &std::fs::Metadata) -> i64 {
+    u64_to_i64_saturating(metadata.len())
+}
+
+fn metadata_mtime_ns_i64(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| {
+            if duration.as_nanos() > i64::MAX as u128 {
+                i64::MAX
+            } else {
+                duration.as_nanos() as i64
+            }
+        })
+        .unwrap_or(0)
+}
+
 #[derive(Clone)]
 struct IncrementalWorkspaceFileWorkItem {
     path: std::path::PathBuf,
     content: String,
     content_hash: String,
+    last_size: i64,
+    last_mtime_ns: i64,
 }
 
 #[derive(Clone)]
@@ -82,6 +111,7 @@ struct WorkspaceScanOutcome {
     stale_files: Vec<String>,
     file_records: Vec<crate::index::sqlite::IndexedFileRecord>,
     extraction_results: Vec<crate::indexer::ExtractionResult>,
+    metadata_refresh_updates: Vec<crate::index::sqlite::TrackedFileMetadataUpdate>,
     is_cold_run: bool,
 }
 
@@ -91,7 +121,7 @@ fn scan_workspace_for_indexing(
     parse_cache: &crate::indexer::ParseCache,
     progress: &crate::indexer::IndexingProgress,
 ) -> crate::error::Result<WorkspaceScanOutcome> {
-    use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
+    use crate::index::sqlite::{IndexedFileRecord, SqliteIndex, TrackedFileMetadataUpdate};
     use crate::indexer::{ExtractionResult, FileWalker, Parser, SymbolExtractor};
     use rayon::prelude::*;
     use std::collections::HashSet;
@@ -110,11 +140,12 @@ fn scan_workspace_for_indexing(
         .filter(|tracked| !current_files.contains(*tracked))
         .cloned()
         .collect();
-    let tracked_hashes = index.get_tracked_file_hashes()?;
-    let is_cold_run = tracked_files.is_empty() && tracked_hashes.is_empty();
+    let tracked_states = index.get_tracked_file_states()?;
+    let is_cold_run = tracked_files.is_empty() && tracked_states.is_empty();
 
     let mut read_errors = 0usize;
     let mut files_skipped = 0usize;
+    let mut metadata_refresh_updates: Vec<TrackedFileMetadataUpdate> = Vec::new();
     let mut cold_files_to_index: Vec<ColdWorkspaceFileWorkItem> = Vec::new();
     let mut incremental_files_to_index: Vec<IncrementalWorkspaceFileWorkItem> = Vec::new();
 
@@ -127,37 +158,65 @@ fn scan_workspace_for_indexing(
     } else {
         enum PrecheckOutcome {
             Changed(IncrementalWorkspaceFileWorkItem),
+            MetadataRefresh(TrackedFileMetadataUpdate),
             Unchanged,
             ReadError(std::path::PathBuf),
         }
 
         let precheck_outcomes: Vec<PrecheckOutcome> = files
             .par_iter()
-            .map(|file| match std::fs::read_to_string(file) {
-                Ok(content) => {
-                    let file_path = file.to_string_lossy().to_string();
-                    let content_hash = SqliteIndex::compute_content_hash(&content);
-                    let needs_reindex = tracked_hashes
-                        .get(&file_path)
-                        .map(|stored| stored != &content_hash)
-                        .unwrap_or(true);
-                    if needs_reindex {
-                        PrecheckOutcome::Changed(IncrementalWorkspaceFileWorkItem {
-                            path: file.clone(),
-                            content,
-                            content_hash,
-                        })
-                    } else {
-                        PrecheckOutcome::Unchanged
-                    }
+            .map(|file| {
+                let file_path = file.to_string_lossy().to_string();
+                let metadata = match std::fs::metadata(file) {
+                    Ok(metadata) => metadata,
+                    Err(_) => return PrecheckOutcome::ReadError(file.clone()),
+                };
+                let last_size = metadata_size_i64(&metadata);
+                let last_mtime_ns = metadata_mtime_ns_i64(&metadata);
+                if tracked_states
+                    .get(&file_path)
+                    .map(|state| {
+                        state.last_size == Some(last_size)
+                            && state.last_mtime_ns == Some(last_mtime_ns)
+                    })
+                    .unwrap_or(false)
+                {
+                    return PrecheckOutcome::Unchanged;
                 }
-                Err(_) => PrecheckOutcome::ReadError(file.clone()),
+
+                match std::fs::read_to_string(file) {
+                    Ok(content) => {
+                        let content_hash = SqliteIndex::compute_content_hash(&content);
+                        let needs_reindex = tracked_states
+                            .get(&file_path)
+                            .and_then(|state| state.content_hash.as_ref())
+                            .map(|stored| stored != &content_hash)
+                            .unwrap_or(true);
+                        if needs_reindex {
+                            PrecheckOutcome::Changed(IncrementalWorkspaceFileWorkItem {
+                                path: file.clone(),
+                                content,
+                                content_hash,
+                                last_size,
+                                last_mtime_ns,
+                            })
+                        } else {
+                            PrecheckOutcome::MetadataRefresh(TrackedFileMetadataUpdate {
+                                path: file_path,
+                                last_size,
+                                last_mtime_ns,
+                            })
+                        }
+                    }
+                    Err(_) => PrecheckOutcome::ReadError(file.clone()),
+                }
             })
             .collect();
 
         for outcome in precheck_outcomes {
             match outcome {
                 PrecheckOutcome::Changed(item) => incremental_files_to_index.push(item),
+                PrecheckOutcome::MetadataRefresh(item) => metadata_refresh_updates.push(item),
                 PrecheckOutcome::Unchanged => {}
                 PrecheckOutcome::ReadError(path) => {
                     read_errors += 1;
@@ -187,6 +246,7 @@ fn scan_workspace_for_indexing(
                     Ok(parsed) => match extractor.extract_all(&parsed, &item.path) {
                         Ok(result) => {
                             let symbol_count = result.symbols.len();
+                            let metadata = std::fs::metadata(&item.path).ok();
                             progress.inc(symbol_count);
                             Some((
                                 IndexedFileRecord {
@@ -194,6 +254,14 @@ fn scan_workspace_for_indexing(
                                     language: parsed.language.clone(),
                                     symbol_count,
                                     content_hash: SqliteIndex::compute_content_hash(&parsed.source),
+                                    last_size: metadata
+                                        .as_ref()
+                                        .map(metadata_size_i64)
+                                        .unwrap_or(0),
+                                    last_mtime_ns: metadata
+                                        .as_ref()
+                                        .map(metadata_mtime_ns_i64)
+                                        .unwrap_or(0),
                                 },
                                 result,
                             ))
@@ -216,34 +284,42 @@ fn scan_workspace_for_indexing(
             .into_par_iter()
             .map_init(
                 || (Parser::global(), SymbolExtractor::new()),
-                |(parser, extractor), item| match parse_cache.parse_source_cached(
-                    &item.path,
-                    &item.content,
-                    parser,
-                ) {
-                    Ok(parsed) => match extractor.extract_all(&parsed, &item.path) {
-                        Ok(result) => {
-                            let symbol_count = result.symbols.len();
-                            progress.inc(symbol_count);
-                            Some((
-                                IndexedFileRecord {
-                                    path: item.path.to_string_lossy().to_string(),
-                                    language: parsed.language.clone(),
-                                    symbol_count,
-                                    content_hash: item.content_hash.clone(),
-                                },
-                                result,
-                            ))
-                        }
+                |(parser, extractor), item| {
+                    let IncrementalWorkspaceFileWorkItem {
+                        path,
+                        content,
+                        content_hash,
+                        last_size,
+                        last_mtime_ns,
+                    } = item;
+
+                    match parse_cache.parse_source_cached_owned(&path, content, parser) {
+                        Ok(parsed) => match extractor.extract_all(&parsed, &path) {
+                            Ok(result) => {
+                                let symbol_count = result.symbols.len();
+                                progress.inc(symbol_count);
+                                Some((
+                                    IndexedFileRecord {
+                                        path: path.to_string_lossy().to_string(),
+                                        language: parsed.language.clone(),
+                                        symbol_count,
+                                        content_hash,
+                                        last_size,
+                                        last_mtime_ns,
+                                    },
+                                    result,
+                                ))
+                            }
+                            Err(_) => {
+                                progress.inc_error();
+                                None
+                            }
+                        },
                         Err(_) => {
                             progress.inc_error();
+                            parse_cache.invalidate(&path);
                             None
                         }
-                    },
-                    Err(_) => {
-                        progress.inc_error();
-                        parse_cache.invalidate(&item.path);
-                        None
                     }
                 },
             )
@@ -264,6 +340,7 @@ fn scan_workspace_for_indexing(
         stale_files,
         file_records,
         extraction_results,
+        metadata_refresh_updates,
         is_cold_run,
     })
 }
@@ -3055,10 +3132,20 @@ impl ServerHandler for McpServer {
                     }
                 };
 
-                let files_updated = scan_outcome.file_records.len();
+                let WorkspaceScanOutcome {
+                    files_count,
+                    files_skipped,
+                    stale_files,
+                    mut file_records,
+                    mut extraction_results,
+                    metadata_refresh_updates,
+                    is_cold_run,
+                } = scan_outcome;
 
-                if !scan_outcome.stale_files.is_empty() {
-                    self.write_remove_files_batch(scan_outcome.stale_files)
+                let files_updated = file_records.len();
+
+                if !stale_files.is_empty() {
+                    self.write_remove_files_batch(stale_files)
                         .await
                         .map_err(|e| {
                             McpError::internal_error(
@@ -3068,46 +3155,84 @@ impl ServerHandler for McpServer {
                         })?;
                 }
 
-                let changed_file_paths: Vec<String> = scan_outcome
-                    .file_records
-                    .iter()
-                    .map(|record| record.path.clone())
-                    .collect();
-                if !scan_outcome.is_cold_run && !changed_file_paths.is_empty() {
-                    self.write_remove_files_batch(changed_file_paths)
+                const CHUNK_FILES: usize = 256;
+                const CHUNK_SYMBOLS: usize = 100_000;
+                let mut total_symbols = 0usize;
+
+                while !file_records.is_empty() {
+                    let max_take = CHUNK_FILES.min(file_records.len());
+                    let mut take = 0usize;
+                    let mut symbols_in_chunk = 0usize;
+                    for result in extraction_results.iter().take(max_take) {
+                        if take > 0 && symbols_in_chunk >= CHUNK_SYMBOLS {
+                            break;
+                        }
+                        symbols_in_chunk += result.symbols.len();
+                        take += 1;
+                    }
+                    if take == 0 {
+                        take = max_take.max(1);
+                    }
+
+                    let records_chunk: Vec<_> = file_records.drain(..take).collect();
+                    let results_chunk: Vec<_> = extraction_results.drain(..take).collect();
+
+                    if !is_cold_run {
+                        let changed_file_paths: Vec<String> = records_chunk
+                            .iter()
+                            .map(|record| record.path.clone())
+                            .collect();
+                        if !changed_file_paths.is_empty() {
+                            self.write_remove_files_batch(changed_file_paths)
+                                .await
+                                .map_err(|e| {
+                                    McpError::internal_error(
+                                        format!("Failed to remove changed files: {}", e),
+                                        None,
+                                    )
+                                })?;
+                        }
+                    }
+
+                    total_symbols += self
+                        .write_add_extraction_results(results_chunk)
                         .await
                         .map_err(|e| {
                             McpError::internal_error(
-                                format!("Failed to remove changed files: {}", e),
+                                format!("Failed to store results: {}", e),
+                                None,
+                            )
+                        })?;
+
+                    self.write_upsert_file_records_batch(records_chunk)
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("Failed to update file records: {}", e),
                                 None,
                             )
                         })?;
                 }
 
-                let total_symbols = self
-                    .write_add_extraction_results(scan_outcome.extraction_results)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(format!("Failed to store results: {}", e), None)
-                    })?;
-
-                self.write_upsert_file_records_batch(scan_outcome.file_records)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(
-                            format!("Failed to update file records: {}", e),
-                            None,
-                        )
-                    })?;
+                if !metadata_refresh_updates.is_empty() {
+                    self.index
+                        .update_file_tracking_metadata_batch(&metadata_refresh_updates)
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("Failed to refresh file tracking metadata: {}", e),
+                                None,
+                            )
+                        })?;
+                }
 
                 self.indexing_progress.finish();
 
                 let output = serde_json::json!({
                     "status": "indexed",
                     "path": workspace_path,
-                    "files_found": scan_outcome.files_count,
+                    "files_found": files_count,
                     "files_updated": files_updated,
-                    "files_skipped": scan_outcome.files_skipped,
+                    "files_skipped": files_skipped,
                     "symbols_indexed": total_symbols,
                     "incremental": true,
                     "watch": params.watch.unwrap_or(false),
@@ -5094,6 +5219,11 @@ mod tests {
         index
             .upsert_file_records_batch(&outcome.file_records)
             .expect("store file records");
+        if !outcome.metadata_refresh_updates.is_empty() {
+            index
+                .update_file_tracking_metadata_batch(&outcome.metadata_refresh_updates)
+                .expect("refresh metadata");
+        }
     }
 
     #[test]
@@ -5132,6 +5262,35 @@ mod tests {
         assert_eq!(third.files_count, 1);
         assert_eq!(third.files_skipped, 0);
         assert_eq!(third.file_records.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_workspace_same_hash_refreshes_tracking_metadata() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_path = temp_dir.path().join("lib.rs");
+        std::fs::write(&file_path, "pub fn alpha() {}\n").expect("write source");
+
+        let db_path = temp_dir.path().join(".code-index.db");
+        let index = crate::index::sqlite::SqliteIndex::new(&db_path).expect("open db");
+        let parse_cache = crate::indexer::ParseCache::new();
+        let progress = crate::indexer::IndexingProgress::new();
+
+        let first = scan_workspace_for_indexing(temp_dir.path(), &index, &parse_cache, &progress)
+            .expect("first scan");
+        persist_scan_outcome(&index, first);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&file_path, "pub fn alpha() {}\n").expect("rewrite same source");
+
+        let second = scan_workspace_for_indexing(temp_dir.path(), &index, &parse_cache, &progress)
+            .expect("second scan");
+        assert!(second.file_records.is_empty());
+        assert_eq!(second.files_skipped, 1);
+        assert_eq!(second.metadata_refresh_updates.len(), 1);
+        assert_eq!(
+            second.metadata_refresh_updates[0].path,
+            file_path.to_string_lossy().to_string()
+        );
     }
 
     #[test]

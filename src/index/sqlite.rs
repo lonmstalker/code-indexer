@@ -2,6 +2,8 @@ use r2d2::{CustomizeConnection, Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use std::path::Path;
+use std::time::Duration;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::dependencies::{Dependency, Ecosystem, ProjectInfo, SymbolSource};
 use crate::error::Result;
@@ -67,6 +69,22 @@ pub struct IndexedFileRecord {
     pub language: String,
     pub symbol_count: usize,
     pub content_hash: String,
+    pub last_size: i64,
+    pub last_mtime_ns: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackedFileState {
+    pub content_hash: Option<String>,
+    pub last_size: Option<i64>,
+    pub last_mtime_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackedFileMetadataUpdate {
+    pub path: String,
+    pub last_size: i64,
+    pub last_mtime_ns: i64,
 }
 
 impl SqliteIndex {
@@ -284,14 +302,9 @@ impl SqliteIndex {
         }
     }
 
-    /// Computes SHA256 hash of file content.
+    /// Computes stable XXH3 64-bit hash of file content.
     pub fn compute_content_hash(content: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        format!("{:016x}", xxh3_64(content.as_bytes()))
     }
 
     /// Upserts file tracking records used by incremental indexing.
@@ -309,13 +322,15 @@ impl SqliteIndex {
 
         let mut stmt = tx.prepare_cached(
             r#"
-            INSERT INTO files (path, language, last_modified, symbol_count, content_hash)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO files (path, language, last_modified, symbol_count, content_hash, last_size, last_mtime_ns)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(path) DO UPDATE SET
                 language = excluded.language,
                 last_modified = excluded.last_modified,
                 symbol_count = excluded.symbol_count,
-                content_hash = excluded.content_hash
+                content_hash = excluded.content_hash,
+                last_size = excluded.last_size,
+                last_mtime_ns = excluded.last_mtime_ns
             "#,
         )?;
 
@@ -326,6 +341,8 @@ impl SqliteIndex {
                 now,
                 record.symbol_count as i64,
                 &record.content_hash,
+                record.last_size,
+                record.last_mtime_ns,
             ])?;
         }
 
@@ -346,17 +363,69 @@ impl SqliteIndex {
 
     /// Gets tracked file content hashes keyed by file path.
     pub fn get_tracked_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
+        let states = self.get_tracked_file_states()?;
+        Ok(states
+            .into_iter()
+            .filter_map(|(path, state)| state.content_hash.map(|hash| (path, hash)))
+            .collect())
+    }
+
+    /// Gets tracked file states keyed by file path.
+    pub fn get_tracked_file_states(
+        &self,
+    ) -> Result<std::collections::HashMap<String, TrackedFileState>> {
         let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT path, content_hash FROM files WHERE content_hash IS NOT NULL")?;
+        let mut stmt = conn.prepare(
+            "SELECT path, content_hash, last_size, last_mtime_ns FROM files ORDER BY path",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 let path: String = row.get(0)?;
-                let content_hash: String = row.get(1)?;
-                Ok((path, content_hash))
+                let content_hash: Option<String> = row.get(1)?;
+                let last_size: Option<i64> = row.get(2)?;
+                let last_mtime_ns: Option<i64> = row.get(3)?;
+                Ok((
+                    path,
+                    TrackedFileState {
+                        content_hash,
+                        last_size,
+                        last_mtime_ns,
+                    },
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Updates cached file metadata used by incremental prefilter without rewriting symbols.
+    pub fn update_file_tracking_metadata_batch(
+        &self,
+        updates: &[TrackedFileMetadataUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut stmt = tx.prepare_cached(
+            "UPDATE files SET last_modified = ?1, last_size = ?2, last_mtime_ns = ?3 WHERE path = ?4",
+        )?;
+        for update in updates {
+            stmt.execute(params![
+                now,
+                update.last_size,
+                update.last_mtime_ns,
+                update.path
+            ])?;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
     }
 
     // === Project and Dependency Methods ===
@@ -1138,6 +1207,7 @@ impl SqliteIndex {
         cold_run: bool,
     ) -> Result<usize> {
         let mut conn = self.conn()?;
+        conn.busy_timeout(Duration::from_millis(5_000))?;
 
         if fast_mode {
             if cold_run {
@@ -1153,103 +1223,114 @@ impl SqliteIndex {
             }
         }
 
-        let operation = (|| -> Result<usize> {
-            let tx = conn.transaction()?;
-            let mut symbol_stmt = tx.prepare_cached(
-                r#"
-                INSERT OR REPLACE INTO symbols
-                (id, name, kind, file_path, start_line, start_column, end_line, end_column,
-                 language, visibility, signature, doc_comment, parent,
-                 generic_params_json, params_json, return_type)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-                "#,
-            )?;
-            let mut refs_stmt = tx.prepare_cached(
-                r#"
-                INSERT OR REPLACE INTO symbol_references
-                (symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                "#,
-            )?;
-            let mut imports_stmt = tx.prepare_cached(
-                r#"
-                INSERT OR REPLACE INTO file_imports
-                (file_path, imported_path, imported_symbol, import_type)
-                VALUES (?1, ?2, ?3, ?4)
-                "#,
-            )?;
+        const MAX_LOCK_RETRIES: usize = 4;
+        let mut attempt = 0usize;
+        let mut retry_backoff_ms = 10u64;
+        let operation = loop {
+            let operation = (|| -> Result<usize> {
+                let tx = conn.transaction()?;
+                let mut symbol_stmt = tx.prepare_cached(
+                    r#"
+                    INSERT OR REPLACE INTO symbols
+                    (id, name, kind, file_path, start_line, start_column, end_line, end_column,
+                     language, visibility, signature, doc_comment, parent,
+                     generic_params_json, params_json, return_type)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                    "#,
+                )?;
+                let mut refs_stmt = tx.prepare_cached(
+                    r#"
+                    INSERT OR REPLACE INTO symbol_references
+                    (symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                )?;
+                let mut imports_stmt = tx.prepare_cached(
+                    r#"
+                    INSERT OR REPLACE INTO file_imports
+                    (file_path, imported_path, imported_symbol, import_type)
+                    VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                )?;
 
-            let mut total_symbols = 0;
+                let mut total_symbols = 0;
 
-            for result in results {
-                // Insert symbols
-                for symbol in result.symbols {
-                    let generic_params_json = if symbol.generic_params.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&symbol.generic_params).ok()
-                    };
-                    let params_json = if symbol.params.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&symbol.params).ok()
-                    };
-                    symbol_stmt.execute(params![
-                        symbol.id,
-                        symbol.name,
-                        symbol.kind.as_str(),
-                        symbol.location.file_path,
-                        symbol.location.start_line,
-                        symbol.location.start_column,
-                        symbol.location.end_line,
-                        symbol.location.end_column,
-                        symbol.language,
-                        symbol.visibility.as_ref().map(|v| v.as_str()),
-                        symbol.signature,
-                        symbol.doc_comment,
-                        symbol.parent,
-                        generic_params_json,
-                        params_json,
-                        symbol.return_type,
-                    ])?;
-                    total_symbols += 1;
+                for result in &results {
+                    for symbol in &result.symbols {
+                        let generic_params_json = if symbol.generic_params.is_empty() {
+                            None
+                        } else {
+                            serde_json::to_string(&symbol.generic_params).ok()
+                        };
+                        let params_json = if symbol.params.is_empty() {
+                            None
+                        } else {
+                            serde_json::to_string(&symbol.params).ok()
+                        };
+                        symbol_stmt.execute(params![
+                            &symbol.id,
+                            &symbol.name,
+                            symbol.kind.as_str(),
+                            &symbol.location.file_path,
+                            symbol.location.start_line,
+                            symbol.location.start_column,
+                            symbol.location.end_line,
+                            symbol.location.end_column,
+                            &symbol.language,
+                            symbol.visibility.as_ref().map(|v| v.as_str()),
+                            &symbol.signature,
+                            &symbol.doc_comment,
+                            &symbol.parent,
+                            generic_params_json,
+                            params_json,
+                            &symbol.return_type,
+                        ])?;
+                        total_symbols += 1;
+                    }
+
+                    for reference in &result.references {
+                        refs_stmt.execute(params![
+                            &reference.symbol_id,
+                            &reference.symbol_name,
+                            &reference.file_path,
+                            reference.line,
+                            reference.column,
+                            reference.kind.as_str(),
+                        ])?;
+                    }
+
+                    for import in &result.imports {
+                        imports_stmt.execute(params![
+                            &import.file_path,
+                            &import.imported_path,
+                            &import.imported_symbol,
+                            import.import_type.as_str(),
+                        ])?;
+                    }
                 }
 
-                // Insert references
-                for reference in result.references {
-                    refs_stmt.execute(params![
-                        reference.symbol_id,
-                        reference.symbol_name,
-                        reference.file_path,
-                        reference.line,
-                        reference.column,
-                        reference.kind.as_str(),
-                    ])?;
-                }
+                tx.execute(
+                    "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
+                    [],
+                )?;
 
-                // Insert imports
-                for import in result.imports {
-                    imports_stmt.execute(params![
-                        import.file_path,
-                        import.imported_path,
-                        import.imported_symbol,
-                        import.import_type.as_str(),
-                    ])?;
+                drop(symbol_stmt);
+                drop(refs_stmt);
+                drop(imports_stmt);
+                tx.commit()?;
+                Ok(total_symbols)
+            })();
+
+            match operation {
+                Ok(total_symbols) => break Ok(total_symbols),
+                Err(err) if Self::is_database_lock_error(&err) && attempt < MAX_LOCK_RETRIES => {
+                    std::thread::sleep(Duration::from_millis(retry_backoff_ms));
+                    retry_backoff_ms = retry_backoff_ms.saturating_mul(2);
+                    attempt += 1;
                 }
+                Err(err) => break Err(err),
             }
-
-            // Increment db revision in same transaction
-            tx.execute(
-                "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
-                [],
-            )?;
-
-            drop(symbol_stmt);
-            drop(refs_stmt);
-            drop(imports_stmt);
-            tx.commit()?;
-            Ok(total_symbols)
-        })();
+        };
 
         if fast_mode {
             let _ = Self::apply_default_pragmas(&conn);
@@ -5289,12 +5370,16 @@ mod tests {
                 language: "rust".to_string(),
                 symbol_count: 2,
                 content_hash: "h1".to_string(),
+                last_size: 11,
+                last_mtime_ns: 22,
             },
             IndexedFileRecord {
                 path: "b.rs".to_string(),
                 language: "rust".to_string(),
                 symbol_count: 0,
                 content_hash: "h2".to_string(),
+                last_size: 33,
+                last_mtime_ns: 44,
             },
         ];
         index.upsert_file_records_batch(&records).unwrap();
@@ -5309,6 +5394,39 @@ mod tests {
             index.get_file_content_hash("b.rs").unwrap(),
             Some("h2".to_string())
         );
+
+        let states = index.get_tracked_file_states().unwrap();
+        let a = states.get("a.rs").expect("state for a.rs");
+        assert_eq!(a.last_size, Some(11));
+        assert_eq!(a.last_mtime_ns, Some(22));
+    }
+
+    #[test]
+    fn test_update_file_tracking_metadata_batch_refreshes_prefilter_fields() {
+        let index = SqliteIndex::in_memory().unwrap();
+        index
+            .upsert_file_records_batch(&[IndexedFileRecord {
+                path: "a.rs".to_string(),
+                language: "rust".to_string(),
+                symbol_count: 1,
+                content_hash: "hash-a".to_string(),
+                last_size: 10,
+                last_mtime_ns: 20,
+            }])
+            .unwrap();
+
+        index
+            .update_file_tracking_metadata_batch(&[TrackedFileMetadataUpdate {
+                path: "a.rs".to_string(),
+                last_size: 99,
+                last_mtime_ns: 101,
+            }])
+            .unwrap();
+
+        let states = index.get_tracked_file_states().unwrap();
+        let state = states.get("a.rs").expect("tracked state");
+        assert_eq!(state.last_size, Some(99));
+        assert_eq!(state.last_mtime_ns, Some(101));
     }
 
     // Helper to add a file entry to the files table

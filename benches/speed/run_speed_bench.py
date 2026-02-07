@@ -74,6 +74,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit non-zero if any selected repo has zero valid cases",
     )
+    parser.add_argument(
+        "--baseline-json",
+        default=None,
+        help="Optional baseline report JSON for regression gating (default: disabled)",
+    )
+    parser.add_argument(
+        "--max-first-run-regression-pct",
+        type=float,
+        default=5.0,
+        help="Allowed regression vs baseline for first-run median code-indexer time (default: 5%%)",
+    )
+    parser.add_argument(
+        "--max-query-only-regression-pct",
+        type=float,
+        default=5.0,
+        help="Allowed regression vs baseline for query-only median code-indexer time (default: 5%%)",
+    )
     return parser.parse_args()
 
 
@@ -366,6 +383,22 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def mode_code_indexer_median_ms(results: list[dict[str, Any]], mode: str) -> float | None:
+    samples: list[float] = []
+    for item in results:
+        if item.get("mode") != mode:
+            continue
+        if not item.get("validity", {}).get("is_valid"):
+            continue
+        median_ms = item.get("timings", {}).get("code_indexer", {}).get("median_ms")
+        if median_ms is None:
+            continue
+        samples.append(float(median_ms))
+    if not samples:
+        return None
+    return float(statistics.median(samples))
+
+
 def main() -> int:
     args = parse_args()
 
@@ -541,6 +574,49 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.baseline_json:
+        baseline_path = Path(args.baseline_json)
+        if not baseline_path.exists():
+            raise FileNotFoundError(f"baseline report not found: {baseline_path}")
+        baseline_report = json.loads(baseline_path.read_text(encoding="utf-8"))
+        baseline_results = baseline_report.get("results", [])
+        if not isinstance(baseline_results, list):
+            raise ValueError("baseline JSON must contain a 'results' array")
+
+        checks = [
+            ("first-run", args.max_first_run_regression_pct),
+            ("query-only", args.max_query_only_regression_pct),
+        ]
+        regressions: list[str] = []
+        for mode, allowed_pct in checks:
+            if args.mode != "both" and args.mode != mode:
+                continue
+
+            current_median = mode_code_indexer_median_ms(report["results"], mode)
+            baseline_median = mode_code_indexer_median_ms(baseline_results, mode)
+            if current_median is None or baseline_median is None:
+                print(
+                    f"[bench] WARN: skip regression gate for mode={mode} (insufficient valid data)",
+                    file=sys.stderr,
+                )
+                continue
+
+            regression_pct = ((current_median - baseline_median) / baseline_median) * 100.0
+            print(
+                f"[bench] gate mode={mode}: current={current_median:.3f}ms baseline={baseline_median:.3f}ms regression={regression_pct:.2f}% allowed={allowed_pct:.2f}%",
+                file=sys.stderr,
+            )
+            if regression_pct > allowed_pct:
+                regressions.append(
+                    f"{mode} regression {regression_pct:.2f}% exceeds allowed {allowed_pct:.2f}%"
+                )
+
+        if regressions:
+            print("[bench] ERROR: performance gates failed:", file=sys.stderr)
+            for item in regressions:
+                print(f"[bench]   - {item}", file=sys.stderr)
+            return 3
 
     return 0
 

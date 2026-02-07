@@ -41,7 +41,7 @@ impl Parser {
             .ok_or_else(|| IndexerError::UnsupportedLanguage(path.display().to_string()))?;
 
         let source = std::fs::read_to_string(path)?;
-        self.parse_source(&source, grammar)
+        self.parse_source_owned(source, grammar)
     }
 
     pub fn parse_source(
@@ -52,11 +52,28 @@ impl Parser {
         self.parse_source_incremental(source, grammar, None)
     }
 
+    pub fn parse_source_owned(
+        &self,
+        source: String,
+        grammar: Arc<dyn LanguageGrammar>,
+    ) -> Result<ParsedFile> {
+        self.parse_source_incremental_owned(source, grammar, None)
+    }
+
     /// Parse source with optional old tree for incremental parsing.
     /// Incremental parsing can provide 30-50% speedup for large files.
     pub fn parse_source_incremental(
         &self,
         source: &str,
+        grammar: Arc<dyn LanguageGrammar>,
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> Result<ParsedFile> {
+        self.parse_source_incremental_owned(source.to_string(), grammar, old_tree)
+    }
+
+    pub fn parse_source_incremental_owned(
+        &self,
+        source: String,
         grammar: Arc<dyn LanguageGrammar>,
         old_tree: Option<&tree_sitter::Tree>,
     ) -> Result<ParsedFile> {
@@ -66,12 +83,12 @@ impl Parser {
             .map_err(|e| IndexerError::Parse(e.to_string()))?;
 
         let tree = parser
-            .parse(source, old_tree)
+            .parse(source.as_str(), old_tree)
             .ok_or_else(|| IndexerError::Parse("Failed to parse source".to_string()))?;
 
         Ok(ParsedFile {
             tree,
-            source: source.to_string(),
+            source,
             language: grammar.name().to_string(),
             grammar,
         })
@@ -122,7 +139,7 @@ impl ParseCache {
             trees.get(path).cloned()
         };
 
-        let parsed = parser.parse_source_incremental(&source, grammar, old_tree.as_ref())?;
+        let parsed = parser.parse_source_incremental_owned(source, grammar, old_tree.as_ref())?;
 
         // Store the new tree in cache
         self.store_tree(path, parsed.tree.clone());
@@ -137,6 +154,15 @@ impl ParseCache {
         source: &str,
         parser: &Parser,
     ) -> Result<ParsedFile> {
+        self.parse_source_cached_owned(path, source.to_string(), parser)
+    }
+
+    pub fn parse_source_cached_owned(
+        &self,
+        path: &Path,
+        source: String,
+        parser: &Parser,
+    ) -> Result<ParsedFile> {
         let grammar = parser
             .registry()
             .get_for_file(path)
@@ -147,7 +173,7 @@ impl ParseCache {
             trees.get(path).cloned()
         };
 
-        let parsed = parser.parse_source_incremental(source, grammar, old_tree.as_ref())?;
+        let parsed = parser.parse_source_incremental_owned(source, grammar, old_tree.as_ref())?;
 
         self.store_tree(path, parsed.tree.clone());
 

@@ -47,7 +47,10 @@ jobs:
             --warmup 2 \
             --out-json benches/results/speed/ci-smoke.json \
             --out-md benches/results/speed/ci-smoke.md \
-            --require-valid
+            --require-valid \
+            --baseline-json benches/results/speed/latest.json \
+            --max-first-run-regression-pct 5 \
+            --max-query-only-regression-pct 5
 
       - name: Validate JSON contract
         run: |

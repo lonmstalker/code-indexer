@@ -485,12 +485,16 @@ mod tests {
                 language: "rust".to_string(),
                 symbol_count: 3,
                 content_hash: "hash-a".to_string(),
+                last_size: 0,
+                last_mtime_ns: 0,
             },
             IndexedFileRecord {
                 path: "/test/b.rs".to_string(),
                 language: "rust".to_string(),
                 symbol_count: 5,
                 content_hash: "hash-b".to_string(),
+                last_size: 0,
+                last_mtime_ns: 0,
             },
         ];
 
