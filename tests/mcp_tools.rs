@@ -599,6 +599,36 @@ mod find_references {
     }
 
     #[test]
+    fn test_find_callers_recursive_depth() {
+        let index = create_test_index();
+        index
+            .add_symbols(vec![
+                create_test_symbol("callee", SymbolKind::Function, "callee.rs", 1),
+                create_test_symbol("caller_a", SymbolKind::Function, "a.rs", 1),
+                create_test_symbol("caller_b", SymbolKind::Function, "b.rs", 1),
+            ])
+            .unwrap();
+
+        index
+            .add_references(vec![
+                // caller_a -> callee
+                SymbolReference::new("callee", "a.rs", 5, 1, ReferenceKind::Call),
+                // caller_b -> caller_a
+                SymbolReference::new("caller_a", "b.rs", 6, 1, ReferenceKind::Call),
+            ])
+            .unwrap();
+
+        let direct = index.find_callers("callee", Some(1)).unwrap();
+        assert_eq!(direct.len(), 1);
+        assert!(direct.iter().any(|r| r.symbol_name == "callee"));
+
+        let recursive = index.find_callers("callee", Some(2)).unwrap();
+        assert_eq!(recursive.len(), 2);
+        assert!(recursive.iter().any(|r| r.symbol_name == "callee"));
+        assert!(recursive.iter().any(|r| r.symbol_name == "caller_a"));
+    }
+
+    #[test]
     fn test_find_implementations() {
         let index = create_test_index();
 

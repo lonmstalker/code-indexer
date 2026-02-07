@@ -2538,21 +2538,77 @@ impl CodeIndex for SqliteIndex {
         depth: Option<u32>,
     ) -> Result<Vec<SymbolReference>> {
         let conn = self.conn()?;
-        let max_depth = depth.unwrap_or(1);
+        let max_depth = depth.unwrap_or(1).max(1);
 
-        // For depth > 1, we would need recursive queries
-        // For now, implement single-level caller search
+        // Recursively resolve callers up to the requested depth.
+        // Depth=1 returns direct callers only, depth>1 follows the caller chain.
         let sql = r#"
-            SELECT symbol_id, symbol_name, referenced_in_file, line, column_num, reference_kind
-            FROM symbol_references
-            WHERE symbol_name = ?1 AND reference_kind = 'call'
+            WITH RECURSIVE caller_chain(
+                depth,
+                symbol_id,
+                symbol_name,
+                referenced_in_file,
+                line,
+                column_num,
+                caller_name
+            ) AS (
+                SELECT
+                    1 AS depth,
+                    r.symbol_id,
+                    r.symbol_name,
+                    r.referenced_in_file,
+                    r.line,
+                    r.column_num,
+                    (
+                        SELECT s.name
+                        FROM symbols s
+                        WHERE s.file_path = r.referenced_in_file
+                          AND s.kind IN ('function', 'method')
+                          AND s.start_line <= r.line
+                          AND s.end_line >= r.line
+                        ORDER BY (s.end_line - s.start_line) ASC
+                        LIMIT 1
+                    ) AS caller_name
+                FROM symbol_references r
+                WHERE r.reference_kind = 'call'
+                  AND r.symbol_name = ?1
+
+                UNION
+
+                SELECT
+                    cc.depth + 1,
+                    r.symbol_id,
+                    r.symbol_name,
+                    r.referenced_in_file,
+                    r.line,
+                    r.column_num,
+                    (
+                        SELECT s.name
+                        FROM symbols s
+                        WHERE s.file_path = r.referenced_in_file
+                          AND s.kind IN ('function', 'method')
+                          AND s.start_line <= r.line
+                          AND s.end_line >= r.line
+                        ORDER BY (s.end_line - s.start_line) ASC
+                        LIMIT 1
+                    ) AS caller_name
+                FROM caller_chain cc
+                JOIN symbol_references r
+                    ON r.reference_kind = 'call'
+                   AND r.symbol_name = cc.caller_name
+                WHERE cc.depth < ?2
+                  AND cc.caller_name IS NOT NULL
+            )
+            SELECT DISTINCT
+                symbol_id, symbol_name, referenced_in_file, line, column_num, 'call'
+            FROM caller_chain
             ORDER BY referenced_in_file, line
             LIMIT 100
         "#;
 
         let mut stmt = conn.prepare(sql)?;
         let refs = stmt
-            .query_map(params![function_name], |row| {
+            .query_map(params![function_name, max_depth], |row| {
                 let kind_str: String = row.get(5)?;
                 Ok(SymbolReference {
                     symbol_id: row.get(0)?,
@@ -2564,12 +2620,6 @@ impl CodeIndex for SqliteIndex {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        // If depth > 1, recursively find callers of the functions that call this one
-        if max_depth > 1 && !refs.is_empty() {
-            // TODO: Implement recursive caller search
-            // For now, just return direct callers
-        }
 
         Ok(refs)
     }
@@ -3025,116 +3075,81 @@ impl SqliteIndex {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
-        // 1. Collect all symbol IDs for all files (chunked to avoid SQLite bind limits)
-        let mut symbol_ids: Vec<String> = Vec::new();
-        for file_chunk in file_paths.chunks(Self::MAX_SQL_VARIABLES) {
-            let file_placeholders = Self::generate_placeholders(file_chunk.len());
-            let file_params: Vec<&dyn rusqlite::ToSql> = file_chunk
-                .iter()
-                .map(|p| p as &dyn rusqlite::ToSql)
-                .collect();
-            let mut stmt = tx.prepare(&format!(
-                "SELECT id FROM symbols WHERE file_path IN ({})",
-                file_placeholders
-            ))?;
-            symbol_ids.extend(
-                stmt.query_map(
-                    rusqlite::params_from_iter(file_params.iter().copied()),
-                    |row| row.get(0),
-                )?
-                .filter_map(|r| r.ok()),
-            );
+        // Use a temp table to avoid large in-memory ID vectors and repeated IN-clause scans.
+        tx.execute_batch(
+            r#"
+            CREATE TEMP TABLE IF NOT EXISTS temp_remove_paths(path TEXT PRIMARY KEY);
+            DELETE FROM temp_remove_paths;
+            "#,
+        )?;
+
+        {
+            let mut insert_stmt =
+                tx.prepare_cached("INSERT OR IGNORE INTO temp_remove_paths(path) VALUES (?1)")?;
+            for file_path in file_paths {
+                insert_stmt.execute(params![file_path])?;
+            }
         }
 
-        // 2. Delete data referencing these symbols (chunked)
-        for symbol_chunk in symbol_ids.chunks(Self::MAX_SQL_VARIABLES) {
-            let placeholders = Self::generate_placeholders(symbol_chunk.len());
-            let params: Vec<&dyn rusqlite::ToSql> = symbol_chunk
-                .iter()
-                .map(|id| id as &dyn rusqlite::ToSql)
-                .collect();
+        tx.execute(
+            r#"
+            DELETE FROM symbol_references
+            WHERE symbol_id IN (
+                SELECT id FROM symbols
+                WHERE file_path IN (SELECT path FROM temp_remove_paths)
+            )
+               OR referenced_in_file IN (SELECT path FROM temp_remove_paths)
+            "#,
+            [],
+        )?;
 
-            tx.execute(
-                &format!(
-                    "DELETE FROM symbol_references WHERE symbol_id IN ({})",
-                    placeholders
-                ),
-                params.as_slice(),
-            )?;
-            tx.execute(
-                &format!(
-                    "DELETE FROM symbol_metrics WHERE symbol_id IN ({})",
-                    placeholders
-                ),
-                params.as_slice(),
-            )?;
+        tx.execute(
+            r#"
+            DELETE FROM symbol_metrics
+            WHERE symbol_id IN (
+                SELECT id FROM symbols
+                WHERE file_path IN (SELECT path FROM temp_remove_paths)
+            )
+            "#,
+            [],
+        )?;
 
-            let double_params: Vec<&dyn rusqlite::ToSql> = symbol_chunk
-                .iter()
-                .chain(symbol_chunk.iter())
-                .map(|id| id as &dyn rusqlite::ToSql)
-                .collect();
-            tx.execute(
-                &format!(
-                    "DELETE FROM call_edges WHERE caller_symbol_id IN ({}) OR callee_symbol_id IN ({})",
-                    placeholders, placeholders
-                ),
-                double_params.as_slice(),
-            )?;
-        }
+        tx.execute(
+            r#"
+            DELETE FROM call_edges
+            WHERE caller_symbol_id IN (
+                SELECT id FROM symbols
+                WHERE file_path IN (SELECT path FROM temp_remove_paths)
+            )
+               OR callee_symbol_id IN (
+                SELECT id FROM symbols
+                WHERE file_path IN (SELECT path FROM temp_remove_paths)
+            )
+               OR file_path IN (SELECT path FROM temp_remove_paths)
+            "#,
+            [],
+        )?;
 
-        // 3. Delete data referencing these file paths (chunked)
-        for file_chunk in file_paths.chunks(Self::MAX_SQL_VARIABLES) {
-            let file_placeholders = Self::generate_placeholders(file_chunk.len());
-            let file_params: Vec<&dyn rusqlite::ToSql> = file_chunk
-                .iter()
-                .map(|p| p as &dyn rusqlite::ToSql)
-                .collect();
+        tx.execute(
+            "DELETE FROM file_imports WHERE file_path IN (SELECT path FROM temp_remove_paths)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM scopes WHERE file_path IN (SELECT path FROM temp_remove_paths)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM symbols WHERE file_path IN (SELECT path FROM temp_remove_paths)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM files WHERE path IN (SELECT path FROM temp_remove_paths)",
+            [],
+        )?;
 
-            tx.execute(
-                &format!(
-                    "DELETE FROM symbol_references WHERE referenced_in_file IN ({})",
-                    file_placeholders
-                ),
-                file_params.as_slice(),
-            )?;
-            tx.execute(
-                &format!(
-                    "DELETE FROM file_imports WHERE file_path IN ({})",
-                    file_placeholders
-                ),
-                file_params.as_slice(),
-            )?;
-            tx.execute(
-                &format!(
-                    "DELETE FROM scopes WHERE file_path IN ({})",
-                    file_placeholders
-                ),
-                file_params.as_slice(),
-            )?;
-            tx.execute(
-                &format!(
-                    "DELETE FROM call_edges WHERE file_path IN ({})",
-                    file_placeholders
-                ),
-                file_params.as_slice(),
-            )?;
+        tx.execute("DELETE FROM temp_remove_paths", [])?;
 
-            // 4. Delete symbols and file entries
-            tx.execute(
-                &format!(
-                    "DELETE FROM symbols WHERE file_path IN ({})",
-                    file_placeholders
-                ),
-                file_params.as_slice(),
-            )?;
-            tx.execute(
-                &format!("DELETE FROM files WHERE path IN ({})", file_placeholders),
-                file_params.as_slice(),
-            )?;
-        }
-
-        // 5. Increment db revision (only once for the batch)
+        // Increment db revision (only once for the batch)
         tx.execute(
             "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'db_revision'",
             [],

@@ -28,7 +28,7 @@ PRAGMA настройки:
 - `temp_store = MEMORY`
 
 Batch/scale-path:
-- `remove_files_batch` удаляет данные chunked по IN-clause (лимит bind-переменных SQLite).
+- `remove_files_batch` использует `TEMP TABLE` + set-based delete (вместо больших IN-списков и промежуточных `symbol_ids` в памяти).
 - Для Intent Layer есть batch API: `upsert_file_meta_batch`, `get_file_meta_many`, `get_file_meta_with_tags_many`, `add_file_tags_batch`.
 
 ## Связанные материалы

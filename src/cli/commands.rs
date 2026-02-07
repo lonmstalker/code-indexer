@@ -652,7 +652,6 @@ pub fn index_directory(
     #[derive(Clone)]
     struct FileWorkItem {
         path: PathBuf,
-        content: String,
         content_hash: String,
     }
 
@@ -732,7 +731,6 @@ pub fn index_directory(
                 if needs_reindex {
                     files_to_index.push(FileWorkItem {
                         path: file.clone(),
-                        content,
                         content_hash,
                     });
                 }
@@ -784,7 +782,7 @@ pub fn index_directory(
                         std::thread::sleep(per_file_delay);
                     }
 
-                    match parse_cache_ref.parse_source_cached(&file.path, &file.content, parser) {
+                    match parse_cache_ref.parse_file(&file.path, parser) {
                         Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
                             Ok(result) => {
                                 let symbol_count = result.symbols.len();

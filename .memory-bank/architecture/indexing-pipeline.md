@@ -8,10 +8,11 @@ description: "Пайплайн индексирования: от FileWalker д�
 
 ## Основная цепочка
 1. File discovery: `FileWalker::global()` собирает поддерживаемые файлы.
-2. Incremental precheck: файл читается один раз, вычисляется `content_hash`; skip unchanged делается через preloaded map `get_tracked_file_hashes` (без per-file DB roundtrip).
+2. Incremental precheck: вычисляется `content_hash`; skip unchanged делается через preloaded map `get_tracked_file_hashes` (без per-file DB roundtrip).
 3. Stale cleanup: из индекса удаляются tracked-файлы, которых больше нет в workspace (`remove_files_batch`).
 4. Progress init: `IndexingProgress::start(files_to_index.len())` — shared atomic state для tracking.
-5. Parsing: `Parser::global()` + `ParseCache::parse_source_cached` строят AST из уже прочитанного контента (rayon `map_init`: parser/extractor создаются один раз на worker thread).
+5. Parsing: `Parser::global()` + `ParseCache::parse_file` строят AST из файловой системы (rayon `map_init`: parser/extractor создаются один раз на worker thread).
+   - Pipeline не удерживает полный исходник каждого changed-файла в `files_to_index`, что снижает peak memory на больших workspace.
    - Параллелизм и тепловой профиль задаются через `index --profile eco|balanced|max`, ручной override `--threads N`, дополнительный мягкий throttling `--throttle-ms`.
 6. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports. Queries берутся из cache (`cached_*_query`) при наличии.
 7. Persist: сначала удаляются старые записи для changed-файлов (`remove_files_batch`, chunked), затем `SqliteIndex::add_extraction_results_batch_with_durability` сохраняет новые символы (`--durability fast|safe` для bulk index).

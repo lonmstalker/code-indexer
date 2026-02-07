@@ -48,6 +48,22 @@ fn diversify_by_directory(results: Vec<SearchResult>, max_per_dir: usize) -> Vec
     diversified
 }
 
+fn decode_offset_cursor(cursor: Option<&str>) -> usize {
+    cursor
+        .and_then(crate::index::PaginationCursor::decode)
+        .and_then(|c| c.offset)
+        .unwrap_or(0)
+}
+
+fn build_next_offset_cursor(offset: usize, limit: usize, totals: &[usize]) -> Option<String> {
+    let next_offset = offset.saturating_add(limit);
+    if totals.iter().any(|total| *total > next_offset) {
+        Some(crate::index::PaginationCursor::from_offset(next_offset).encode())
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct McpServer {
     index: Arc<SqliteIndex>,
@@ -2809,7 +2825,6 @@ impl ServerHandler for McpServer {
                 #[derive(Clone)]
                 struct FileWorkItem {
                     path: PathBuf,
-                    content: String,
                     content_hash: String,
                 }
 
@@ -2863,7 +2878,6 @@ impl ServerHandler for McpServer {
                                     if needs_reindex {
                                         files_to_index.push(FileWorkItem {
                                             path: file,
-                                            content,
                                             content_hash,
                                         });
                                     }
@@ -2881,47 +2895,46 @@ impl ServerHandler for McpServer {
                             progress.inc_error();
                         }
 
-                        let results: Vec<(IndexedFileRecord, ExtractionResult)> =
-                            files_to_index
-                                .into_par_iter()
-                                .map_init(
-                                    || (Parser::global(), SymbolExtractor::new()),
-                                    |(parser, extractor), item| match parse_cache
-                                        .parse_source_cached(&item.path, &item.content, parser)
-                                    {
-                                        Ok(parsed) => {
-                                            match extractor.extract_all(&parsed, &item.path) {
-                                                Ok(result) => {
-                                                    let symbol_count = result.symbols.len();
-                                                    progress.inc(symbol_count);
-                                                    Some((
-                                                        IndexedFileRecord {
-                                                            path: item
-                                                                .path
-                                                                .to_string_lossy()
-                                                                .to_string(),
-                                                            language: parsed.language.clone(),
-                                                            symbol_count,
-                                                            content_hash: item.content_hash,
-                                                        },
-                                                        result,
-                                                    ))
-                                                }
-                                                Err(_) => {
-                                                    progress.inc_error();
-                                                    None
-                                                }
+                        let results: Vec<(IndexedFileRecord, ExtractionResult)> = files_to_index
+                            .into_par_iter()
+                            .map_init(
+                                || (Parser::global(), SymbolExtractor::new()),
+                                |(parser, extractor), item| match parse_cache
+                                    .parse_file(&item.path, parser)
+                                {
+                                    Ok(parsed) => {
+                                        match extractor.extract_all(&parsed, &item.path) {
+                                            Ok(result) => {
+                                                let symbol_count = result.symbols.len();
+                                                progress.inc(symbol_count);
+                                                Some((
+                                                    IndexedFileRecord {
+                                                        path: item
+                                                            .path
+                                                            .to_string_lossy()
+                                                            .to_string(),
+                                                        language: parsed.language.clone(),
+                                                        symbol_count,
+                                                        content_hash: item.content_hash,
+                                                    },
+                                                    result,
+                                                ))
+                                            }
+                                            Err(_) => {
+                                                progress.inc_error();
+                                                None
                                             }
                                         }
-                                        Err(_) => {
-                                            progress.inc_error();
-                                            parse_cache.invalidate(&item.path);
-                                            None
-                                        }
-                                    },
-                                )
-                                .filter_map(|r| r)
-                                .collect();
+                                    }
+                                    Err(_) => {
+                                        progress.inc_error();
+                                        parse_cache.invalidate(&item.path);
+                                        None
+                                    }
+                                },
+                            )
+                            .filter_map(|r| r)
+                            .collect();
 
                         let mut file_records = Vec::with_capacity(results.len());
                         let mut extraction_results = Vec::with_capacity(results.len());
@@ -4573,8 +4586,9 @@ impl ServerHandler for McpServer {
                 )
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let limit = params.limit.unwrap_or(20);
+                let limit = params.limit.unwrap_or(20).max(1);
                 let include_symbols = params.include_symbols.unwrap_or(false);
+                let offset = decode_offset_cursor(params.cursor.as_deref());
 
                 // Get the node
                 let node = match self.index.get_project_node(&params.node_id) {
@@ -4591,11 +4605,14 @@ impl ServerHandler for McpServer {
                 };
 
                 // Get children
-                let children: Vec<CompassModuleNode> = self
+                let all_children = self
                     .index
                     .get_node_children(&params.node_id)
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let total_children = all_children.len();
+                let children: Vec<CompassModuleNode> = all_children
                     .into_iter()
+                    .skip(offset)
                     .take(limit)
                     .map(|n| CompassModuleNode {
                         id: n.id,
@@ -4608,60 +4625,78 @@ impl ServerHandler for McpServer {
                     .collect();
 
                 // Get files in this node's path
-                let top_files: Vec<NodeFileInfo> = if let Ok(stats) = self.index.get_stats() {
-                    // Create file info from languages found in this node
-                    stats
-                        .files_by_language
-                        .iter()
-                        .filter(|(_, count)| *count > 0)
-                        .take(limit)
-                        .map(|(lang, _)| {
-                            let symbol_count = stats
-                                .symbols_by_language
-                                .iter()
-                                .find(|(l, _)| l == lang)
-                                .map(|(_, c)| *c)
-                                .unwrap_or(0);
-                            NodeFileInfo {
-                                path: format!("{}/*.{}", node.path, lang),
-                                language: lang.clone(),
-                                symbol_count,
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let (top_files, total_top_files): (Vec<NodeFileInfo>, usize) =
+                    if let Ok(stats) = self.index.get_stats() {
+                        // Create file info from languages found in this node
+                        let all_files: Vec<NodeFileInfo> = stats
+                            .files_by_language
+                            .iter()
+                            .filter(|(_, count)| *count > 0)
+                            .map(|(lang, _)| {
+                                let symbol_count = stats
+                                    .symbols_by_language
+                                    .iter()
+                                    .find(|(l, _)| l == lang)
+                                    .map(|(_, c)| *c)
+                                    .unwrap_or(0);
+                                NodeFileInfo {
+                                    path: format!("{}/*.{}", node.path, lang),
+                                    language: lang.clone(),
+                                    symbol_count,
+                                }
+                            })
+                            .collect();
+                        let total = all_files.len();
+                        (
+                            all_files.into_iter().skip(offset).take(limit).collect(),
+                            total,
+                        )
+                    } else {
+                        (Vec::new(), 0)
+                    };
 
                 // Get top symbols if requested
-                let top_symbols: Vec<SymbolCard> = if include_symbols {
+                let (top_symbols, total_top_symbols): (Vec<SymbolCard>, usize) = if include_symbols
+                {
                     let sym_options = crate::index::SearchOptions {
                         file_filter: Some(node.path.clone()),
-                        limit: Some(limit),
+                        limit: Some(limit.saturating_add(offset)),
                         ..Default::default()
                     };
 
                     let functions = self.index.list_functions(&sym_options).unwrap_or_default();
                     let types = self.index.list_types(&sym_options).unwrap_or_default();
+                    let all_symbols: Vec<_> =
+                        functions.into_iter().chain(types.into_iter()).collect();
+                    let total = all_symbols.len();
 
-                    functions
-                        .into_iter()
-                        .chain(types.into_iter())
-                        .take(limit)
-                        .enumerate()
-                        .map(|(i, s)| SymbolCard {
-                            id: s.id.clone(),
-                            fqdn: s.fqdn.clone(),
-                            kind: s.kind.as_str().to_string(),
-                            sig: s.signature.clone(),
-                            loc: format!("{}:{}", s.location.file_path, s.location.start_line),
-                            rank: (i + 1) as u32,
-                            snippet: None,
-                        })
-                        .collect()
+                    (
+                        all_symbols
+                            .into_iter()
+                            .skip(offset)
+                            .take(limit)
+                            .enumerate()
+                            .map(|(i, s)| SymbolCard {
+                                id: s.id.clone(),
+                                fqdn: s.fqdn.clone(),
+                                kind: s.kind.as_str().to_string(),
+                                sig: s.signature.clone(),
+                                loc: format!("{}:{}", s.location.file_path, s.location.start_line),
+                                rank: (i + 1) as u32,
+                                snippet: None,
+                            })
+                            .collect(),
+                        total,
+                    )
                 } else {
-                    Vec::new()
+                    (Vec::new(), 0)
                 };
+
+                let mut totals = vec![total_children, total_top_files];
+                if include_symbols {
+                    totals.push(total_top_symbols);
+                }
+                let next_cursor = build_next_offset_cursor(offset, limit, &totals);
 
                 let response = ExpandedNodeResponse {
                     node: CompassModuleNode {
@@ -4675,7 +4710,7 @@ impl ServerHandler for McpServer {
                     children,
                     top_files,
                     top_symbols,
-                    next_cursor: None, // TODO: implement pagination
+                    next_cursor,
                 };
 
                 CallToolResult::success(vec![Content::text(
@@ -4943,6 +4978,23 @@ mod tests {
         });
 
         format!("http://{}/v1", addr)
+    }
+
+    #[test]
+    fn test_decode_offset_cursor() {
+        let encoded = crate::index::PaginationCursor::from_offset(42).encode();
+        assert_eq!(decode_offset_cursor(Some(&encoded)), 42);
+        assert_eq!(decode_offset_cursor(Some("not-valid-cursor")), 0);
+        assert_eq!(decode_offset_cursor(None), 0);
+    }
+
+    #[test]
+    fn test_build_next_offset_cursor() {
+        let next = build_next_offset_cursor(0, 10, &[5, 25]).expect("cursor expected");
+        let decoded = crate::index::PaginationCursor::decode(&next).expect("decode cursor");
+        assert_eq!(decoded.offset, Some(10));
+
+        assert!(build_next_offset_cursor(20, 10, &[5, 25]).is_none());
     }
 
     // === enforce_max_bytes tests ===
