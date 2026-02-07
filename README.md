@@ -405,6 +405,51 @@ UserService:cls@src/UserService.java:10
 - `find_dead_code`, `get_metrics` → `get_diagnostics`
 - `index_stats` → `get_stats`
 
+## MCP настройка для Codex (project-level через Docker)
+
+Codex поддерживает проектный конфиг MCP в `.codex/config.toml` (без глобального `~/.codex/config.toml`) для trusted-проектов.
+
+Добавьте в корень проекта файл `.codex/config.toml`:
+
+```toml
+[mcp_servers.code-indexer]
+command = "docker"
+args = [
+  "run",
+  "--rm",
+  "-i",
+  "-v",
+  ".:/workspace",
+  "-w",
+  "/workspace",
+  "-e",
+  "OPENAI_API_KEY",
+  "-e",
+  "ANTHROPIC_API_KEY",
+  "-e",
+  "OPENROUTER_API_KEY",
+  "-e",
+  "LOCAL_LLM_API_KEY",
+  "-e",
+  "VIBEPROXY_API_KEY",
+  "lonmstalkerd/code-indexer:latest",
+  "--db",
+  "/workspace/.code-index.db",
+  "serve",
+]
+```
+
+Проверка из корня проекта:
+
+```bash
+codex mcp list
+```
+
+Примечания:
+- Для нескольких проектов используйте отдельный `.codex/config.toml` в каждом проекте.
+- Если проект больше не нужен, индекс можно удалить: `rm -f .code-index.db` (или `code-indexer clear`).
+- Для `prepare_context` agent-токен берётся из `agent.api_key_env` в `.code-indexer.yml`; соответствующую переменную нужно прокинуть в контейнер через `-e <ENV_NAME>`.
+
 ## MCP настройка для Claude Desktop
 
 Добавьте в `~/.config/claude/claude_desktop_config.json`:

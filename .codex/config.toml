@@ -1,0 +1,25 @@
+[mcp_servers.code-indexer]
+command = "docker"
+args = [
+  "run",
+  "--rm",
+  "-i",
+  "-v",
+  ".:/workspace",
+  "-w",
+  "/workspace",
+  "-e",
+  "OPENAI_API_KEY",
+  "-e",
+  "ANTHROPIC_API_KEY",
+  "-e",
+  "OPENROUTER_API_KEY",
+  "-e",
+  "LOCAL_LLM_API_KEY",
+  "-e",
+  "VIBEPROXY_API_KEY",
+  "lonmstalkerd/code-indexer:latest",
+  "--db",
+  "/workspace/.code-index.db",
+  "serve",
+]
