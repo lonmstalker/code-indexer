@@ -30,6 +30,11 @@ PRAGMA настройки:
 Batch/scale-path:
 - `remove_files_batch` использует `TEMP TABLE` + set-based delete (вместо больших IN-списков и промежуточных `symbol_ids` в памяти).
 - Для Intent Layer есть batch API: `upsert_file_meta_batch`, `get_file_meta_many`, `get_file_meta_with_tags_many`, `add_file_tags_batch`.
+- Для symbol ingest используется `add_extraction_results_batch_with_mode(results, fast_mode, cold_run)`:
+  - default/safe profile: базовые PRAGMA (`WAL/NORMAL/-64000`).
+  - `fast_mode` profile: `synchronous=OFF`, `cache_size=-128000`.
+  - `fast_mode + cold_run` profile: агрессивный one-shot bulk (`journal_mode=MEMORY`, `locking_mode=EXCLUSIVE`, `synchronous=OFF`, `temp_store=MEMORY`, `cache_size=-256000`) с обязательным restore к дефолтному профилю после batch insert.
+  - если cold-fast профиль не может быть включён из-за SQLite lock/busy, ingest автоматически fallback на обычный fast profile, чтобы избежать hard-fail индексации.
 
 ## Связанные материалы
 [.memory-bank/guides/data-store.md](../guides/data-store.md): эксплуатация БД и команды обслуживания.

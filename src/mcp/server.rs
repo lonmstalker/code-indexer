@@ -65,6 +65,210 @@ fn build_next_offset_cursor(offset: usize, limit: usize, totals: &[usize]) -> Op
 }
 
 #[derive(Clone)]
+struct IncrementalWorkspaceFileWorkItem {
+    path: std::path::PathBuf,
+    content: String,
+    content_hash: String,
+}
+
+#[derive(Clone)]
+struct ColdWorkspaceFileWorkItem {
+    path: std::path::PathBuf,
+}
+
+struct WorkspaceScanOutcome {
+    files_count: usize,
+    files_skipped: usize,
+    stale_files: Vec<String>,
+    file_records: Vec<crate::index::sqlite::IndexedFileRecord>,
+    extraction_results: Vec<crate::indexer::ExtractionResult>,
+    is_cold_run: bool,
+}
+
+fn scan_workspace_for_indexing(
+    root_path: &std::path::Path,
+    index: &crate::index::sqlite::SqliteIndex,
+    parse_cache: &crate::indexer::ParseCache,
+    progress: &crate::indexer::IndexingProgress,
+) -> crate::error::Result<WorkspaceScanOutcome> {
+    use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
+    use crate::indexer::{ExtractionResult, FileWalker, Parser, SymbolExtractor};
+    use rayon::prelude::*;
+    use std::collections::HashSet;
+
+    let walker = FileWalker::global();
+    let files = walker.walk(root_path)?;
+
+    let files_count = files.len();
+    let current_files: HashSet<String> = files
+        .iter()
+        .map(|file| file.to_string_lossy().to_string())
+        .collect();
+    let tracked_files = index.get_tracked_files()?;
+    let stale_files: Vec<String> = tracked_files
+        .iter()
+        .filter(|tracked| !current_files.contains(*tracked))
+        .cloned()
+        .collect();
+    let tracked_hashes = index.get_tracked_file_hashes()?;
+    let is_cold_run = tracked_files.is_empty() && tracked_hashes.is_empty();
+
+    let mut read_errors = 0usize;
+    let mut files_skipped = 0usize;
+    let mut cold_files_to_index: Vec<ColdWorkspaceFileWorkItem> = Vec::new();
+    let mut incremental_files_to_index: Vec<IncrementalWorkspaceFileWorkItem> = Vec::new();
+
+    if is_cold_run {
+        cold_files_to_index = files
+            .iter()
+            .cloned()
+            .map(|path| ColdWorkspaceFileWorkItem { path })
+            .collect();
+    } else {
+        enum PrecheckOutcome {
+            Changed(IncrementalWorkspaceFileWorkItem),
+            Unchanged,
+            ReadError(std::path::PathBuf),
+        }
+
+        let precheck_outcomes: Vec<PrecheckOutcome> = files
+            .par_iter()
+            .map(|file| match std::fs::read_to_string(file) {
+                Ok(content) => {
+                    let file_path = file.to_string_lossy().to_string();
+                    let content_hash = SqliteIndex::compute_content_hash(&content);
+                    let needs_reindex = tracked_hashes
+                        .get(&file_path)
+                        .map(|stored| stored != &content_hash)
+                        .unwrap_or(true);
+                    if needs_reindex {
+                        PrecheckOutcome::Changed(IncrementalWorkspaceFileWorkItem {
+                            path: file.clone(),
+                            content,
+                            content_hash,
+                        })
+                    } else {
+                        PrecheckOutcome::Unchanged
+                    }
+                }
+                Err(_) => PrecheckOutcome::ReadError(file.clone()),
+            })
+            .collect();
+
+        for outcome in precheck_outcomes {
+            match outcome {
+                PrecheckOutcome::Changed(item) => incremental_files_to_index.push(item),
+                PrecheckOutcome::Unchanged => {}
+                PrecheckOutcome::ReadError(path) => {
+                    read_errors += 1;
+                    let _ = path;
+                }
+            }
+        }
+        files_skipped = files_count.saturating_sub(incremental_files_to_index.len() + read_errors);
+    }
+
+    let files_to_index_len = if is_cold_run {
+        cold_files_to_index.len()
+    } else {
+        incremental_files_to_index.len()
+    };
+    progress.start(files_to_index_len + read_errors);
+    for _ in 0..read_errors {
+        progress.inc_error();
+    }
+
+    let results: Vec<(IndexedFileRecord, ExtractionResult)> = if is_cold_run {
+        cold_files_to_index
+            .into_par_iter()
+            .map_init(
+                || (Parser::global(), SymbolExtractor::new()),
+                |(parser, extractor), item| match parser.parse_file(&item.path) {
+                    Ok(parsed) => match extractor.extract_all(&parsed, &item.path) {
+                        Ok(result) => {
+                            let symbol_count = result.symbols.len();
+                            progress.inc(symbol_count);
+                            Some((
+                                IndexedFileRecord {
+                                    path: item.path.to_string_lossy().to_string(),
+                                    language: parsed.language.clone(),
+                                    symbol_count,
+                                    content_hash: SqliteIndex::compute_content_hash(&parsed.source),
+                                },
+                                result,
+                            ))
+                        }
+                        Err(_) => {
+                            progress.inc_error();
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        progress.inc_error();
+                        None
+                    }
+                },
+            )
+            .filter_map(|r| r)
+            .collect()
+    } else {
+        incremental_files_to_index
+            .into_par_iter()
+            .map_init(
+                || (Parser::global(), SymbolExtractor::new()),
+                |(parser, extractor), item| match parse_cache.parse_source_cached(
+                    &item.path,
+                    &item.content,
+                    parser,
+                ) {
+                    Ok(parsed) => match extractor.extract_all(&parsed, &item.path) {
+                        Ok(result) => {
+                            let symbol_count = result.symbols.len();
+                            progress.inc(symbol_count);
+                            Some((
+                                IndexedFileRecord {
+                                    path: item.path.to_string_lossy().to_string(),
+                                    language: parsed.language.clone(),
+                                    symbol_count,
+                                    content_hash: item.content_hash.clone(),
+                                },
+                                result,
+                            ))
+                        }
+                        Err(_) => {
+                            progress.inc_error();
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        progress.inc_error();
+                        parse_cache.invalidate(&item.path);
+                        None
+                    }
+                },
+            )
+            .filter_map(|r| r)
+            .collect()
+    };
+
+    let mut file_records = Vec::with_capacity(results.len());
+    let mut extraction_results = Vec::with_capacity(results.len());
+    for (file_record, extraction_result) in results {
+        file_records.push(file_record);
+        extraction_results.push(extraction_result);
+    }
+
+    Ok(WorkspaceScanOutcome {
+        files_count,
+        files_skipped,
+        stale_files,
+        file_records,
+        extraction_results,
+        is_cold_run,
+    })
+}
+
+#[derive(Clone)]
 pub struct McpServer {
     index: Arc<SqliteIndex>,
     overlay: Arc<DocumentOverlay>,
@@ -2816,25 +3020,7 @@ impl ServerHandler for McpServer {
         let result = match tool_name {
             // === 1. index_workspace ===
             "index_workspace" => {
-                use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
-                use crate::indexer::{ExtractionResult, FileWalker, Parser, SymbolExtractor};
-                use rayon::prelude::*;
-                use std::collections::HashSet;
                 use std::path::PathBuf;
-
-                #[derive(Clone)]
-                struct FileWorkItem {
-                    path: PathBuf,
-                    content_hash: String,
-                }
-
-                struct ScanOutcome {
-                    files_count: usize,
-                    files_skipped: usize,
-                    stale_files: Vec<String>,
-                    file_records: Vec<IndexedFileRecord>,
-                    extraction_results: Vec<ExtractionResult>,
-                }
 
                 let params: IndexWorkspaceParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -2847,111 +3033,9 @@ impl ServerHandler for McpServer {
                 let parse_cache = self.parse_cache.clone();
                 let progress = self.indexing_progress.clone();
 
-                let scan_outcome = match tokio::task::spawn_blocking(
-                    move || -> crate::error::Result<ScanOutcome> {
-                        let walker = FileWalker::global();
-                        let files = walker.walk(&root_path)?;
-
-                        let files_count = files.len();
-                        let current_files: HashSet<String> = files
-                            .iter()
-                            .map(|file| file.to_string_lossy().to_string())
-                            .collect();
-                        let tracked_files = index.get_tracked_files()?;
-                        let stale_files: Vec<String> = tracked_files
-                            .into_iter()
-                            .filter(|tracked| !current_files.contains(tracked))
-                            .collect();
-                        let tracked_hashes = index.get_tracked_file_hashes()?;
-
-                        let mut read_errors = 0usize;
-                        let mut files_to_index = Vec::new();
-                        for file in files {
-                            match std::fs::read_to_string(&file) {
-                                Ok(content) => {
-                                    let file_path = file.to_string_lossy().to_string();
-                                    let content_hash = SqliteIndex::compute_content_hash(&content);
-                                    let needs_reindex = tracked_hashes
-                                        .get(&file_path)
-                                        .map(|stored| stored != &content_hash)
-                                        .unwrap_or(true);
-                                    if needs_reindex {
-                                        files_to_index.push(FileWorkItem {
-                                            path: file,
-                                            content_hash,
-                                        });
-                                    }
-                                }
-                                Err(_) => {
-                                    read_errors += 1;
-                                }
-                            }
-                        }
-
-                        let files_skipped =
-                            files_count.saturating_sub(files_to_index.len() + read_errors);
-                        progress.start(files_to_index.len() + read_errors);
-                        for _ in 0..read_errors {
-                            progress.inc_error();
-                        }
-
-                        let results: Vec<(IndexedFileRecord, ExtractionResult)> = files_to_index
-                            .into_par_iter()
-                            .map_init(
-                                || (Parser::global(), SymbolExtractor::new()),
-                                |(parser, extractor), item| match parse_cache
-                                    .parse_file(&item.path, parser)
-                                {
-                                    Ok(parsed) => {
-                                        match extractor.extract_all(&parsed, &item.path) {
-                                            Ok(result) => {
-                                                let symbol_count = result.symbols.len();
-                                                progress.inc(symbol_count);
-                                                Some((
-                                                    IndexedFileRecord {
-                                                        path: item
-                                                            .path
-                                                            .to_string_lossy()
-                                                            .to_string(),
-                                                        language: parsed.language.clone(),
-                                                        symbol_count,
-                                                        content_hash: item.content_hash,
-                                                    },
-                                                    result,
-                                                ))
-                                            }
-                                            Err(_) => {
-                                                progress.inc_error();
-                                                None
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        progress.inc_error();
-                                        parse_cache.invalidate(&item.path);
-                                        None
-                                    }
-                                },
-                            )
-                            .filter_map(|r| r)
-                            .collect();
-
-                        let mut file_records = Vec::with_capacity(results.len());
-                        let mut extraction_results = Vec::with_capacity(results.len());
-                        for (file_record, extraction_result) in results {
-                            file_records.push(file_record);
-                            extraction_results.push(extraction_result);
-                        }
-
-                        Ok(ScanOutcome {
-                            files_count,
-                            files_skipped,
-                            stale_files,
-                            file_records,
-                            extraction_results,
-                        })
-                    },
-                )
+                let scan_outcome = match tokio::task::spawn_blocking(move || {
+                    scan_workspace_for_indexing(&root_path, &index, &parse_cache, &progress)
+                })
                 .await
                 {
                     Ok(Ok(outcome)) => outcome,
@@ -2989,7 +3073,7 @@ impl ServerHandler for McpServer {
                     .iter()
                     .map(|record| record.path.clone())
                     .collect();
-                if !changed_file_paths.is_empty() {
+                if !scan_outcome.is_cold_run && !changed_file_paths.is_empty() {
                     self.write_remove_files_batch(changed_file_paths)
                         .await
                         .map_err(|e| {
@@ -4978,6 +5062,76 @@ mod tests {
         });
 
         format!("http://{}/v1", addr)
+    }
+
+    fn persist_scan_outcome(
+        index: &crate::index::sqlite::SqliteIndex,
+        outcome: WorkspaceScanOutcome,
+    ) {
+        if !outcome.stale_files.is_empty() {
+            let stale_refs: Vec<&str> = outcome.stale_files.iter().map(|s| s.as_str()).collect();
+            index
+                .remove_files_batch(&stale_refs)
+                .expect("remove stale files");
+        }
+
+        if !outcome.is_cold_run {
+            let changed_paths: Vec<&str> = outcome
+                .file_records
+                .iter()
+                .map(|record| record.path.as_str())
+                .collect();
+            if !changed_paths.is_empty() {
+                index
+                    .remove_files_batch(&changed_paths)
+                    .expect("remove changed files");
+            }
+        }
+
+        index
+            .add_extraction_results_batch(outcome.extraction_results)
+            .expect("store extraction results");
+        index
+            .upsert_file_records_batch(&outcome.file_records)
+            .expect("store file records");
+    }
+
+    #[test]
+    fn test_scan_workspace_cold_and_incremental_counters() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_path = temp_dir.path().join("lib.rs");
+        std::fs::write(&file_path, "pub fn alpha() {}\n").expect("write source");
+
+        let db_path = temp_dir.path().join(".code-index.db");
+        let index = crate::index::sqlite::SqliteIndex::new(&db_path).expect("open db");
+        let parse_cache = crate::indexer::ParseCache::new();
+        let progress = crate::indexer::IndexingProgress::new();
+
+        let first = scan_workspace_for_indexing(temp_dir.path(), &index, &parse_cache, &progress)
+            .expect("first scan");
+        assert!(first.is_cold_run);
+        assert_eq!(first.files_count, 1);
+        assert_eq!(first.files_skipped, 0);
+        assert_eq!(first.file_records.len(), 1);
+
+        persist_scan_outcome(&index, first);
+
+        let second = scan_workspace_for_indexing(temp_dir.path(), &index, &parse_cache, &progress)
+            .expect("second scan");
+        assert!(!second.is_cold_run);
+        assert_eq!(second.files_count, 1);
+        assert_eq!(second.files_skipped, 1);
+        assert!(second.file_records.is_empty());
+
+        std::fs::write(&file_path, "pub fn alpha() { println!(\"x\"); }\n")
+            .expect("rewrite source");
+
+        let third = scan_workspace_for_indexing(temp_dir.path(), &index, &parse_cache, &progress)
+            .expect("third scan");
+        assert!(!third.is_cold_run);
+        assert_eq!(third.files_count, 1);
+        assert_eq!(third.files_skipped, 0);
+        assert_eq!(third.file_records.len(), 1);
     }
 
     #[test]

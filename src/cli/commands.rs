@@ -650,9 +650,15 @@ pub fn index_directory(
     use code_indexer::indexer::ExtractionResult;
 
     #[derive(Clone)]
-    struct FileWorkItem {
+    struct IncrementalFileWorkItem {
         path: PathBuf,
+        content: String,
         content_hash: String,
+    }
+
+    #[derive(Clone)]
+    struct ColdFileWorkItem {
+        path: PathBuf,
     }
 
     // If db_path is the default value, place the database inside the indexed directory
@@ -705,8 +711,9 @@ pub fn index_directory(
 
     let tracked_files = index.get_tracked_files()?;
     let stale_files: Vec<String> = tracked_files
-        .into_iter()
-        .filter(|tracked| !current_files.contains(tracked))
+        .iter()
+        .filter(|tracked| !current_files.contains(*tracked))
+        .cloned()
         .collect();
     if !stale_files.is_empty() {
         let stale_refs: Vec<&str> = stale_files.iter().map(|p| p.as_str()).collect();
@@ -718,30 +725,76 @@ pub fn index_directory(
     let sidecar_meta = process_sidecar_files(&files, path, &index)?;
 
     let tracked_hashes = index.get_tracked_file_hashes()?;
-    let mut files_to_index = Vec::new();
-    for file in &files {
-        match fs::read_to_string(file) {
-            Ok(content) => {
-                let file_path = file.to_string_lossy().to_string();
-                let content_hash = SqliteIndex::compute_content_hash(&content);
-                let needs_reindex = tracked_hashes
-                    .get(&file_path)
-                    .map(|stored| stored != &content_hash)
-                    .unwrap_or(true);
-                if needs_reindex {
-                    files_to_index.push(FileWorkItem {
-                        path: file.clone(),
-                        content_hash,
-                    });
+    let is_cold_run = tracked_files.is_empty() && tracked_hashes.is_empty();
+
+    let mut read_errors = 0usize;
+    let mut unchanged_files = 0usize;
+    let mut cold_files_to_index: Vec<ColdFileWorkItem> = Vec::new();
+    let mut incremental_files_to_index: Vec<IncrementalFileWorkItem> = Vec::new();
+
+    if is_cold_run {
+        cold_files_to_index = files
+            .iter()
+            .cloned()
+            .map(|path| ColdFileWorkItem { path })
+            .collect();
+    } else {
+        enum PrecheckOutcome {
+            Changed(IncrementalFileWorkItem),
+            Unchanged,
+            ReadError(PathBuf, std::io::Error),
+        }
+
+        let precheck_outcomes: Vec<PrecheckOutcome> = index_pool.install(|| {
+            files
+                .par_iter()
+                .map(|file| match fs::read_to_string(file) {
+                    Ok(content) => {
+                        let file_path = file.to_string_lossy().to_string();
+                        let content_hash = SqliteIndex::compute_content_hash(&content);
+                        let needs_reindex = tracked_hashes
+                            .get(&file_path)
+                            .map(|stored| stored != &content_hash)
+                            .unwrap_or(true);
+                        if needs_reindex {
+                            PrecheckOutcome::Changed(IncrementalFileWorkItem {
+                                path: file.clone(),
+                                content,
+                                content_hash,
+                            })
+                        } else {
+                            PrecheckOutcome::Unchanged
+                        }
+                    }
+                    Err(e) => PrecheckOutcome::ReadError(file.clone(), e),
+                })
+                .collect()
+        });
+
+        for outcome in precheck_outcomes {
+            match outcome {
+                PrecheckOutcome::Changed(item) => incremental_files_to_index.push(item),
+                PrecheckOutcome::Unchanged => unchanged_files += 1,
+                PrecheckOutcome::ReadError(path, err) => {
+                    read_errors += 1;
+                    eprintln!("Error reading {}: {}", path.display(), err);
                 }
-            }
-            Err(e) => {
-                eprintln!("Error reading {}: {}", file.display(), e);
             }
         }
     }
 
-    let unchanged_files = files.len().saturating_sub(files_to_index.len());
+    let files_to_index_len = if is_cold_run {
+        cold_files_to_index.len()
+    } else {
+        incremental_files_to_index.len()
+    };
+
+    if !is_cold_run {
+        unchanged_files = files
+            .len()
+            .saturating_sub(incremental_files_to_index.len() + read_errors);
+    }
+
     if unchanged_files > 0 {
         println!("Skipping {} unchanged files", unchanged_files);
     }
@@ -751,9 +804,12 @@ pub fn index_directory(
     use indicatif::{ProgressBar, ProgressStyle};
 
     let progress = IndexingProgress::new();
-    progress.start(files_to_index.len());
+    progress.start(files_to_index_len + read_errors);
+    for _ in 0..read_errors {
+        progress.inc_error();
+    }
 
-    let pb = ProgressBar::new(files_to_index.len() as u64);
+    let pb = ProgressBar::new(files_to_index_len as u64);
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {elapsed_precise} ETA {eta} | {msg}",
@@ -766,46 +822,60 @@ pub fn index_directory(
     // Parallel parsing and extraction using rayon
     let progress_ref = &progress;
     let pb_ref = &pb;
-    let total_files = files_to_index.len();
+    let total_files = files_to_index_len;
     let files_done = AtomicUsize::new(0);
     let progress_batch_size = 32usize;
     let per_file_delay = std::time::Duration::from_millis(throttle_ms);
-    let parse_cache = ParseCache::new();
-    let parse_cache_ref = &parse_cache;
-    let collect_results = || {
-        files_to_index
-            .par_iter()
-            .map_init(
-                || (CodeParser::global(), SymbolExtractor::new()),
-                |(parser, extractor), file| {
-                    if throttle_ms > 0 {
-                        std::thread::sleep(per_file_delay);
-                    }
+    let results: Vec<(IndexedFileRecord, ExtractionResult)> = if is_cold_run {
+        let collect_results = || {
+            cold_files_to_index
+                .par_iter()
+                .map_init(
+                    || (CodeParser::global(), SymbolExtractor::new()),
+                    |(parser, extractor), file| {
+                        if throttle_ms > 0 {
+                            std::thread::sleep(per_file_delay);
+                        }
 
-                    match parse_cache_ref.parse_file(&file.path, parser) {
-                        Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
-                            Ok(result) => {
-                                let symbol_count = result.symbols.len();
-                                let file_record = IndexedFileRecord {
-                                    path: file.path.to_string_lossy().to_string(),
-                                    language: parsed.language.clone(),
-                                    symbol_count,
-                                    content_hash: file.content_hash.clone(),
-                                };
-                                progress_ref.inc(symbol_count);
-                                let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                                if completed % progress_batch_size == 0 || completed == total_files
-                                {
-                                    pb_ref.set_position(completed as u64);
+                        match parser.parse_file(&file.path) {
+                            Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
+                                Ok(result) => {
+                                    let symbol_count = result.symbols.len();
+                                    let file_record = IndexedFileRecord {
+                                        path: file.path.to_string_lossy().to_string(),
+                                        language: parsed.language.clone(),
+                                        symbol_count,
+                                        content_hash: SqliteIndex::compute_content_hash(
+                                            &parsed.source,
+                                        ),
+                                    };
+                                    progress_ref.inc(symbol_count);
+                                    let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if completed % progress_batch_size == 0
+                                        || completed == total_files
+                                    {
+                                        pb_ref.set_position(completed as u64);
+                                    }
+                                    Some((file_record, result))
                                 }
-                                Some((file_record, result))
-                            }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Error extracting symbols from {}: {}",
+                                        file.path.display(),
+                                        e
+                                    );
+                                    progress_ref.inc_error();
+                                    let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if completed % progress_batch_size == 0
+                                        || completed == total_files
+                                    {
+                                        pb_ref.set_position(completed as u64);
+                                    }
+                                    None
+                                }
+                            },
                             Err(e) => {
-                                eprintln!(
-                                    "Error extracting symbols from {}: {}",
-                                    file.path.display(),
-                                    e
-                                );
+                                eprintln!("Error parsing {}: {}", file.path.display(), e);
                                 progress_ref.inc_error();
                                 let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                                 if completed % progress_batch_size == 0 || completed == total_files
@@ -814,24 +884,81 @@ pub fn index_directory(
                                 }
                                 None
                             }
-                        },
-                        Err(e) => {
-                            eprintln!("Error parsing {}: {}", file.path.display(), e);
-                            parse_cache_ref.invalidate(&file.path);
-                            progress_ref.inc_error();
-                            let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                            if completed % progress_batch_size == 0 || completed == total_files {
-                                pb_ref.set_position(completed as u64);
-                            }
-                            None
                         }
-                    }
-                },
-            )
-            .filter_map(|r| r)
-            .collect::<Vec<(IndexedFileRecord, ExtractionResult)>>()
+                    },
+                )
+                .filter_map(|r| r)
+                .collect::<Vec<(IndexedFileRecord, ExtractionResult)>>()
+        };
+        index_pool.install(collect_results)
+    } else {
+        let parse_cache = ParseCache::new();
+        let parse_cache_ref = &parse_cache;
+        let collect_results = || {
+            incremental_files_to_index
+                .par_iter()
+                .map_init(
+                    || (CodeParser::global(), SymbolExtractor::new()),
+                    |(parser, extractor), file| {
+                        if throttle_ms > 0 {
+                            std::thread::sleep(per_file_delay);
+                        }
+
+                        match parse_cache_ref.parse_source_cached(&file.path, &file.content, parser)
+                        {
+                            Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
+                                Ok(result) => {
+                                    let symbol_count = result.symbols.len();
+                                    let file_record = IndexedFileRecord {
+                                        path: file.path.to_string_lossy().to_string(),
+                                        language: parsed.language.clone(),
+                                        symbol_count,
+                                        content_hash: file.content_hash.clone(),
+                                    };
+                                    progress_ref.inc(symbol_count);
+                                    let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if completed % progress_batch_size == 0
+                                        || completed == total_files
+                                    {
+                                        pb_ref.set_position(completed as u64);
+                                    }
+                                    Some((file_record, result))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Error extracting symbols from {}: {}",
+                                        file.path.display(),
+                                        e
+                                    );
+                                    progress_ref.inc_error();
+                                    let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if completed % progress_batch_size == 0
+                                        || completed == total_files
+                                    {
+                                        pb_ref.set_position(completed as u64);
+                                    }
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Error parsing {}: {}", file.path.display(), e);
+                                parse_cache_ref.invalidate(&file.path);
+                                progress_ref.inc_error();
+                                let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if completed % progress_batch_size == 0 || completed == total_files
+                                {
+                                    pb_ref.set_position(completed as u64);
+                                }
+                                None
+                            }
+                        }
+                    },
+                )
+                .filter_map(|r| r)
+                .collect::<Vec<(IndexedFileRecord, ExtractionResult)>>()
+        };
+        index_pool.install(collect_results)
     };
-    let results: Vec<(IndexedFileRecord, ExtractionResult)> = index_pool.install(collect_results);
 
     let mut file_records = Vec::with_capacity(results.len());
     let mut extraction_results = Vec::with_capacity(results.len());
@@ -845,12 +972,19 @@ pub fn index_directory(
     update_exported_hashes(&extraction_results, &sidecar_meta, &index)?;
 
     // Remove stale rows for changed files before batch insert.
-    let changed_paths: Vec<&str> = file_records.iter().map(|r| r.path.as_str()).collect();
-    index.remove_files_batch(&changed_paths)?;
+    if !is_cold_run {
+        let changed_paths: Vec<&str> = file_records.iter().map(|r| r.path.as_str()).collect();
+        if !changed_paths.is_empty() {
+            index.remove_files_batch(&changed_paths)?;
+        }
+    }
 
     // Batch insert all changed results.
-    let total_symbols =
-        index.add_extraction_results_batch_with_durability(extraction_results, use_fast_bulk)?;
+    let total_symbols = index.add_extraction_results_batch_with_mode(
+        extraction_results,
+        use_fast_bulk,
+        is_cold_run,
+    )?;
     index.upsert_file_records_batch(&file_records)?;
 
     pb.finish_with_message(format!(

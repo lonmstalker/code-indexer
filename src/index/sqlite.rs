@@ -1,6 +1,6 @@
 use r2d2::{CustomizeConnection, Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use crate::dependencies::{Dependency, Ecosystem, ProjectInfo, SymbolSource};
@@ -1116,7 +1116,7 @@ impl SqliteIndex {
     /// Batch insert all extraction results (symbols, references, imports) in a single transaction.
     /// Returns the total number of symbols inserted.
     pub fn add_extraction_results_batch(&self, results: Vec<ExtractionResult>) -> Result<usize> {
-        self.add_extraction_results_batch_with_durability(results, false)
+        self.add_extraction_results_batch_with_mode(results, false, false)
     }
 
     /// Batch insert all extraction results with optional fast durability mode for bulk indexing.
@@ -1126,10 +1126,31 @@ impl SqliteIndex {
         results: Vec<ExtractionResult>,
         fast_mode: bool,
     ) -> Result<usize> {
+        self.add_extraction_results_batch_with_mode(results, fast_mode, false)
+    }
+
+    /// Batch insert all extraction results with optional fast durability mode and cold-run profile.
+    /// When `cold_run` is true together with `fast_mode`, an aggressive one-shot bulk profile is used.
+    pub fn add_extraction_results_batch_with_mode(
+        &self,
+        results: Vec<ExtractionResult>,
+        fast_mode: bool,
+        cold_run: bool,
+    ) -> Result<usize> {
         let mut conn = self.conn()?;
 
         if fast_mode {
-            Self::apply_bulk_fast_pragmas(&conn)?;
+            if cold_run {
+                if let Err(err) = Self::apply_bulk_cold_fast_pragmas(&conn) {
+                    if Self::is_database_lock_error(&err) {
+                        Self::apply_bulk_fast_pragmas(&conn)?;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            } else {
+                Self::apply_bulk_fast_pragmas(&conn)?;
+            }
         }
 
         let operation = (|| -> Result<usize> {
@@ -1241,6 +1262,8 @@ impl SqliteIndex {
     fn apply_default_pragmas(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA locking_mode = NORMAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
             PRAGMA temp_store = MEMORY;
@@ -1259,6 +1282,33 @@ impl SqliteIndex {
             "#,
         )?;
         Ok(())
+    }
+
+    #[inline]
+    fn apply_bulk_cold_fast_pragmas(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = MEMORY;
+            PRAGMA locking_mode = EXCLUSIVE;
+            PRAGMA synchronous = OFF;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -256000;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    #[inline]
+    fn is_database_lock_error(err: &crate::error::IndexerError) -> bool {
+        match err {
+            crate::error::IndexerError::Database(rusqlite::Error::SqliteFailure(code, _)) => {
+                matches!(
+                    code.code,
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                )
+            }
+            _ => false,
+        }
     }
 
     fn symbol_from_row(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
@@ -5353,6 +5403,53 @@ mod tests {
             index.get_file_content_hash("test.rs").unwrap(),
             Some("hash_v2".to_string())
         );
+    }
+
+    #[test]
+    fn test_bulk_cold_fast_pragmas_switch_and_restore_defaults() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("pragmas.db");
+        let conn = Connection::open(&db_path).expect("open sqlite");
+
+        SqliteIndex::apply_bulk_cold_fast_pragmas(&conn).expect("apply fast cold pragmas");
+
+        let fast_journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        let fast_locking: String = conn
+            .query_row("PRAGMA locking_mode", [], |row| row.get(0))
+            .expect("locking mode");
+        let fast_sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous");
+        let fast_cache_size: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("cache_size");
+
+        assert_eq!(fast_journal.to_lowercase(), "memory");
+        assert_eq!(fast_locking.to_lowercase(), "exclusive");
+        assert_eq!(fast_sync, 0);
+        assert_eq!(fast_cache_size, -256000);
+
+        SqliteIndex::apply_default_pragmas(&conn).expect("restore defaults");
+
+        let default_journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        let default_locking: String = conn
+            .query_row("PRAGMA locking_mode", [], |row| row.get(0))
+            .expect("locking mode");
+        let default_sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous");
+        let default_cache_size: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("cache_size");
+
+        assert_eq!(default_journal.to_lowercase(), "wal");
+        assert_eq!(default_locking.to_lowercase(), "normal");
+        assert_eq!(default_sync, 1);
+        assert_eq!(default_cache_size, -64000);
     }
 
     #[test]
