@@ -652,6 +652,7 @@ pub fn index_directory(
     #[derive(Clone)]
     struct FileWorkItem {
         path: PathBuf,
+        content: String,
         content_hash: String,
     }
 
@@ -662,8 +663,7 @@ pub fn index_directory(
         db_path.to_path_buf()
     };
 
-    let registry = LanguageRegistry::new();
-    let walker = FileWalker::new(registry);
+    let walker = FileWalker::global();
     let index = SqliteIndex::new(&effective_db)?;
     let use_fast_bulk = durability == IndexDurability::Fast && !watch;
     let available_parallelism = detect_available_parallelism();
@@ -718,15 +718,21 @@ pub fn index_directory(
     // === Phase 1: Process sidecar files ===
     let sidecar_meta = process_sidecar_files(&files, path, &index)?;
 
+    let tracked_hashes = index.get_tracked_file_hashes()?;
     let mut files_to_index = Vec::new();
     for file in &files {
         match fs::read_to_string(file) {
             Ok(content) => {
                 let file_path = file.to_string_lossy().to_string();
                 let content_hash = SqliteIndex::compute_content_hash(&content);
-                if index.file_needs_reindex(&file_path, &content_hash)? {
+                let needs_reindex = tracked_hashes
+                    .get(&file_path)
+                    .map(|stored| stored != &content_hash)
+                    .unwrap_or(true);
+                if needs_reindex {
                     files_to_index.push(FileWorkItem {
                         path: file.clone(),
+                        content,
                         content_hash,
                     });
                 }
@@ -766,22 +772,19 @@ pub fn index_directory(
     let files_done = AtomicUsize::new(0);
     let progress_batch_size = 32usize;
     let per_file_delay = std::time::Duration::from_millis(throttle_ms);
+    let parse_cache = ParseCache::new();
+    let parse_cache_ref = &parse_cache;
     let collect_results = || {
         files_to_index
             .par_iter()
             .map_init(
-                || {
-                    (
-                        CodeParser::new(LanguageRegistry::new()),
-                        SymbolExtractor::new(),
-                    )
-                },
+                || (CodeParser::global(), SymbolExtractor::new()),
                 |(parser, extractor), file| {
                     if throttle_ms > 0 {
                         std::thread::sleep(per_file_delay);
                     }
 
-                    match parser.parse_file(&file.path) {
+                    match parse_cache_ref.parse_source_cached(&file.path, &file.content, parser) {
                         Ok(parsed) => match extractor.extract_all(&parsed, &file.path) {
                             Ok(result) => {
                                 let symbol_count = result.symbols.len();
@@ -816,6 +819,7 @@ pub fn index_directory(
                         },
                         Err(e) => {
                             eprintln!("Error parsing {}: {}", file.path.display(), e);
+                            parse_cache_ref.invalidate(&file.path);
                             progress_ref.inc_error();
                             let completed = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                             if completed % progress_batch_size == 0 || completed == total_files {
@@ -868,8 +872,8 @@ pub fn index_directory(
     if watch {
         println!("Watching for changes...");
         let watcher = FileWatcher::new(path)?;
-        let walker = FileWalker::new(LanguageRegistry::new());
-        let parser = CodeParser::new(LanguageRegistry::new());
+        let walker = FileWalker::global();
+        let parser = CodeParser::global();
         let parse_cache = ParseCache::new();
         let extractor = SymbolExtractor::new();
 
@@ -2306,13 +2310,13 @@ fn process_sidecar_files(
     root: &Path,
     index: &SqliteIndex,
 ) -> Result<HashMap<String, String>> {
-    use std::collections::HashSet;
-
-    // Collect unique directories
-    let mut directories: HashSet<PathBuf> = HashSet::new();
+    let mut files_by_dir: HashMap<PathBuf, Vec<&PathBuf>> = HashMap::new();
     for file in files {
         if let Some(parent) = file.parent() {
-            directories.insert(parent.to_path_buf());
+            files_by_dir
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(file);
         }
     }
 
@@ -2323,7 +2327,7 @@ fn process_sidecar_files(
     let mut sidecar_count = 0;
 
     // Process each directory's sidecar
-    for dir in directories {
+    for (dir, dir_files) in files_by_dir {
         let sidecar_path = dir.join(SIDECAR_FILENAME);
         if !sidecar_path.exists() {
             continue;
@@ -2347,13 +2351,11 @@ fn process_sidecar_files(
 
         sidecar_count += 1;
         let dir_str = dir.to_string_lossy();
+        let mut meta_batch = Vec::new();
+        let mut tag_batch: Vec<(String, Vec<crate::index::FileTag>)> = Vec::new();
 
         // Process files in this directory that are listed in the sidecar
-        for file in files {
-            if file.parent() != Some(dir.as_path()) {
-                continue;
-            }
-
+        for file in dir_files {
             let file_path_str = file.to_string_lossy().to_string();
 
             // Make relative path for sidecar lookup
@@ -2365,14 +2367,8 @@ fn process_sidecar_files(
 
             // Extract file metadata from sidecar
             if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
-                if let Err(e) = index.upsert_file_meta(&meta) {
-                    eprintln!(
-                        "Warning: Could not save metadata for {}: {}",
-                        file_path_str, e
-                    );
-                } else {
-                    files_with_meta.insert(file_path_str.clone(), relative_path.clone());
-                }
+                files_with_meta.insert(file_path_str.clone(), relative_path.clone());
+                meta_batch.push(meta);
             }
 
             // Extract and save file tags
@@ -2380,10 +2376,19 @@ fn process_sidecar_files(
             if !tag_strings.is_empty() {
                 let file_tags = resolve_tags(&file_path_str, &tag_strings, &tag_dict);
                 if !file_tags.is_empty() {
-                    if let Err(e) = index.add_file_tags(&file_path_str, &file_tags) {
-                        eprintln!("Warning: Could not save tags for {}: {}", file_path_str, e);
-                    }
+                    tag_batch.push((file_path_str, file_tags));
                 }
+            }
+        }
+
+        if !meta_batch.is_empty() {
+            if let Err(e) = index.upsert_file_meta_batch(&meta_batch) {
+                eprintln!("Warning: Could not save sidecar metadata batch: {}", e);
+            }
+        }
+        if !tag_batch.is_empty() {
+            if let Err(e) = index.add_file_tags_batch(&tag_batch) {
+                eprintln!("Warning: Could not save sidecar tags batch: {}", e);
             }
         }
     }
@@ -2445,6 +2450,8 @@ fn handle_sidecar_change(
     };
 
     let mut updated_count = 0;
+    let mut meta_batch = Vec::new();
+    let mut tag_batch: Vec<(String, Vec<crate::index::FileTag>)> = Vec::new();
 
     for file in files {
         let file_path_str = file.to_string_lossy().to_string();
@@ -2456,9 +2463,8 @@ fn handle_sidecar_change(
 
         // Update file metadata
         if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
-            if index.upsert_file_meta(&meta).is_ok() {
-                updated_count += 1;
-            }
+            updated_count += 1;
+            meta_batch.push(meta);
         }
 
         // Update file tags
@@ -2466,9 +2472,16 @@ fn handle_sidecar_change(
         if !tag_strings.is_empty() {
             let file_tags = resolve_tags(&file_path_str, &tag_strings, &tag_dict);
             if !file_tags.is_empty() {
-                let _ = index.add_file_tags(&file_path_str, &file_tags);
+                tag_batch.push((file_path_str, file_tags));
             }
         }
+    }
+
+    if !meta_batch.is_empty() {
+        let _ = index.upsert_file_meta_batch(&meta_batch);
+    }
+    if !tag_batch.is_empty() {
+        let _ = index.add_file_tags_batch(&tag_batch);
     }
 
     println!("Updated metadata for {} files", updated_count);
@@ -2522,6 +2535,7 @@ fn update_exported_hashes(
     files_with_meta: &HashMap<String, String>,
     index: &SqliteIndex,
 ) -> Result<()> {
+    let mut exported_by_file: HashMap<String, String> = HashMap::new();
     for result in results {
         // Get file_path from first symbol's location
         let file_path = match result.symbols.first() {
@@ -2531,25 +2545,32 @@ fn update_exported_hashes(
 
         // Compute exported hash from public symbols
         let exported_hash = compute_exported_hash(&result.symbols);
+        exported_by_file.insert(file_path, exported_hash);
+    }
 
-        // Get existing file_meta or create new one
-        let mut meta = index
-            .get_file_meta(&file_path)?
+    if exported_by_file.is_empty() {
+        return Ok(());
+    }
+
+    let file_paths: Vec<String> = exported_by_file.keys().cloned().collect();
+    let mut existing = index.get_file_meta_many(&file_paths)?;
+    let mut updates = Vec::with_capacity(file_paths.len());
+
+    for file_path in file_paths {
+        let mut meta = existing
+            .remove(&file_path)
             .unwrap_or_else(|| FileMeta::new(&file_path));
-
-        // Update exported_hash
-        meta.exported_hash = Some(exported_hash);
+        meta.exported_hash = exported_by_file.get(&file_path).cloned();
 
         // If this file wasn't in a sidecar, mark as inferred
         if !files_with_meta.contains_key(&file_path) {
             meta.source = MetaSource::Inferred;
             meta.confidence = 0.5;
         }
-
-        // Save updated metadata
-        index.upsert_file_meta(&meta)?;
+        updates.push(meta);
     }
 
+    index.upsert_file_meta_batch(&updates)?;
     Ok(())
 }
 

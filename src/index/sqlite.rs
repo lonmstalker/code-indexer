@@ -72,6 +72,8 @@ pub struct IndexedFileRecord {
 impl SqliteIndex {
     /// Default pool size for concurrent connections.
     const DEFAULT_POOL_SIZE: u32 = 4;
+    /// Conservative upper-bound for SQLite bind variables in dynamic IN clauses.
+    const MAX_SQL_VARIABLES: usize = 900;
 
     /// Standard symbol columns for SELECT queries (16 columns).
     /// Order: id(0), name(1), kind(2), file_path(3), start_line(4), start_column(5),
@@ -340,6 +342,21 @@ impl SqliteIndex {
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(files)
+    }
+
+    /// Gets tracked file content hashes keyed by file path.
+    pub fn get_tracked_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT path, content_hash FROM files WHERE content_hash IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let path: String = row.get(0)?;
+                let content_hash: String = row.get(1)?;
+                Ok((path, content_hash))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().collect())
     }
 
     // === Project and Dependency Methods ===
@@ -3008,32 +3025,31 @@ impl SqliteIndex {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
-        // 1. Collect all symbol IDs for all files
-        let file_placeholders = Self::generate_placeholders(file_paths.len());
-        let file_params: Vec<&dyn rusqlite::ToSql> = file_paths
-            .iter()
-            .map(|p| p as &dyn rusqlite::ToSql)
-            .collect();
-
-        let symbol_ids: Vec<String> = {
+        // 1. Collect all symbol IDs for all files (chunked to avoid SQLite bind limits)
+        let mut symbol_ids: Vec<String> = Vec::new();
+        for file_chunk in file_paths.chunks(Self::MAX_SQL_VARIABLES) {
+            let file_placeholders = Self::generate_placeholders(file_chunk.len());
+            let file_params: Vec<&dyn rusqlite::ToSql> = file_chunk
+                .iter()
+                .map(|p| p as &dyn rusqlite::ToSql)
+                .collect();
             let mut stmt = tx.prepare(&format!(
                 "SELECT id FROM symbols WHERE file_path IN ({})",
                 file_placeholders
             ))?;
-            let ids = stmt
-                .query_map(
+            symbol_ids.extend(
+                stmt.query_map(
                     rusqlite::params_from_iter(file_params.iter().copied()),
                     |row| row.get(0),
                 )?
-                .filter_map(|r| r.ok())
-                .collect();
-            ids
-        };
+                .filter_map(|r| r.ok()),
+            );
+        }
 
-        // 2. Delete data referencing these symbols (batch with IN clause)
-        if !symbol_ids.is_empty() {
-            let placeholders = Self::generate_placeholders(symbol_ids.len());
-            let params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+        // 2. Delete data referencing these symbols (chunked)
+        for symbol_chunk in symbol_ids.chunks(Self::MAX_SQL_VARIABLES) {
+            let placeholders = Self::generate_placeholders(symbol_chunk.len());
+            let params: Vec<&dyn rusqlite::ToSql> = symbol_chunk
                 .iter()
                 .map(|id| id as &dyn rusqlite::ToSql)
                 .collect();
@@ -3053,68 +3069,70 @@ impl SqliteIndex {
                 params.as_slice(),
             )?;
 
-            let double_params: Vec<&dyn rusqlite::ToSql> = symbol_ids
+            let double_params: Vec<&dyn rusqlite::ToSql> = symbol_chunk
                 .iter()
-                .chain(symbol_ids.iter())
+                .chain(symbol_chunk.iter())
                 .map(|id| id as &dyn rusqlite::ToSql)
                 .collect();
-            let double_placeholders = Self::generate_placeholders(symbol_ids.len());
             tx.execute(
                 &format!(
                     "DELETE FROM call_edges WHERE caller_symbol_id IN ({}) OR callee_symbol_id IN ({})",
-                    double_placeholders, double_placeholders
+                    placeholders, placeholders
                 ),
                 double_params.as_slice(),
             )?;
         }
 
-        // 3. Delete data referencing these file paths (batch)
-        let file_params: Vec<&dyn rusqlite::ToSql> = file_paths
-            .iter()
-            .map(|p| p as &dyn rusqlite::ToSql)
-            .collect();
+        // 3. Delete data referencing these file paths (chunked)
+        for file_chunk in file_paths.chunks(Self::MAX_SQL_VARIABLES) {
+            let file_placeholders = Self::generate_placeholders(file_chunk.len());
+            let file_params: Vec<&dyn rusqlite::ToSql> = file_chunk
+                .iter()
+                .map(|p| p as &dyn rusqlite::ToSql)
+                .collect();
 
-        tx.execute(
-            &format!(
-                "DELETE FROM symbol_references WHERE referenced_in_file IN ({})",
-                file_placeholders
-            ),
-            file_params.as_slice(),
-        )?;
-        tx.execute(
-            &format!(
-                "DELETE FROM file_imports WHERE file_path IN ({})",
-                file_placeholders
-            ),
-            file_params.as_slice(),
-        )?;
-        tx.execute(
-            &format!(
-                "DELETE FROM scopes WHERE file_path IN ({})",
-                file_placeholders
-            ),
-            file_params.as_slice(),
-        )?;
-        tx.execute(
-            &format!(
-                "DELETE FROM call_edges WHERE file_path IN ({})",
-                file_placeholders
-            ),
-            file_params.as_slice(),
-        )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM symbol_references WHERE referenced_in_file IN ({})",
+                    file_placeholders
+                ),
+                file_params.as_slice(),
+            )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM file_imports WHERE file_path IN ({})",
+                    file_placeholders
+                ),
+                file_params.as_slice(),
+            )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM scopes WHERE file_path IN ({})",
+                    file_placeholders
+                ),
+                file_params.as_slice(),
+            )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM call_edges WHERE file_path IN ({})",
+                    file_placeholders
+                ),
+                file_params.as_slice(),
+            )?;
 
-        // 4. Delete symbols and file entries
-        tx.execute(
-            &format!(
-                "DELETE FROM symbols WHERE file_path IN ({})",
-                file_placeholders
-            ),
-            file_params.as_slice(),
-        )?;
-        tx.execute(
-            &format!("DELETE FROM files WHERE path IN ({})", file_placeholders),
-            file_params.as_slice(),
-        )?;
+            // 4. Delete symbols and file entries
+            tx.execute(
+                &format!(
+                    "DELETE FROM symbols WHERE file_path IN ({})",
+                    file_placeholders
+                ),
+                file_params.as_slice(),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM files WHERE path IN ({})", file_placeholders),
+                file_params.as_slice(),
+            )?;
+        }
 
         // 5. Increment db revision (only once for the batch)
         tx.execute(
@@ -3850,22 +3868,76 @@ impl SqliteIndex {
 
     // === File Tags and Intent Layer Methods ===
 
+    fn file_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::index::FileMeta> {
+        let file_path: String = row.get(0)?;
+        let doc1: Option<String> = row.get(1)?;
+        let purpose: Option<String> = row.get(2)?;
+        let capabilities_json: String = row.get(3)?;
+        let invariants_json: String = row.get(4)?;
+        let non_goals_json: String = row.get(5)?;
+        let security_notes: Option<String> = row.get(6)?;
+        let owner: Option<String> = row.get(7)?;
+        let stability_str: Option<String> = row.get(8)?;
+        let exported_hash: Option<String> = row.get(9)?;
+        let last_extracted: i64 = row.get(10)?;
+        let source_str: String = row.get(11)?;
+        let confidence: f64 = row.get(12)?;
+
+        let capabilities: Vec<String> =
+            serde_json::from_str(&capabilities_json).unwrap_or_default();
+        let invariants: Vec<String> = serde_json::from_str(&invariants_json).unwrap_or_default();
+        let non_goals: Vec<String> = serde_json::from_str(&non_goals_json).unwrap_or_default();
+
+        let stability = stability_str.and_then(|s| crate::index::Stability::from_str(&s));
+        let source = crate::index::MetaSource::from_str(&source_str)
+            .unwrap_or(crate::index::MetaSource::Inferred);
+
+        Ok(crate::index::FileMeta {
+            file_path,
+            doc1,
+            purpose,
+            capabilities,
+            invariants,
+            non_goals,
+            security_notes,
+            owner,
+            stability,
+            exported_hash,
+            last_extracted,
+            source,
+            confidence,
+            is_stale: false,
+        })
+    }
+
     /// Upserts file metadata (Intent Layer)
     pub fn upsert_file_meta(&self, meta: &crate::index::FileMeta) -> Result<()> {
-        let conn = self.conn()?;
+        self.upsert_file_meta_batch(std::slice::from_ref(meta))
+    }
 
-        let capabilities_json = serde_json::to_string(&meta.capabilities).unwrap_or_default();
-        let invariants_json = serde_json::to_string(&meta.invariants).unwrap_or_default();
-        let non_goals_json = serde_json::to_string(&meta.non_goals).unwrap_or_default();
+    /// Upserts multiple file metadata records in one transaction.
+    pub fn upsert_file_meta_batch(&self, metas: &[crate::index::FileMeta]) -> Result<()> {
+        if metas.is_empty() {
+            return Ok(());
+        }
 
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare_cached(
             r#"
             INSERT OR REPLACE INTO file_meta
             (file_path, doc1, purpose, capabilities, invariants, non_goals,
              security_notes, owner, stability, exported_hash, last_extracted, source, confidence)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
-            params![
+        )?;
+
+        for meta in metas {
+            let capabilities_json = serde_json::to_string(&meta.capabilities).unwrap_or_default();
+            let invariants_json = serde_json::to_string(&meta.invariants).unwrap_or_default();
+            let non_goals_json = serde_json::to_string(&meta.non_goals).unwrap_or_default();
+
+            stmt.execute(params![
                 meta.file_path,
                 meta.doc1,
                 meta.purpose,
@@ -3879,8 +3951,11 @@ impl SqliteIndex {
                 meta.last_extracted,
                 meta.source.as_str(),
                 meta.confidence,
-            ],
-        )?;
+            ])?;
+        }
+
+        drop(stmt);
+        tx.commit()?;
         Ok(())
     }
 
@@ -3888,57 +3963,56 @@ impl SqliteIndex {
     pub fn get_file_meta(&self, file_path: &str) -> Result<Option<crate::index::FileMeta>> {
         let conn = self.conn()?;
 
-        let result = conn.query_row(
-            r#"
+        let result = conn
+            .query_row(
+                r#"
             SELECT file_path, doc1, purpose, capabilities, invariants, non_goals,
                    security_notes, owner, stability, exported_hash, last_extracted, source, confidence
             FROM file_meta WHERE file_path = ?1
             "#,
-            params![file_path],
-            |row| {
-                let file_path: String = row.get(0)?;
-                let doc1: Option<String> = row.get(1)?;
-                let purpose: Option<String> = row.get(2)?;
-                let capabilities_json: String = row.get(3)?;
-                let invariants_json: String = row.get(4)?;
-                let non_goals_json: String = row.get(5)?;
-                let security_notes: Option<String> = row.get(6)?;
-                let owner: Option<String> = row.get(7)?;
-                let stability_str: Option<String> = row.get(8)?;
-                let exported_hash: Option<String> = row.get(9)?;
-                let last_extracted: i64 = row.get(10)?;
-                let source_str: String = row.get(11)?;
-                let confidence: f64 = row.get(12)?;
+                params![file_path],
+                Self::file_meta_from_row,
+            )
+            .optional()?;
 
-                let capabilities: Vec<String> =
-                    serde_json::from_str(&capabilities_json).unwrap_or_default();
-                let invariants: Vec<String> =
-                    serde_json::from_str(&invariants_json).unwrap_or_default();
-                let non_goals: Vec<String> =
-                    serde_json::from_str(&non_goals_json).unwrap_or_default();
+        Ok(result)
+    }
 
-                let stability = stability_str.and_then(|s| crate::index::Stability::from_str(&s));
-                let source = crate::index::MetaSource::from_str(&source_str)
-                    .unwrap_or(crate::index::MetaSource::Inferred);
+    /// Gets file metadata for multiple files in one query.
+    pub fn get_file_meta_many(
+        &self,
+        file_paths: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::index::FileMeta>> {
+        let mut result = std::collections::HashMap::new();
+        if file_paths.is_empty() {
+            return Ok(result);
+        }
 
-                Ok(crate::index::FileMeta {
-                    file_path,
-                    doc1,
-                    purpose,
-                    capabilities,
-                    invariants,
-                    non_goals,
-                    security_notes,
-                    owner,
-                    stability,
-                    exported_hash,
-                    last_extracted,
-                    source,
-                    confidence,
-                    is_stale: false,
-                })
-            },
-        ).optional()?;
+        let conn = self.conn()?;
+        for chunk in file_paths.chunks(Self::MAX_SQL_VARIABLES) {
+            let placeholders = Self::generate_placeholders(chunk.len());
+            let sql = format!(
+                r#"
+                SELECT file_path, doc1, purpose, capabilities, invariants, non_goals,
+                       security_notes, owner, stability, exported_hash, last_extracted, source, confidence
+                FROM file_meta
+                WHERE file_path IN ({})
+                "#,
+                placeholders
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let metas = stmt
+                .query_map(
+                    rusqlite::params_from_iter(params.iter().copied()),
+                    Self::file_meta_from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for meta in metas {
+                result.insert(meta.file_path.clone(), meta);
+            }
+        }
 
         Ok(result)
     }
@@ -4067,25 +4141,40 @@ impl SqliteIndex {
 
     /// Adds tags to a file
     pub fn add_file_tags(&self, file_path: &str, tags: &[crate::index::FileTag]) -> Result<()> {
+        self.add_file_tags_batch(&[(file_path.to_string(), tags.to_vec())])
+    }
+
+    /// Adds tags for multiple files in one transaction.
+    pub fn add_file_tags_batch(
+        &self,
+        entries: &[(String, Vec<crate::index::FileTag>)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        let mut stmt = tx.prepare_cached(
+            r#"
+            INSERT OR REPLACE INTO file_tags (file_path, tag_id, source, confidence, reason)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )?;
 
-        for tag in tags {
-            tx.execute(
-                r#"
-                INSERT OR REPLACE INTO file_tags (file_path, tag_id, source, confidence, reason)
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                "#,
-                params![
+        for (file_path, tags) in entries {
+            for tag in tags {
+                stmt.execute(params![
                     file_path,
                     tag.tag_id,
                     tag.source.as_str(),
                     tag.confidence,
                     tag.reason
-                ],
-            )?;
+                ])?;
+            }
         }
 
+        drop(stmt);
         tx.commit()?;
         Ok(())
     }
@@ -4201,13 +4290,83 @@ impl SqliteIndex {
         &self,
         file_path: &str,
     ) -> Result<Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>> {
-        let meta = self.get_file_meta(file_path)?;
-        if let Some(m) = meta {
-            let tags = self.get_file_tags(file_path)?;
-            Ok(Some((m, tags)))
-        } else {
-            Ok(None)
+        let mut by_file = self.get_file_meta_with_tags_many(&[file_path.to_string()])?;
+        Ok(by_file.remove(file_path))
+    }
+
+    /// Gets metadata with tags for multiple files in batch.
+    pub fn get_file_meta_with_tags_many(
+        &self,
+        file_paths: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, (crate::index::FileMeta, Vec<crate::index::FileTag>)>,
+    > {
+        let metas = self.get_file_meta_many(file_paths)?;
+        if metas.is_empty() {
+            return Ok(std::collections::HashMap::new());
         }
+
+        let conn = self.conn()?;
+        let mut tags_by_file: std::collections::HashMap<String, Vec<crate::index::FileTag>> =
+            std::collections::HashMap::new();
+
+        for chunk in file_paths.chunks(Self::MAX_SQL_VARIABLES) {
+            let placeholders = Self::generate_placeholders(chunk.len());
+            let sql = format!(
+                r#"
+                SELECT ft.file_path, ft.id, ft.tag_id, td.canonical_name, td.category,
+                       ft.source, ft.confidence, ft.reason
+                FROM file_tags ft
+                JOIN tag_dictionary td ON ft.tag_id = td.id
+                WHERE ft.file_path IN ({})
+                ORDER BY ft.file_path, td.category, td.canonical_name
+                "#,
+                placeholders
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let tags = stmt
+                .query_map(rusqlite::params_from_iter(params.iter().copied()), |row| {
+                    let file_path: String = row.get(0)?;
+                    let id: i64 = row.get(1)?;
+                    let tag_id: i64 = row.get(2)?;
+                    let tag_name: String = row.get(3)?;
+                    let tag_category: String = row.get(4)?;
+                    let source_str: String = row.get(5)?;
+                    let confidence: f64 = row.get(6)?;
+                    let reason: Option<String> = row.get(7)?;
+                    let source = crate::index::MetaSource::from_str(&source_str)
+                        .unwrap_or(crate::index::MetaSource::Inferred);
+
+                    Ok((
+                        file_path.clone(),
+                        crate::index::FileTag {
+                            id: Some(id),
+                            file_path,
+                            tag_id,
+                            tag_name: Some(tag_name),
+                            tag_category: Some(tag_category),
+                            source,
+                            confidence,
+                            reason,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            for (file_path, tag) in tags {
+                tags_by_file.entry(file_path).or_default().push(tag);
+            }
+        }
+
+        let mut result = std::collections::HashMap::new();
+        for (file_path, meta) in metas {
+            let tags = tags_by_file.remove(&file_path).unwrap_or_default();
+            result.insert(file_path, (meta, tags));
+        }
+
+        Ok(result)
     }
 
     /// Searches file metadata using FTS on doc1/purpose
@@ -4232,49 +4391,7 @@ impl SqliteIndex {
         )?;
 
         let results = stmt
-            .query_map(params![fts_query, limit as i64], |row| {
-                let file_path: String = row.get(0)?;
-                let doc1: Option<String> = row.get(1)?;
-                let purpose: Option<String> = row.get(2)?;
-                let capabilities_json: String = row.get(3)?;
-                let invariants_json: String = row.get(4)?;
-                let non_goals_json: String = row.get(5)?;
-                let security_notes: Option<String> = row.get(6)?;
-                let owner: Option<String> = row.get(7)?;
-                let stability_str: Option<String> = row.get(8)?;
-                let exported_hash: Option<String> = row.get(9)?;
-                let last_extracted: i64 = row.get(10)?;
-                let source_str: String = row.get(11)?;
-                let confidence: f64 = row.get(12)?;
-
-                let capabilities: Vec<String> =
-                    serde_json::from_str(&capabilities_json).unwrap_or_default();
-                let invariants: Vec<String> =
-                    serde_json::from_str(&invariants_json).unwrap_or_default();
-                let non_goals: Vec<String> =
-                    serde_json::from_str(&non_goals_json).unwrap_or_default();
-
-                let stability = stability_str.and_then(|s| crate::index::Stability::from_str(&s));
-                let source = crate::index::MetaSource::from_str(&source_str)
-                    .unwrap_or(crate::index::MetaSource::Inferred);
-
-                Ok(crate::index::FileMeta {
-                    file_path,
-                    doc1,
-                    purpose,
-                    capabilities,
-                    invariants,
-                    non_goals,
-                    security_notes,
-                    owner,
-                    stability,
-                    exported_hash,
-                    last_extracted,
-                    source,
-                    confidence,
-                    is_stale: false,
-                })
-            })?
+            .query_map(params![fts_query, limit as i64], Self::file_meta_from_row)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -5279,6 +5396,40 @@ mod tests {
     }
 
     #[test]
+    fn test_upsert_and_get_file_meta_many() {
+        use crate::index::{FileMeta, MetaSource};
+
+        let index = SqliteIndex::in_memory().unwrap();
+        let metas = vec![
+            FileMeta::new("src/a.rs")
+                .with_doc1("A")
+                .with_source(MetaSource::Sidecar),
+            FileMeta::new("src/b.rs")
+                .with_doc1("B")
+                .with_source(MetaSource::Inferred),
+        ];
+
+        index.upsert_file_meta_batch(&metas).unwrap();
+
+        let requested = vec![
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+            "src/missing.rs".to_string(),
+        ];
+        let by_file = index.get_file_meta_many(&requested).unwrap();
+
+        assert_eq!(by_file.len(), 2);
+        assert_eq!(
+            by_file.get("src/a.rs").and_then(|m| m.doc1.clone()),
+            Some("A".to_string())
+        );
+        assert_eq!(
+            by_file.get("src/b.rs").map(|m| m.source),
+            Some(MetaSource::Inferred)
+        );
+    }
+
+    #[test]
     fn test_delete_file_meta() {
         use crate::index::FileMeta;
 
@@ -5439,6 +5590,63 @@ mod tests {
     }
 
     #[test]
+    fn test_get_file_meta_with_tags_many() {
+        use crate::index::{FileMeta, FileTag, MetaSource};
+
+        let index = SqliteIndex::in_memory().unwrap();
+        let auth_tag = index.get_tag_by_name("auth").unwrap().unwrap();
+        let service_tag = index.get_tag_by_name("service").unwrap().unwrap();
+
+        index
+            .upsert_file_meta_batch(&[
+                FileMeta::new("src/auth.rs")
+                    .with_doc1("Auth")
+                    .with_source(MetaSource::Sidecar),
+                FileMeta::new("src/service.rs")
+                    .with_doc1("Service")
+                    .with_source(MetaSource::Sidecar),
+            ])
+            .unwrap();
+
+        let tag_entries = vec![
+            (
+                "src/auth.rs".to_string(),
+                vec![FileTag::new("src/auth.rs", auth_tag.id).with_source(MetaSource::Sidecar)],
+            ),
+            (
+                "src/service.rs".to_string(),
+                vec![
+                    FileTag::new("src/service.rs", service_tag.id).with_source(MetaSource::Sidecar)
+                ],
+            ),
+        ];
+        index.add_file_tags_batch(&tag_entries).unwrap();
+
+        let requested = vec![
+            "src/auth.rs".to_string(),
+            "src/service.rs".to_string(),
+            "src/missing.rs".to_string(),
+        ];
+        let combined = index.get_file_meta_with_tags_many(&requested).unwrap();
+
+        assert_eq!(combined.len(), 2);
+        assert_eq!(
+            combined
+                .get("src/auth.rs")
+                .and_then(|(_, tags)| tags.first())
+                .and_then(|t| t.tag_name.clone()),
+            Some("auth".to_string())
+        );
+        assert_eq!(
+            combined
+                .get("src/service.rs")
+                .and_then(|(_, tags)| tags.first())
+                .and_then(|t| t.tag_name.clone()),
+            Some("service".to_string())
+        );
+    }
+
+    #[test]
     fn test_search_file_meta_fts() {
         use crate::index::FileMeta;
 
@@ -5572,6 +5780,34 @@ mod tests {
         let results = index.search("func4", &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].symbol.name, "func4");
+    }
+
+    #[test]
+    fn test_remove_files_batch_large_input_chunked() {
+        let index = SqliteIndex::in_memory().unwrap();
+        let total_files = SqliteIndex::MAX_SQL_VARIABLES + 37;
+
+        let mut symbols = Vec::with_capacity(total_files);
+        let mut file_paths = Vec::with_capacity(total_files);
+        for i in 0..total_files {
+            let file_path = format!("batch_{}.rs", i);
+            file_paths.push(file_path.clone());
+            symbols.push(create_test_symbol(
+                &format!("func_{}", i),
+                SymbolKind::Function,
+                &file_path,
+                "rust",
+            ));
+        }
+        index.add_symbols(symbols).unwrap();
+        let before = index.get_stats().unwrap();
+        assert_eq!(before.total_symbols, total_files);
+
+        let refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
+        index.remove_files_batch(&refs).unwrap();
+
+        let after = index.get_stats().unwrap();
+        assert_eq!(after.total_symbols, 0);
     }
 
     #[test]

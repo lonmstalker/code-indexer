@@ -13,6 +13,7 @@ description: "SQLite схема индекса, FTS и параметры хра
 - `call_edges` — ребра графа вызовов с `CallConfidence`.
 - `scopes` — дерево scopes для scope-aware анализа.
 - `files` — метаданные файлов, hash и counts.
+- `file_meta`, `file_tags`, `tag_dictionary` — Intent Layer (doc1/purpose/capabilities + теги).
 - `projects` и `dependencies` — metadata по deps.
 
 ## Поиск
@@ -25,6 +26,10 @@ PRAGMA настройки:
 - `synchronous = NORMAL`
 - `cache_size = -64000`
 - `temp_store = MEMORY`
+
+Batch/scale-path:
+- `remove_files_batch` удаляет данные chunked по IN-clause (лимит bind-переменных SQLite).
+- Для Intent Layer есть batch API: `upsert_file_meta_batch`, `get_file_meta_many`, `get_file_meta_with_tags_many`, `add_file_tags_batch`.
 
 ## Связанные материалы
 [.memory-bank/guides/data-store.md](../guides/data-store.md): эксплуатация БД и команды обслуживания.

@@ -5,7 +5,7 @@ description: "Поверхности CLI и MCP tools, их назначение
 # Interfaces (Architecture)
 
 ## CLI Surface
-- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`, `--profile eco|balanced|max`, `--threads N`, `--throttle-ms`; по умолчанию работает инкрементально (skip unchanged + cleanup stale files по `content_hash`/tracked files).
+- `index` — индексация директории, поддерживает `--watch`, `--deep-deps`, `--durability fast|safe`, `--profile eco|balanced|max`, `--threads N`, `--throttle-ms`; по умолчанию работает инкрементально (skip unchanged + cleanup stale files по `content_hash`/tracked files), использует single-read precheck, global parser/walker и batch sidecar/meta persist.
 - `prepare-context` — agent-only оркестрация сбора контекста из NL-запроса; поддерживает `--file`, `--task-hint`, budget-флаги и лимиты оркестрации (`--agent-timeout-sec`, `--agent-max-steps`, `--agent-include-trace`); routing читается из корневого `.code-indexer.yml` (`agent.provider/model/endpoint/api_key[_env]`). Без валидного agent-конфига команда завершается ошибкой.
 - `serve` — запуск MCP server (`--transport stdio|unix`, `--socket <path>` для unix daemon).
 - `symbols` — список символов с фильтрами, поддерживает `--remote <unix-socket>`.
@@ -22,9 +22,11 @@ description: "Поверхности CLI и MCP tools, их назначение
 
 ## MCP Surface (24 tools)
 - `index_workspace` — индексация проекта. Params: `path`, `watch`, `include_deps`.
+  - heavy scan/parse path выполняется в `spawn_blocking`, writes идут через serialized write queue (если включена), persist — batch.
 - `update_files` — virtual documents. Params: `files[]` с `path`, `content`, `version`.
 - `list_symbols` — список символов. Params: `kind`, `language`, `file`, `pattern`, `limit`, `format`.
 - `search_symbols` — поиск, включая fuzzy/regex. Params: `query`, `fuzzy`, `fuzzy_threshold`, `regex`, `module`, `limit`.
+  - `include_file_meta=true` использует batch retrieval (`get_file_meta_with_tags_many`) вместо per-file запросов.
 - `get_symbol` — получение по ID или позиции. Params: `id`, `ids[]`, `file`, `line`, `column`.
 - `find_definitions` — определения. Params: `name`, `include_deps`, `dependency`.
 - `find_references` — usages. Params: `name`, `include_callers`, `include_importers`, `kind`, `depth`.

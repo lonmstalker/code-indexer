@@ -5,18 +5,38 @@ use std::sync::{Arc, RwLock};
 use crate::error::{IndexerError, Result};
 use crate::languages::{LanguageGrammar, LanguageRegistry};
 
+enum RegistryHandle {
+    Owned(LanguageRegistry),
+    Global(&'static LanguageRegistry),
+}
+
 pub struct Parser {
-    registry: LanguageRegistry,
+    registry: RegistryHandle,
 }
 
 impl Parser {
     pub fn new(registry: LanguageRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry: RegistryHandle::Owned(registry),
+        }
+    }
+
+    pub fn global() -> Self {
+        Self {
+            registry: RegistryHandle::Global(LanguageRegistry::global()),
+        }
+    }
+
+    fn registry(&self) -> &LanguageRegistry {
+        match &self.registry {
+            RegistryHandle::Owned(registry) => registry,
+            RegistryHandle::Global(registry) => registry,
+        }
     }
 
     pub fn parse_file(&self, path: &Path) -> Result<ParsedFile> {
         let grammar = self
-            .registry
+            .registry()
             .get_for_file(path)
             .ok_or_else(|| IndexerError::UnsupportedLanguage(path.display().to_string()))?;
 
@@ -24,7 +44,11 @@ impl Parser {
         self.parse_source(&source, grammar)
     }
 
-    pub fn parse_source(&self, source: &str, grammar: Arc<dyn LanguageGrammar>) -> Result<ParsedFile> {
+    pub fn parse_source(
+        &self,
+        source: &str,
+        grammar: Arc<dyn LanguageGrammar>,
+    ) -> Result<ParsedFile> {
         self.parse_source_incremental(source, grammar, None)
     }
 
@@ -55,7 +79,7 @@ impl Parser {
 
     #[allow(dead_code)]
     pub fn get_grammar(&self, path: &Path) -> Option<Arc<dyn LanguageGrammar>> {
-        self.registry.get_for_file(path)
+        self.registry().get_for_file(path)
     }
 }
 
@@ -86,7 +110,7 @@ impl ParseCache {
     /// Parse a file with incremental support using cached tree.
     pub fn parse_file(&self, path: &Path, parser: &Parser) -> Result<ParsedFile> {
         let grammar = parser
-            .registry
+            .registry()
             .get_for_file(path)
             .ok_or_else(|| IndexerError::UnsupportedLanguage(path.display().to_string()))?;
 
@@ -114,7 +138,7 @@ impl ParseCache {
         parser: &Parser,
     ) -> Result<ParsedFile> {
         let grammar = parser
-            .registry
+            .registry()
             .get_for_file(path)
             .ok_or_else(|| IndexerError::UnsupportedLanguage(path.display().to_string()))?;
 
@@ -207,6 +231,10 @@ mod tests {
         Parser::new(LanguageRegistry::new())
     }
 
+    fn create_global_parser() -> Parser {
+        Parser::global()
+    }
+
     #[test]
     fn test_parse_source_rust() {
         let parser = create_parser();
@@ -258,6 +286,15 @@ function greet(name: string): string {
         let parsed = parser.parse_source(source, grammar).unwrap();
         assert_eq!(parsed.language, "typescript");
         assert!(parsed.root_node().child_count() > 0 || parsed.source.is_empty());
+    }
+
+    #[test]
+    fn test_parse_source_with_global_registry() {
+        let parser = create_global_parser();
+        let grammar = LanguageRegistry::global().get_by_name("rust").unwrap();
+        let source = "fn main() { println!(\"ok\"); }";
+        let parsed = parser.parse_source(source, grammar).unwrap();
+        assert_eq!(parsed.language, "rust");
     }
 
     #[test]
@@ -501,8 +538,12 @@ interface User {
         let parser = create_parser();
         let cache = ParseCache::new();
 
-        cache.parse_source_cached(Path::new("a.rs"), "fn a() {}", &parser).unwrap();
-        cache.parse_source_cached(Path::new("b.rs"), "fn b() {}", &parser).unwrap();
+        cache
+            .parse_source_cached(Path::new("a.rs"), "fn a() {}", &parser)
+            .unwrap();
+        cache
+            .parse_source_cached(Path::new("b.rs"), "fn b() {}", &parser)
+            .unwrap();
         assert_eq!(cache.len(), 2);
 
         cache.clear();

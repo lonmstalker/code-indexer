@@ -5,13 +5,33 @@ use ignore::WalkBuilder;
 use crate::error::Result;
 use crate::languages::LanguageRegistry;
 
+enum RegistryHandle {
+    Owned(LanguageRegistry),
+    Global(&'static LanguageRegistry),
+}
+
 pub struct FileWalker {
-    registry: LanguageRegistry,
+    registry: RegistryHandle,
 }
 
 impl FileWalker {
     pub fn new(registry: LanguageRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry: RegistryHandle::Owned(registry),
+        }
+    }
+
+    pub fn global() -> Self {
+        Self {
+            registry: RegistryHandle::Global(LanguageRegistry::global()),
+        }
+    }
+
+    fn registry(&self) -> &LanguageRegistry {
+        match &self.registry {
+            RegistryHandle::Owned(registry) => registry,
+            RegistryHandle::Global(registry) => registry,
+        }
     }
 
     pub fn walk(&self, root: &Path) -> Result<Vec<PathBuf>> {
@@ -36,12 +56,14 @@ impl FileWalker {
     }
 
     pub fn is_supported(&self, path: &Path) -> bool {
-        self.registry.get_for_file(path).is_some()
+        self.registry().get_for_file(path).is_some()
     }
 
     #[allow(dead_code)]
     pub fn get_language(&self, path: &Path) -> Option<String> {
-        self.registry.get_for_file(path).map(|g| g.name().to_string())
+        self.registry()
+            .get_for_file(path)
+            .map(|g| g.name().to_string())
     }
 }
 
@@ -54,6 +76,10 @@ mod tests {
 
     fn create_walker() -> FileWalker {
         FileWalker::new(LanguageRegistry::new())
+    }
+
+    fn create_global_walker() -> FileWalker {
+        FileWalker::global()
     }
 
     fn create_file(dir: &Path, name: &str, content: &str) {
@@ -79,6 +105,16 @@ mod tests {
     }
 
     #[test]
+    fn test_global_walker_finds_supported_files() {
+        let temp_dir = TempDir::new().unwrap();
+        create_file(temp_dir.path(), "main.rs", "fn main() {}");
+        let walker = create_global_walker();
+        let files = walker.walk(temp_dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].to_string_lossy().ends_with("main.rs"));
+    }
+
+    #[test]
     fn test_walk_finds_java_files() {
         let temp_dir = TempDir::new().unwrap();
         create_file(temp_dir.path(), "Main.java", "public class Main {}");
@@ -94,7 +130,11 @@ mod tests {
     fn test_walk_finds_typescript_files() {
         let temp_dir = TempDir::new().unwrap();
         create_file(temp_dir.path(), "app.ts", "const x = 1;");
-        create_file(temp_dir.path(), "component.tsx", "export default () => null;");
+        create_file(
+            temp_dir.path(),
+            "component.tsx",
+            "export default () => null;",
+        );
         create_file(temp_dir.path(), "utils.js", "function test() {}");
         create_file(temp_dir.path(), "comp.jsx", "export const C = () => null;");
 
@@ -154,7 +194,9 @@ mod tests {
 
         // With git initialized, .gitignore should be respected
         // Without git, all files would be found
-        let main_found = files.iter().any(|f| f.to_string_lossy().contains("main.rs"));
+        let main_found = files
+            .iter()
+            .any(|f| f.to_string_lossy().contains("main.rs"));
         assert!(main_found, "main.rs should be found");
     }
 
@@ -301,22 +343,40 @@ mod tests {
     #[test]
     fn test_get_language_rust() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("test.rs")), Some("rust".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("test.rs")),
+            Some("rust".to_string())
+        );
     }
 
     #[test]
     fn test_get_language_java() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("Main.java")), Some("java".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("Main.java")),
+            Some("java".to_string())
+        );
     }
 
     #[test]
     fn test_get_language_typescript() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("app.ts")), Some("typescript".to_string()));
-        assert_eq!(walker.get_language(Path::new("app.tsx")), Some("typescript".to_string()));
-        assert_eq!(walker.get_language(Path::new("app.js")), Some("typescript".to_string()));
-        assert_eq!(walker.get_language(Path::new("app.jsx")), Some("typescript".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("app.ts")),
+            Some("typescript".to_string())
+        );
+        assert_eq!(
+            walker.get_language(Path::new("app.tsx")),
+            Some("typescript".to_string())
+        );
+        assert_eq!(
+            walker.get_language(Path::new("app.js")),
+            Some("typescript".to_string())
+        );
+        assert_eq!(
+            walker.get_language(Path::new("app.jsx")),
+            Some("typescript".to_string())
+        );
     }
 
     #[test]
@@ -329,26 +389,41 @@ mod tests {
     #[test]
     fn test_get_language_python() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("script.py")), Some("python".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("script.py")),
+            Some("python".to_string())
+        );
     }
 
     #[test]
     fn test_get_language_go() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("main.go")), Some("go".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("main.go")),
+            Some("go".to_string())
+        );
     }
 
     #[test]
     fn test_get_language_csharp() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("Program.cs")), Some("csharp".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("Program.cs")),
+            Some("csharp".to_string())
+        );
     }
 
     #[test]
     fn test_get_language_cpp() {
         let walker = create_walker();
-        assert_eq!(walker.get_language(Path::new("main.cpp")), Some("cpp".to_string()));
-        assert_eq!(walker.get_language(Path::new("header.h")), Some("cpp".to_string()));
+        assert_eq!(
+            walker.get_language(Path::new("main.cpp")),
+            Some("cpp".to_string())
+        );
+        assert_eq!(
+            walker.get_language(Path::new("header.h")),
+            Some("cpp".to_string())
+        );
     }
 
     #[test]

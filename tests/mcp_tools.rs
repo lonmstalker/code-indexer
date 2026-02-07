@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use code_indexer::{
-    CodeIndex, FileWalker, LanguageRegistry, Location, Parser, SearchOptions, SqliteIndex,
-    Symbol, SymbolExtractor, SymbolKind,
+    CodeIndex, FileWalker, LanguageRegistry, Location, Parser, SearchOptions, SqliteIndex, Symbol,
+    SymbolExtractor, SymbolKind,
 };
 use tempfile::NamedTempFile;
 
@@ -22,7 +22,12 @@ fn create_test_index() -> SqliteIndex {
 
 /// Helper to create a test symbol
 fn create_test_symbol(name: &str, kind: SymbolKind, file: &str, line: u32) -> Symbol {
-    Symbol::new(name, kind, Location::new(file, line, 0, line + 10, 0), "rust")
+    Symbol::new(
+        name,
+        kind,
+        Location::new(file, line, 0, line + 10, 0),
+        "rust",
+    )
 }
 
 /// Helper to create an index from a directory
@@ -204,7 +209,9 @@ mod search_symbols {
             ])
             .unwrap();
 
-        let results = index.search("calculate_sum", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("calculate_sum", &SearchOptions::default())
+            .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].symbol.name, "calculate_sum");
     }
@@ -219,7 +226,9 @@ mod search_symbols {
             ])
             .unwrap();
 
-        let results = index.search("calculate", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("calculate", &SearchOptions::default())
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -268,10 +277,17 @@ mod search_symbols {
     fn test_search_no_results() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("foo", SymbolKind::Function, "test.rs", 1))
+            .add_symbol(create_test_symbol(
+                "foo",
+                SymbolKind::Function,
+                "test.rs",
+                1,
+            ))
             .unwrap();
 
-        let results = index.search("nonexistent", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("nonexistent", &SearchOptions::default())
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -279,11 +295,18 @@ mod search_symbols {
     fn test_search_case_insensitive() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("MyFunction", SymbolKind::Function, "test.rs", 1))
+            .add_symbol(create_test_symbol(
+                "MyFunction",
+                SymbolKind::Function,
+                "test.rs",
+                1,
+            ))
             .unwrap();
 
         // FTS5 is case-insensitive by default
-        let results = index.search("myfunction", &SearchOptions::default()).unwrap();
+        let results = index
+            .search("myfunction", &SearchOptions::default())
+            .unwrap();
         assert!(!results.is_empty());
     }
 
@@ -307,7 +330,12 @@ mod search_symbols {
     fn test_search_empty_query() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("foo", SymbolKind::Function, "test.rs", 1))
+            .add_symbol(create_test_symbol(
+                "foo",
+                SymbolKind::Function,
+                "test.rs",
+                1,
+            ))
             .unwrap();
 
         let results = index.search("", &SearchOptions::default()).unwrap();
@@ -319,7 +347,12 @@ mod search_symbols {
     fn test_fuzzy_search() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("calculate", SymbolKind::Function, "test.rs", 1))
+            .add_symbol(create_test_symbol(
+                "calculate",
+                SymbolKind::Function,
+                "test.rs",
+                1,
+            ))
             .unwrap();
 
         let options = SearchOptions {
@@ -328,9 +361,9 @@ mod search_symbols {
         };
         // Fuzzy search should find "calculate" when searching for "calculte" (typo)
         let results = index.search_fuzzy("calculte", &options).unwrap();
-        // May or may not find depending on threshold
-        // Just verify it doesn't panic
-        assert!(results.len() >= 0);
+        // May or may not find depending on threshold.
+        // If results exist, they must be well-formed.
+        assert!(results.iter().all(|r| !r.symbol.name.is_empty()));
     }
 }
 
@@ -427,7 +460,12 @@ mod find_definitions {
     fn test_find_definition_function() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("process", SymbolKind::Function, "lib.rs", 1))
+            .add_symbol(create_test_symbol(
+                "process",
+                SymbolKind::Function,
+                "lib.rs",
+                1,
+            ))
             .unwrap();
 
         let defs = index.find_definition("process").unwrap();
@@ -488,7 +526,12 @@ mod find_references {
     fn test_find_references_basic() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("target", SymbolKind::Function, "lib.rs", 1))
+            .add_symbol(create_test_symbol(
+                "target",
+                SymbolKind::Function,
+                "lib.rs",
+                1,
+            ))
             .unwrap();
 
         index
@@ -535,7 +578,12 @@ mod find_references {
     fn test_find_callers() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("callee", SymbolKind::Function, "lib.rs", 1))
+            .add_symbol(create_test_symbol(
+                "callee",
+                SymbolKind::Function,
+                "lib.rs",
+                1,
+            ))
             .unwrap();
 
         index
@@ -556,7 +604,12 @@ mod find_references {
 
         // Create a trait
         index
-            .add_symbol(create_test_symbol("MyTrait", SymbolKind::Trait, "lib.rs", 1))
+            .add_symbol(create_test_symbol(
+                "MyTrait",
+                SymbolKind::Trait,
+                "lib.rs",
+                1,
+            ))
             .unwrap();
 
         // Create implementations with parent pointing to the trait
@@ -570,7 +623,7 @@ mod find_references {
 
         let impls = index.find_implementations("MyTrait").unwrap();
         // find_implementations looks for methods with that trait name
-        assert!(impls.len() >= 0);
+        assert!(impls.iter().all(|s| !s.name.is_empty()));
     }
 
     #[test]
@@ -579,7 +632,12 @@ mod find_references {
 
         // Create type with members
         index
-            .add_symbol(create_test_symbol("MyStruct", SymbolKind::Struct, "lib.rs", 1))
+            .add_symbol(create_test_symbol(
+                "MyStruct",
+                SymbolKind::Struct,
+                "lib.rs",
+                1,
+            ))
             .unwrap();
 
         let mut field = create_test_symbol("field1", SymbolKind::Field, "lib.rs", 2);
@@ -766,8 +824,14 @@ mod get_stats {
             .unwrap();
 
         let stats = index.get_stats().unwrap();
-        assert!(stats.symbols_by_kind.iter().any(|(k, c)| k == "function" && *c == 2));
-        assert!(stats.symbols_by_kind.iter().any(|(k, c)| k == "struct" && *c == 1));
+        assert!(stats
+            .symbols_by_kind
+            .iter()
+            .any(|(k, c)| k == "function" && *c == 2));
+        assert!(stats
+            .symbols_by_kind
+            .iter()
+            .any(|(k, c)| k == "struct" && *c == 1));
     }
 
     #[test]
@@ -810,7 +874,9 @@ mod integration {
         // Search for common Rust struct/function names
         let results = index.search("User", &SearchOptions::default()).unwrap();
         // May or may not find depending on what's in the example
-        assert!(results.len() >= 0);
+        assert!(results
+            .iter()
+            .all(|r| !r.symbol.location.file_path.is_empty()));
     }
 
     #[test]
@@ -829,7 +895,7 @@ mod integration {
         // List types in Java project
         let types = index.list_types(&SearchOptions::default()).unwrap();
         // Java example should have classes
-        assert!(types.len() >= 0);
+        assert!(types.iter().all(|t| !t.name.is_empty()));
     }
 
     #[test]
@@ -850,9 +916,15 @@ mod integration {
         let kotlin_stats = kotlin_index.get_stats().unwrap();
 
         // Rust example should have symbols
-        assert!(rust_stats.total_symbols > 0, "Rust example should have symbols");
+        assert!(
+            rust_stats.total_symbols > 0,
+            "Rust example should have symbols"
+        );
         // Kotlin may or may not have symbols depending on parser support
-        assert!(kotlin_stats.total_symbols >= 0);
+        assert!(kotlin_stats
+            .symbols_by_language
+            .iter()
+            .all(|(language, _)| !language.is_empty()));
     }
 }
 
@@ -869,7 +941,12 @@ mod analyze_call_graph {
 
         // Add function
         index
-            .add_symbol(create_test_symbol("main", SymbolKind::Function, "main.rs", 1))
+            .add_symbol(create_test_symbol(
+                "main",
+                SymbolKind::Function,
+                "main.rs",
+                1,
+            ))
             .unwrap();
 
         let graph = index.get_call_graph("main", 2).unwrap();
@@ -891,7 +968,7 @@ mod analyze_call_graph {
         // This tests that find_callees doesn't panic
         let callees = index.find_callees("some_function").unwrap();
         // May be empty if no call data
-        assert!(callees.len() >= 0);
+        assert!(callees.iter().all(|c| !c.symbol_name.is_empty()));
     }
 
     #[test]
@@ -908,7 +985,7 @@ mod analyze_call_graph {
 
         let report = index.find_dead_code().unwrap();
         // Should have some results (functions without references)
-        assert!(report.unused_functions.len() >= 0);
+        assert!(report.unused_functions.iter().all(|s| !s.name.is_empty()));
     }
 }
 
@@ -923,7 +1000,12 @@ mod get_diagnostics {
     fn test_dead_code_report() {
         let index = create_test_index();
         index
-            .add_symbol(create_test_symbol("orphan", SymbolKind::Function, "lib.rs", 1))
+            .add_symbol(create_test_symbol(
+                "orphan",
+                SymbolKind::Function,
+                "lib.rs",
+                1,
+            ))
             .unwrap();
 
         let report = index.find_dead_code().unwrap();
@@ -936,12 +1018,13 @@ mod get_diagnostics {
         let index = create_test_index();
 
         let mut func = create_test_symbol("complex_func", SymbolKind::Function, "lib.rs", 1);
-        func.signature = Some("fn complex_func(a: i32, b: i32, c: i32) -> Result<String, Error>".to_string());
+        func.signature =
+            Some("fn complex_func(a: i32, b: i32, c: i32) -> Result<String, Error>".to_string());
         index.add_symbol(func).unwrap();
 
         let metrics = index.get_function_metrics("complex_func").unwrap();
         // Should have at least one metrics entry
-        assert!(metrics.len() >= 0);
+        assert!(metrics.iter().all(|m| !m.name.is_empty()));
     }
 
     #[test]
@@ -1151,7 +1234,9 @@ mod symbol_hierarchy {
 
         // Should find both methods
         assert_eq!(members.len(), 2);
-        assert!(members.iter().all(|m| m.parent == Some("MyStruct".to_string())));
+        assert!(members
+            .iter()
+            .all(|m| m.parent == Some("MyStruct".to_string())));
     }
 
     #[test]

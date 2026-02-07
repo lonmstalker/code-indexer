@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::docs::{ConfigDigest, DocDigest};
 use crate::error::Result;
-use crate::index::sqlite::SqliteIndex;
+use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
 use crate::index::{CodeIndex, FileTag, Scope, Symbol, SymbolMetrics};
 use crate::indexer::ExtractionResult;
 
@@ -35,6 +35,11 @@ pub enum WriteCommand {
     AddExtractionResults {
         results: Vec<ExtractionResult>,
         respond: oneshot::Sender<Result<usize>>,
+    },
+    /// Upsert tracked file records in batch
+    UpsertFileRecordsBatch {
+        records: Vec<IndexedFileRecord>,
+        respond: oneshot::Sender<Result<()>>,
     },
     /// Set file content hash
     SetFileContentHash {
@@ -112,8 +117,9 @@ impl WriteQueueHandle {
             .send(WriteCommand::AddSymbols { symbols, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Removes a file from the index.
@@ -123,19 +129,24 @@ impl WriteQueueHandle {
             .send(WriteCommand::RemoveFile { file_path, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Removes multiple files from the index.
     pub async fn remove_files_batch(&self, file_paths: Vec<String>) -> Result<()> {
         let (respond, rx) = oneshot::channel();
         self.sender
-            .send(WriteCommand::RemoveFilesBatch { file_paths, respond })
+            .send(WriteCommand::RemoveFilesBatch {
+                file_paths,
+                respond,
+            })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Adds extraction results in batch.
@@ -145,12 +156,29 @@ impl WriteQueueHandle {
             .send(WriteCommand::AddExtractionResults { results, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
+    }
+
+    /// Upserts tracked file records in batch.
+    pub async fn upsert_file_records_batch(&self, records: Vec<IndexedFileRecord>) -> Result<()> {
+        let (respond, rx) = oneshot::channel();
+        self.sender
+            .send(WriteCommand::UpsertFileRecordsBatch { records, respond })
+            .await
+            .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Sets the content hash for a file.
-    pub async fn set_file_content_hash(&self, file_path: String, content_hash: String) -> Result<()> {
+    pub async fn set_file_content_hash(
+        &self,
+        file_path: String,
+        content_hash: String,
+    ) -> Result<()> {
         let (respond, rx) = oneshot::channel();
         self.sender
             .send(WriteCommand::SetFileContentHash {
@@ -160,8 +188,9 @@ impl WriteQueueHandle {
             })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Adds scopes to the index.
@@ -171,8 +200,9 @@ impl WriteQueueHandle {
             .send(WriteCommand::AddScopes { scopes, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Updates symbol metrics in batch.
@@ -182,8 +212,9 @@ impl WriteQueueHandle {
             .send(WriteCommand::UpdateSymbolMetricsBatch { metrics, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Adds file tags.
@@ -197,8 +228,9 @@ impl WriteQueueHandle {
             })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Adds doc digests in batch.
@@ -208,8 +240,9 @@ impl WriteQueueHandle {
             .send(WriteCommand::AddDocDigestsBatch { digests, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Adds a config digest.
@@ -219,8 +252,9 @@ impl WriteQueueHandle {
             .send(WriteCommand::AddConfigDigest { digest, respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Clears the entire index.
@@ -230,8 +264,9 @@ impl WriteQueueHandle {
             .send(WriteCommand::Clear { respond })
             .await
             .map_err(|_| crate::error::IndexerError::Index("Write queue closed".into()))?;
-        rx.await
-            .map_err(|_| crate::error::IndexerError::Index("Write response channel closed".into()))?
+        rx.await.map_err(|_| {
+            crate::error::IndexerError::Index("Write response channel closed".into())
+        })?
     }
 
     /// Shuts down the write queue worker.
@@ -276,13 +311,20 @@ impl WriteQueueWorker {
                     let result = self.index.remove_file(&file_path);
                     let _ = respond.send(result);
                 }
-                WriteCommand::RemoveFilesBatch { file_paths, respond } => {
+                WriteCommand::RemoveFilesBatch {
+                    file_paths,
+                    respond,
+                } => {
                     let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
                     let result = self.index.remove_files_batch(&file_refs);
                     let _ = respond.send(result);
                 }
                 WriteCommand::AddExtractionResults { results, respond } => {
                     let result = self.index.add_extraction_results_batch(results);
+                    let _ = respond.send(result);
+                }
+                WriteCommand::UpsertFileRecordsBatch { records, respond } => {
+                    let result = self.index.upsert_file_records_batch(&records);
                     let _ = respond.send(result);
                 }
                 WriteCommand::SetFileContentHash {
@@ -426,6 +468,42 @@ mod tests {
         // Verify the symbol was removed
         let found = index.find_definition("to_remove").unwrap();
         assert!(found.is_empty());
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_queue_upsert_file_records_batch() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let index = Arc::new(SqliteIndex::new(&db_path).unwrap());
+        let queue = WriteQueueHandle::new(index.clone());
+
+        let records = vec![
+            IndexedFileRecord {
+                path: "/test/a.rs".to_string(),
+                language: "rust".to_string(),
+                symbol_count: 3,
+                content_hash: "hash-a".to_string(),
+            },
+            IndexedFileRecord {
+                path: "/test/b.rs".to_string(),
+                language: "rust".to_string(),
+                symbol_count: 5,
+                content_hash: "hash-b".to_string(),
+            },
+        ];
+
+        queue.upsert_file_records_batch(records).await.unwrap();
+
+        assert_eq!(
+            index.get_file_content_hash("/test/a.rs").unwrap(),
+            Some("hash-a".to_string())
+        );
+        assert_eq!(
+            index.get_file_content_hash("/test/b.rs").unwrap(),
+            Some("hash-b".to_string())
+        );
 
         queue.shutdown().await.unwrap();
     }

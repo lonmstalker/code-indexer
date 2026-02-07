@@ -7,16 +7,18 @@ description: "Пайплайн индексирования: от FileWalker д�
 Пайплайн индексации построен вокруг `index_directory` в `src/cli/commands.rs` и компонентов `indexer`.
 
 ## Основная цепочка
-1. File discovery: `FileWalker::new(LanguageRegistry)` собирает поддерживаемые файлы.
-2. Incremental precheck: для каждого файла вычисляется `content_hash`; unchanged файлы пропускаются через `file_needs_reindex`.
+1. File discovery: `FileWalker::global()` собирает поддерживаемые файлы.
+2. Incremental precheck: файл читается один раз, вычисляется `content_hash`; skip unchanged делается через preloaded map `get_tracked_file_hashes` (без per-file DB roundtrip).
 3. Stale cleanup: из индекса удаляются tracked-файлы, которых больше нет в workspace (`remove_files_batch`).
 4. Progress init: `IndexingProgress::start(files_to_index.len())` — shared atomic state для tracking.
-5. Parsing: `Parser::parse_file` строит AST через tree-sitter (rayon `map_init`: parser/extractor создаются один раз на worker thread).
+5. Parsing: `Parser::global()` + `ParseCache::parse_source_cached` строят AST из уже прочитанного контента (rayon `map_init`: parser/extractor создаются один раз на worker thread).
    - Параллелизм и тепловой профиль задаются через `index --profile eco|balanced|max`, ручной override `--threads N`, дополнительный мягкий throttling `--throttle-ms`.
 6. Extraction: `SymbolExtractor::extract_all` извлекает symbols, references, imports. Queries берутся из cache (`cached_*_query`) при наличии.
-7. Persist: сначала удаляются старые записи для changed-файлов, затем `SqliteIndex::add_extraction_results_batch_with_durability` сохраняет новые символы (`--durability fast|safe` для bulk index).
+7. Persist: сначала удаляются старые записи для changed-файлов (`remove_files_batch`, chunked), затем `SqliteIndex::add_extraction_results_batch_with_durability` сохраняет новые символы (`--durability fast|safe` для bulk index).
 8. File tracking persist: `upsert_file_records_batch` обновляет `files(path, language, symbol_count, content_hash)` для следующего incremental-run.
 9. Finish: `progress.finish()` — финализация прогресса.
+
+Sidecar metadata/tags в CLI обрабатываются батчами (`upsert_file_meta_batch` / `add_file_tags_batch`), а `exported_hash` обновляется через batch retrieval/update (`get_file_meta_many` + `upsert_file_meta_batch`).
 
 CLI использует `indicatif::ProgressBar` для визуализации. MCP предоставляет `get_indexing_status` tool для polling.
 

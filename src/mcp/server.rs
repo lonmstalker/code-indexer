@@ -148,30 +148,15 @@ impl McpServer {
         }
     }
 
-    /// Sets file content hash. Uses write queue if available.
-    async fn write_set_file_content_hash(
+    /// Upserts file records. Uses write queue if available.
+    async fn write_upsert_file_records_batch(
         &self,
-        file_path: &str,
-        content_hash: &str,
+        records: Vec<crate::index::sqlite::IndexedFileRecord>,
     ) -> crate::error::Result<()> {
         if let Some(ref wq) = self.write_queue {
-            wq.set_file_content_hash(file_path.to_string(), content_hash.to_string())
-                .await
+            wq.upsert_file_records_batch(records).await
         } else {
-            self.index.set_file_content_hash(file_path, content_hash)
-        }
-    }
-
-    /// Adds file tags. Uses write queue if available.
-    async fn write_add_file_tags(
-        &self,
-        file_path: &str,
-        tags: &[crate::index::FileTag],
-    ) -> crate::error::Result<()> {
-        if let Some(ref wq) = self.write_queue {
-            wq.add_file_tags(file_path.to_string(), tags.to_vec()).await
-        } else {
-            self.index.add_file_tags(file_path, tags)
+            self.index.upsert_file_records_batch(&records)
         }
     }
 
@@ -1276,10 +1261,8 @@ impl McpServer {
         bundle.coverage = Some(collection.coverage.clone());
         bundle.gaps = collection.gaps;
         bundle.collection_meta = Some(collection.collection_meta);
-        bundle.suggested_tool_calls = merge_suggested_calls(
-            bundle.suggested_tool_calls,
-            collection.suggested_tool_calls,
-        );
+        bundle.suggested_tool_calls =
+            merge_suggested_calls(bundle.suggested_tool_calls, collection.suggested_tool_calls);
 
         let mut envelope = ResponseEnvelope::with_items(vec![bundle], format);
         for warning in base_envelope.meta.warnings.drain(..) {
@@ -1311,7 +1294,10 @@ impl McpServer {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "search_symbols requires 'query'".to_string())?;
-                let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
                 let file_filter = args
                     .get("file")
                     .or_else(|| args.get("in_file"))
@@ -1325,7 +1311,10 @@ impl McpServer {
                     use_advanced_ranking: Some(true),
                     ..Default::default()
                 };
-                let results = self.index.search(query, &options).map_err(|e| e.to_string())?;
+                let results = self
+                    .index
+                    .search(query, &options)
+                    .map_err(|e| e.to_string())?;
                 serde_json::to_value(results).map_err(|e| e.to_string())
             }
             "find_references" => {
@@ -1334,7 +1323,10 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "find_references requires 'name'".to_string())?;
                 let options = SearchOptions {
-                    limit: args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize),
+                    limit: args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize),
                     file_filter: args
                         .get("file")
                         .and_then(|v| v.as_str())
@@ -1413,7 +1405,10 @@ impl McpServer {
                     .or_else(|| args.get("path"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "get_file_outline requires 'file'".to_string())?;
-                let symbols = self.index.get_file_symbols(file).map_err(|e| e.to_string())?;
+                let symbols = self
+                    .index
+                    .get_file_symbols(file)
+                    .map_err(|e| e.to_string())?;
                 let mut output = serde_json::Map::new();
                 output.insert(
                     "symbols".to_string(),
@@ -1451,7 +1446,10 @@ impl McpServer {
                     if !tag_values.is_empty() {
                         file_meta.insert("tags".to_string(), serde_json::json!(tag_values));
                     }
-                    output.insert("file_meta".to_string(), serde_json::Value::Object(file_meta));
+                    output.insert(
+                        "file_meta".to_string(),
+                        serde_json::Value::Object(file_meta),
+                    );
                 }
                 Ok(serde_json::Value::Object(output))
             }
@@ -1461,7 +1459,10 @@ impl McpServer {
                     .or_else(|| args.get("path"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "get_imports requires 'file'".to_string())?;
-                let imports = self.index.get_file_imports(file).map_err(|e| e.to_string())?;
+                let imports = self
+                    .index
+                    .get_file_imports(file)
+                    .map_err(|e| e.to_string())?;
                 let mut output = serde_json::Map::new();
                 output.insert(
                     "imports".to_string(),
@@ -1594,7 +1595,10 @@ impl McpServer {
                         .map_err(|e| e.to_string())?
                 } else {
                     let target_lower = target.to_lowercase();
-                    let all_docs = self.index.get_all_doc_digests().map_err(|e| e.to_string())?;
+                    let all_docs = self
+                        .index
+                        .get_all_doc_digests()
+                        .map_err(|e| e.to_string())?;
                     all_docs
                         .into_iter()
                         .find(|d| d.doc_type.as_str() == target_lower)
@@ -1622,10 +1626,16 @@ impl McpServer {
                 }))
             }
             "get_project_commands" => {
-                let commands = self.index.get_project_commands().map_err(|e| e.to_string())?;
+                let commands = self
+                    .index
+                    .get_project_commands()
+                    .map_err(|e| e.to_string())?;
                 serde_json::to_value(commands).map_err(|e| e.to_string())
             }
-            _ => Err(format!("tool '{}' is not supported in prepare_context orchestrator", tool)),
+            _ => Err(format!(
+                "tool '{}' is not supported in prepare_context orchestrator",
+                tool
+            )),
         }
     }
 }
@@ -1700,8 +1710,8 @@ fn merge_next_actions(
 fn resolve_agent_runtime_config(
     config: InternalAgentConfig,
 ) -> crate::error::Result<ResolvedAgentRuntimeConfig> {
-    let provider =
-        crate::indexer::normalize_agent_provider(config.provider.as_deref()).ok_or_else(|| {
+    let provider = crate::indexer::normalize_agent_provider(config.provider.as_deref())
+        .ok_or_else(|| {
             crate::error::IndexerError::Mcp(
                 "prepare_context agent config must define a valid provider".to_string(),
             )
@@ -1804,9 +1814,8 @@ fn normalize_agent_config(config: Option<InternalAgentConfig>) -> Option<Context
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
-    let effective_env = explicit_env.or_else(|| {
-        crate::indexer::default_agent_api_key_env(&provider).map(|v| v.to_string())
-    });
+    let effective_env = explicit_env
+        .or_else(|| crate::indexer::default_agent_api_key_env(&provider).map(|v| v.to_string()));
     let env_token = effective_env
         .as_deref()
         .and_then(|env_name| std::env::var(env_name).ok())
@@ -2792,10 +2801,25 @@ impl ServerHandler for McpServer {
             // === 1. index_workspace ===
             "index_workspace" => {
                 use crate::index::sqlite::{IndexedFileRecord, SqliteIndex};
-                use crate::indexer::{FileWalker, Parser, SymbolExtractor};
-                use crate::languages::LanguageRegistry;
+                use crate::indexer::{ExtractionResult, FileWalker, Parser, SymbolExtractor};
                 use rayon::prelude::*;
                 use std::collections::HashSet;
+                use std::path::PathBuf;
+
+                #[derive(Clone)]
+                struct FileWorkItem {
+                    path: PathBuf,
+                    content: String,
+                    content_hash: String,
+                }
+
+                struct ScanOutcome {
+                    files_count: usize,
+                    files_skipped: usize,
+                    stale_files: Vec<String>,
+                    file_records: Vec<IndexedFileRecord>,
+                    extraction_results: Vec<ExtractionResult>,
+                }
 
                 let params: IndexWorkspaceParams = serde_json::from_value(
                     serde_json::Value::Object(request.arguments.unwrap_or_default()),
@@ -2803,133 +2827,175 @@ impl ServerHandler for McpServer {
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
                 let workspace_path = params.path.unwrap_or_else(|| ".".to_string());
-                let path = std::path::Path::new(&workspace_path);
+                let root_path = PathBuf::from(&workspace_path);
+                let index = self.index.clone();
+                let parse_cache = self.parse_cache.clone();
+                let progress = self.indexing_progress.clone();
 
-                // Walk the workspace to find supported files
-                let registry = LanguageRegistry::new();
-                let walker = FileWalker::new(registry);
+                let scan_outcome = match tokio::task::spawn_blocking(
+                    move || -> crate::error::Result<ScanOutcome> {
+                        let walker = FileWalker::global();
+                        let files = walker.walk(&root_path)?;
 
-                let files = walker.walk(path).map_err(|e| {
-                    McpError::internal_error(format!("Failed to walk workspace: {}", e), None)
-                })?;
+                        let files_count = files.len();
+                        let current_files: HashSet<String> = files
+                            .iter()
+                            .map(|file| file.to_string_lossy().to_string())
+                            .collect();
+                        let tracked_files = index.get_tracked_files()?;
+                        let stale_files: Vec<String> = tracked_files
+                            .into_iter()
+                            .filter(|tracked| !current_files.contains(tracked))
+                            .collect();
+                        let tracked_hashes = index.get_tracked_file_hashes()?;
 
-                let files_count = files.len();
-                let current_files: HashSet<String> = files
-                    .iter()
-                    .map(|file| file.to_string_lossy().to_string())
-                    .collect();
-                let tracked_files = self.index.get_tracked_files().map_err(|e| {
-                    McpError::internal_error(format!("Failed to list tracked files: {}", e), None)
-                })?;
-                let stale_files: Vec<String> = tracked_files
-                    .into_iter()
-                    .filter(|tracked| !current_files.contains(tracked))
-                    .collect();
-                if !stale_files.is_empty() {
-                    let stale_refs: Vec<&str> = stale_files.iter().map(|s| s.as_str()).collect();
-                    self.index.remove_files_batch(&stale_refs).map_err(|e| {
-                        McpError::internal_error(
-                            format!("Failed to remove stale files: {}", e),
-                            None,
-                        )
-                    })?;
-                }
-
-                // Incremental indexing: filter out files that haven't changed
-                let files_to_index: Vec<_> = files
-                    .iter()
-                    .filter(|file| {
-                        // Read file content and compute hash
-                        if let Ok(content) = std::fs::read_to_string(file) {
-                            let hash = SqliteIndex::compute_content_hash(&content);
-                            if let Ok(needs_reindex) = self
-                                .index
-                                .file_needs_reindex(&file.to_string_lossy(), &hash)
-                            {
-                                if !needs_reindex {
-                                    return false; // Skip unchanged file
+                        let mut read_errors = 0usize;
+                        let mut files_to_index = Vec::new();
+                        for file in files {
+                            match std::fs::read_to_string(&file) {
+                                Ok(content) => {
+                                    let file_path = file.to_string_lossy().to_string();
+                                    let content_hash = SqliteIndex::compute_content_hash(&content);
+                                    let needs_reindex = tracked_hashes
+                                        .get(&file_path)
+                                        .map(|stored| stored != &content_hash)
+                                        .unwrap_or(true);
+                                    if needs_reindex {
+                                        files_to_index.push(FileWorkItem {
+                                            path: file,
+                                            content,
+                                            content_hash,
+                                        });
+                                    }
+                                }
+                                Err(_) => {
+                                    read_errors += 1;
                                 }
                             }
                         }
-                        true
-                    })
-                    .collect();
 
-                let files_skipped = files_count - files_to_index.len();
+                        let files_skipped =
+                            files_count.saturating_sub(files_to_index.len() + read_errors);
+                        progress.start(files_to_index.len() + read_errors);
+                        for _ in 0..read_errors {
+                            progress.inc_error();
+                        }
 
-                // Start progress tracking
-                self.indexing_progress.start(files_to_index.len());
-                let progress_ref = &self.indexing_progress;
-
-                // Parallel parsing and extraction using rayon
-                let parse_cache = self.parse_cache.clone();
-                let results: Vec<(IndexedFileRecord, crate::indexer::ExtractionResult)> =
-                    files_to_index
-                        .into_par_iter()
-                        .map_init(
-                            || (Parser::new(LanguageRegistry::new()), SymbolExtractor::new()),
-                            |(parser, extractor), file| {
-                                // Read content and compute hash
-                                let content = std::fs::read_to_string(file).ok()?;
-                                let hash = SqliteIndex::compute_content_hash(&content);
-
-                                match parse_cache.parse_source_cached(file, &content, parser) {
-                                    Ok(parsed) => match extractor.extract_all(&parsed, file) {
-                                        Ok(result) => {
-                                            let symbol_count = result.symbols.len();
-                                            progress_ref.inc(symbol_count);
-                                            Some((
-                                                IndexedFileRecord {
-                                                    path: file.to_string_lossy().to_string(),
-                                                    language: parsed.language.clone(),
-                                                    symbol_count,
-                                                    content_hash: hash,
-                                                },
-                                                result,
-                                            ))
+                        let results: Vec<(IndexedFileRecord, ExtractionResult)> =
+                            files_to_index
+                                .into_par_iter()
+                                .map_init(
+                                    || (Parser::global(), SymbolExtractor::new()),
+                                    |(parser, extractor), item| match parse_cache
+                                        .parse_source_cached(&item.path, &item.content, parser)
+                                    {
+                                        Ok(parsed) => {
+                                            match extractor.extract_all(&parsed, &item.path) {
+                                                Ok(result) => {
+                                                    let symbol_count = result.symbols.len();
+                                                    progress.inc(symbol_count);
+                                                    Some((
+                                                        IndexedFileRecord {
+                                                            path: item
+                                                                .path
+                                                                .to_string_lossy()
+                                                                .to_string(),
+                                                            language: parsed.language.clone(),
+                                                            symbol_count,
+                                                            content_hash: item.content_hash,
+                                                        },
+                                                        result,
+                                                    ))
+                                                }
+                                                Err(_) => {
+                                                    progress.inc_error();
+                                                    None
+                                                }
+                                            }
                                         }
                                         Err(_) => {
-                                            progress_ref.inc_error();
+                                            progress.inc_error();
+                                            parse_cache.invalidate(&item.path);
                                             None
                                         }
                                     },
-                                    Err(_) => {
-                                        progress_ref.inc_error();
-                                        parse_cache.invalidate(file);
-                                        None
-                                    }
-                                }
-                            },
-                        )
-                        .filter_map(|r| r)
-                        .collect();
+                                )
+                                .filter_map(|r| r)
+                                .collect();
 
-                let files_updated = results.len();
+                        let mut file_records = Vec::with_capacity(results.len());
+                        let mut extraction_results = Vec::with_capacity(results.len());
+                        for (file_record, extraction_result) in results {
+                            file_records.push(file_record);
+                            extraction_results.push(extraction_result);
+                        }
 
-                // Remove old data for files that will be updated (batch operation)
-                let file_paths: Vec<String> = results.iter().map(|(f, _)| f.path.clone()).collect();
-                let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
-                let _ = self.index.remove_files_batch(&file_refs);
+                        Ok(ScanOutcome {
+                            files_count,
+                            files_skipped,
+                            stale_files,
+                            file_records,
+                            extraction_results,
+                        })
+                    },
+                )
+                .await
+                {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(e)) => {
+                        self.indexing_progress.finish();
+                        return Err(McpError::internal_error(
+                            format!("Failed to index workspace: {}", e),
+                            None,
+                        ));
+                    }
+                    Err(e) => {
+                        self.indexing_progress.finish();
+                        return Err(McpError::internal_error(
+                            format!("Indexing worker failed: {}", e),
+                            None,
+                        ));
+                    }
+                };
 
-                // Split records and extracted symbols for storage.
-                let mut file_records = Vec::with_capacity(results.len());
-                let mut extraction_results = Vec::with_capacity(results.len());
-                for (file_record, extraction_result) in results {
-                    file_records.push(file_record);
-                    extraction_results.push(extraction_result);
+                let files_updated = scan_outcome.file_records.len();
+
+                if !scan_outcome.stale_files.is_empty() {
+                    self.write_remove_files_batch(scan_outcome.stale_files)
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("Failed to remove stale files: {}", e),
+                                None,
+                            )
+                        })?;
                 }
 
-                // Batch insert all results
+                let changed_file_paths: Vec<String> = scan_outcome
+                    .file_records
+                    .iter()
+                    .map(|record| record.path.clone())
+                    .collect();
+                if !changed_file_paths.is_empty() {
+                    self.write_remove_files_batch(changed_file_paths)
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("Failed to remove changed files: {}", e),
+                                None,
+                            )
+                        })?;
+                }
+
                 let total_symbols = self
-                    .index
-                    .add_extraction_results_batch(extraction_results)
+                    .write_add_extraction_results(scan_outcome.extraction_results)
+                    .await
                     .map_err(|e| {
                         McpError::internal_error(format!("Failed to store results: {}", e), None)
                     })?;
 
-                // Persist file metadata/content hashes for incremental updates.
-                self.index
-                    .upsert_file_records_batch(&file_records)
+                self.write_upsert_file_records_batch(scan_outcome.file_records)
+                    .await
                     .map_err(|e| {
                         McpError::internal_error(
                             format!("Failed to update file records: {}", e),
@@ -2942,9 +3008,9 @@ impl ServerHandler for McpServer {
                 let output = serde_json::json!({
                     "status": "indexed",
                     "path": workspace_path,
-                    "files_found": files_count,
+                    "files_found": scan_outcome.files_count,
                     "files_updated": files_updated,
-                    "files_skipped": files_skipped,
+                    "files_skipped": scan_outcome.files_skipped,
                     "symbols_indexed": total_symbols,
                     "incremental": true,
                     "watch": params.watch.unwrap_or(false),
@@ -2959,15 +3025,13 @@ impl ServerHandler for McpServer {
             // === 2. update_files ===
             "update_files" => {
                 use crate::indexer::{Parser, SymbolExtractor};
-                use crate::languages::LanguageRegistry;
 
                 let params: UpdateFilesParams = serde_json::from_value(serde_json::Value::Object(
                     request.arguments.unwrap_or_default(),
                 ))
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-                let registry = LanguageRegistry::new();
-                let parser = Parser::new(registry);
+                let parser = Parser::global();
                 let extractor = SymbolExtractor::new();
 
                 let mut updated_files = Vec::new();
@@ -3198,26 +3262,31 @@ impl ServerHandler for McpServer {
                         }
 
                         let output = if include_file_meta {
-                            // Build results with file metadata
+                            // Build results with file metadata (single batch lookup).
+                            let mut unique_paths = Vec::new();
+                            let mut seen = std::collections::HashSet::new();
+                            for result in &results {
+                                let file_path = result.symbol.location.file_path.clone();
+                                if seen.insert(file_path.clone()) {
+                                    unique_paths.push(file_path);
+                                }
+                            }
+
+                            let file_meta_map = self
+                                .index
+                                .get_file_meta_with_tags_many(&unique_paths)
+                                .unwrap_or_default();
+
                             let mut items: Vec<serde_json::Value> = Vec::new();
-                            let mut file_meta_cache: std::collections::HashMap<
-                                String,
-                                Option<(crate::index::FileMeta, Vec<crate::index::FileTag>)>,
-                            > = std::collections::HashMap::new();
 
                             for r in &results {
                                 let file_path = &r.symbol.location.file_path;
-
-                                // Get cached or fetch file metadata
-                                let meta_tags =
-                                    file_meta_cache.entry(file_path.clone()).or_insert_with(|| {
-                                        self.index.get_file_meta_with_tags(file_path).ok().flatten()
-                                    });
+                                let meta_tags = file_meta_map.get(file_path);
 
                                 match output_format {
                                     OutputFormat::Full => {
-                                        let mut item = serde_json::to_value(&r).unwrap_or_default();
-                                        if let Some((ref meta, ref tags)) = meta_tags {
+                                        let mut item = serde_json::to_value(r).unwrap_or_default();
+                                        if let Some((meta, tags)) = meta_tags {
                                             let fm = CompactFileMeta::from_file_meta(meta, tags);
                                             if let serde_json::Value::Object(ref mut map) = item {
                                                 map.insert(
@@ -3233,7 +3302,7 @@ impl ServerHandler for McpServer {
                                             CompactSymbol::from_symbol(&r.symbol, Some(r.score)),
                                         )
                                         .unwrap_or_default();
-                                        if let Some((ref meta, ref tags)) = meta_tags {
+                                        if let Some((meta, tags)) = meta_tags {
                                             let fm = CompactFileMeta::from_file_meta(meta, tags);
                                             if let serde_json::Value::Object(ref mut map) = compact
                                             {
@@ -5088,7 +5157,10 @@ mod tests {
             Some("https://openrouter.ai/api/v1")
         );
         assert!(info.auth_configured);
-        assert_eq!(info.auth_source.as_deref(), Some("env:CODE_INDEXER_TEST_OPENROUTER_TOKEN_NORMALIZE"));
+        assert_eq!(
+            info.auth_source.as_deref(),
+            Some("env:CODE_INDEXER_TEST_OPENROUTER_TOKEN_NORMALIZE")
+        );
         assert_eq!(info.mode, "planner");
 
         std::env::remove_var(env_name);
@@ -5266,8 +5338,12 @@ agent:
             .expect("prepare context bundle");
 
         assert!(
-            envelope.meta.warnings.iter().any(|w| w
-                .contains("internal agent routing configured: provider=local, mode=planner"))
+            envelope
+                .meta
+                .warnings
+                .iter()
+                .any(|w| w
+                    .contains("internal agent routing configured: provider=local, mode=planner"))
         );
 
         let items = envelope.items.expect("items");
