@@ -436,6 +436,8 @@ UserService:cls@src/UserService.java:10
         "/path/to/your/project:/workspace",
         "-w",
         "/workspace",
+        "-e",
+        "OPENAI_API_KEY",
         "lonmstalkerd/code-indexer:latest",
         "--db",
         "/workspace/.code-index.db",
@@ -444,6 +446,61 @@ UserService:cls@src/UserService.java:10
     }
   }
 }
+```
+
+Для нескольких проектов в одном MCP-клиенте поднимайте отдельный server на каждый проект
+(с отдельным `-v` mount и отдельным `--db`), например:
+
+```json
+{
+  "mcpServers": {
+    "code-indexer-project-a": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-v",
+        "/abs/path/project-a:/workspace",
+        "-w",
+        "/workspace",
+        "-e",
+        "OPENAI_API_KEY",
+        "lonmstalkerd/code-indexer:latest",
+        "--db",
+        "/workspace/.code-index.db",
+        "serve"
+      ]
+    },
+    "code-indexer-project-b": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-v",
+        "/abs/path/project-b:/workspace",
+        "-w",
+        "/workspace",
+        "-e",
+        "OPENAI_API_KEY",
+        "lonmstalkerd/code-indexer:latest",
+        "--db",
+        "/workspace/.code-index.db",
+        "serve"
+      ]
+    }
+  }
+}
+```
+
+Чтобы `prepare_context` в MCP использовал токен агента из env, укажите в корневом `.code-indexer.yml`:
+
+```yaml
+agent:
+  provider: openai
+  model: gpt-5
+  api_key_env: OPENAI_API_KEY
 ```
 
 ## Анализ кода
