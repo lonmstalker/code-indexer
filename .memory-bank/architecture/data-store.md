@@ -30,6 +30,7 @@ PRAGMA настройки:
 Batch/scale-path:
 - `remove_files_batch` использует `TEMP TABLE` + set-based delete (вместо больших IN-списков и промежуточных `symbol_ids` в памяти).
 - Для Intent Layer есть batch API: `upsert_file_meta_batch`, `get_file_meta_many`, `get_file_meta_with_tags_many`, `add_file_tags_batch`.
+- `exported_hash` в `file_meta` пишется из индексатора селективно: inferred-мета не создаётся для файлов без sidecar и без exported symbols; это снижает рост таблицы `file_meta` и объём лишних апдейтов.
 - Для symbol ingest используется `add_extraction_results_batch_with_mode(results, fast_mode, cold_run)`:
   - default/safe profile: базовые PRAGMA (`WAL/NORMAL/-64000`).
   - `fast_mode` profile: `synchronous=OFF`, `cache_size=-128000`.

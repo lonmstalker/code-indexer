@@ -130,18 +130,22 @@ fn scan_workspace_for_indexing(
     let files = walker.walk(root_path)?;
 
     let files_count = files.len();
-    let current_files: HashSet<String> = files
-        .iter()
-        .map(|file| file.to_string_lossy().to_string())
-        .collect();
-    let tracked_files = index.get_tracked_files()?;
-    let stale_files: Vec<String> = tracked_files
-        .iter()
-        .filter(|tracked| !current_files.contains(*tracked))
-        .cloned()
-        .collect();
     let tracked_states = index.get_tracked_file_states()?;
-    let is_cold_run = tracked_files.is_empty() && tracked_states.is_empty();
+    let tracked_files: Vec<String> = tracked_states.keys().cloned().collect();
+    let stale_files: Vec<String> = if tracked_files.is_empty() {
+        Vec::new()
+    } else {
+        let current_files: HashSet<String> = files
+            .iter()
+            .map(|file| file.to_string_lossy().to_string())
+            .collect();
+        tracked_files
+            .iter()
+            .filter(|tracked| !current_files.contains(*tracked))
+            .cloned()
+            .collect()
+    };
+    let is_cold_run = tracked_states.is_empty();
 
     let mut read_errors = 0usize;
     let mut files_skipped = 0usize;

@@ -29,6 +29,7 @@ description: "Пайплайн индексирования: от FileWalker д�
 10. Finish: `progress.finish()` — финализация прогресса.
 
 Sidecar metadata/tags в CLI обрабатываются батчами (`upsert_file_meta_batch` / `add_file_tags_batch`), а `exported_hash` обновляется через batch retrieval/update (`get_file_meta_many` + `upsert_file_meta_batch`).
+Для `file_meta` есть selective persist: для файлов без sidecar и без exported symbols (`public|internal`) inferred-запись не создаётся (экономия места и write I/O), но для sidecar-managed файлов `exported_hash` сохраняется всегда.
 
 CLI использует `indicatif::ProgressBar` для визуализации. MCP предоставляет `get_indexing_status` tool для polling и использует тот же split `cold-run/incremental` в `index_workspace`.
 

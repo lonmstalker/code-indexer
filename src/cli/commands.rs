@@ -698,7 +698,8 @@ pub fn index_directory(
     };
 
     let walker = FileWalker::global();
-    let index = SqliteIndex::new(&effective_db)?;
+    // CLI indexing writes in a single pipeline; one SQLite connection avoids lock churn.
+    let index = SqliteIndex::with_pool_size(&effective_db, 1)?;
     let use_fast_bulk = durability == IndexDurability::Fast && !watch;
     let available_parallelism = detect_available_parallelism();
     let worker_threads = resolve_index_threads(profile, threads, available_parallelism);
@@ -733,17 +734,21 @@ pub fn index_directory(
     }
 
     let files = walker.walk(path)?;
-    let current_files: HashSet<String> = files
-        .iter()
-        .map(|file| file.to_string_lossy().to_string())
-        .collect();
-
-    let tracked_files = index.get_tracked_files()?;
-    let stale_files: Vec<String> = tracked_files
-        .iter()
-        .filter(|tracked| !current_files.contains(*tracked))
-        .cloned()
-        .collect();
+    let tracked_states = index.get_tracked_file_states()?;
+    let tracked_files: Vec<String> = tracked_states.keys().cloned().collect();
+    let stale_files: Vec<String> = if tracked_files.is_empty() {
+        Vec::new()
+    } else {
+        let current_files: HashSet<String> = files
+            .iter()
+            .map(|file| file.to_string_lossy().to_string())
+            .collect();
+        tracked_files
+            .iter()
+            .filter(|tracked| !current_files.contains(*tracked))
+            .cloned()
+            .collect()
+    };
     if !stale_files.is_empty() {
         let stale_refs: Vec<&str> = stale_files.iter().map(|p| p.as_str()).collect();
         index.remove_files_batch(&stale_refs)?;
@@ -753,8 +758,7 @@ pub fn index_directory(
     // === Phase 1: Process sidecar files ===
     let sidecar_meta = process_sidecar_files(&files, path, &index)?;
 
-    let tracked_states = index.get_tracked_file_states()?;
-    let is_cold_run = tracked_files.is_empty() && tracked_states.is_empty();
+    let is_cold_run = tracked_states.is_empty();
 
     let mut read_errors = 0usize;
     let mut unchanged_files = 0usize;
@@ -896,7 +900,7 @@ pub fn index_directory(
 
     fn flush_pending_chunk(
         index: &SqliteIndex,
-        sidecar_meta: &HashMap<String, String>,
+        sidecar_meta: &HashSet<String>,
         pending_file_records: &mut Vec<IndexedFileRecord>,
         pending_extraction_results: &mut Vec<ExtractionResult>,
         use_fast_bulk: bool,
@@ -2605,34 +2609,50 @@ fn find_and_parse_project(path: &Path, registry: &DependencyRegistry) -> Result<
 // === Sidecar Processing Functions ===
 
 /// Processes sidecar files (.code-indexer.yml) and stores metadata in the index.
-/// Returns a map of file_path -> file_path for files that had sidecar metadata.
+/// Returns a set of file paths that had sidecar metadata.
 fn process_sidecar_files(
     files: &[PathBuf],
     root: &Path,
     index: &SqliteIndex,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashSet<String>> {
+    let mut sidecar_dirs: HashSet<PathBuf> = HashSet::new();
+    for file in files {
+        if let Some(parent) = file.parent() {
+            let dir = parent.to_path_buf();
+            if sidecar_dirs.contains(&dir) {
+                continue;
+            }
+            if dir.join(SIDECAR_FILENAME).exists() {
+                sidecar_dirs.insert(dir);
+            }
+        }
+    }
+
+    if sidecar_dirs.is_empty() {
+        return Ok(HashSet::new());
+    }
+
     let mut files_by_dir: HashMap<PathBuf, Vec<&PathBuf>> = HashMap::new();
     for file in files {
         if let Some(parent) = file.parent() {
-            files_by_dir
-                .entry(parent.to_path_buf())
-                .or_default()
-                .push(file);
+            if sidecar_dirs.contains(parent) {
+                files_by_dir
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(file);
+            }
         }
     }
 
     // Get tag dictionary for resolution
     let tag_dict = index.get_tag_dictionary().unwrap_or_default();
 
-    let mut files_with_meta: HashMap<String, String> = HashMap::new();
+    let mut files_with_meta: HashSet<String> = HashSet::new();
     let mut sidecar_count = 0;
 
     // Process each directory's sidecar
     for (dir, dir_files) in files_by_dir {
         let sidecar_path = dir.join(SIDECAR_FILENAME);
-        if !sidecar_path.exists() {
-            continue;
-        }
 
         let content = match fs::read_to_string(&sidecar_path) {
             Ok(c) => c,
@@ -2668,7 +2688,7 @@ fn process_sidecar_files(
 
             // Extract file metadata from sidecar
             if let Some(meta) = extract_file_meta(&relative_path, &sidecar_data, &dir_str) {
-                files_with_meta.insert(file_path_str.clone(), relative_path.clone());
+                files_with_meta.insert(file_path_str.clone());
                 meta_batch.push(meta);
             }
 
@@ -2833,7 +2853,7 @@ fn update_file_sidecar_meta(file_path: &Path, root: &Path, index: &SqliteIndex) 
 /// Updates exported_hash for files based on their public symbols.
 fn update_exported_hashes(
     results: &[code_indexer::indexer::ExtractionResult],
-    files_with_meta: &HashMap<String, String>,
+    files_with_meta: &HashSet<String>,
     index: &SqliteIndex,
 ) -> Result<()> {
     let mut exported_by_file: HashMap<String, String> = HashMap::new();
@@ -2843,6 +2863,19 @@ fn update_exported_hashes(
             Some(symbol) => symbol.location.file_path.clone(),
             None => continue, // Skip files with no symbols
         };
+
+        let has_sidecar_meta = files_with_meta.contains(&file_path);
+        let has_exported_symbols = result.symbols.iter().any(|symbol| {
+            matches!(
+                symbol.visibility,
+                Some(crate::index::Visibility::Public) | Some(crate::index::Visibility::Internal)
+            )
+        });
+
+        // Avoid storing inferred metadata for files that have no exported API surface.
+        if !has_sidecar_meta && !has_exported_symbols {
+            continue;
+        }
 
         // Compute exported hash from public symbols
         let exported_hash = compute_exported_hash(&result.symbols);
@@ -2858,17 +2891,45 @@ fn update_exported_hashes(
     let mut updates = Vec::with_capacity(file_paths.len());
 
     for file_path in file_paths {
-        let mut meta = existing
-            .remove(&file_path)
-            .unwrap_or_else(|| FileMeta::new(&file_path));
-        meta.exported_hash = exported_by_file.get(&file_path).cloned();
+        let has_sidecar_meta = files_with_meta.contains(&file_path);
+        let target_hash = exported_by_file.get(&file_path).cloned();
 
-        // If this file wasn't in a sidecar, mark as inferred
-        if !files_with_meta.contains_key(&file_path) {
+        if let Some(mut meta) = existing.remove(&file_path) {
+            let mut changed = false;
+            if meta.exported_hash != target_hash {
+                meta.exported_hash = target_hash.clone();
+                changed = true;
+            }
+            if !has_sidecar_meta {
+                if meta.source != MetaSource::Inferred {
+                    meta.source = MetaSource::Inferred;
+                    changed = true;
+                }
+                if meta.confidence != 0.5 {
+                    meta.confidence = 0.5;
+                    changed = true;
+                }
+            }
+            if changed {
+                updates.push(meta);
+            }
+            continue;
+        }
+
+        let mut meta = FileMeta::new(&file_path);
+        meta.exported_hash = target_hash;
+        if has_sidecar_meta {
+            meta.source = MetaSource::Sidecar;
+            meta.confidence = 1.0;
+        } else {
             meta.source = MetaSource::Inferred;
             meta.confidence = 0.5;
         }
         updates.push(meta);
+    }
+
+    if updates.is_empty() {
+        return Ok(());
     }
 
     index.upsert_file_meta_batch(&updates)?;
@@ -3354,6 +3415,70 @@ mod tests {
                 .expect("tracked files")
                 .contains(&removed_str),
             "deleted file must be removed from tracked files table"
+        );
+    }
+
+    #[test]
+    fn index_directory_skips_inferred_meta_for_files_without_exported_symbols() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let source_path = temp_dir.path().join("private_only.rs");
+        fs::write(&source_path, "fn helper() {}\n").expect("write source");
+
+        index_directory(
+            temp_dir.path(),
+            Path::new(".code-index.db"),
+            false,
+            IndexDurability::Safe,
+            IndexPowerProfile::Balanced,
+            None,
+            0,
+        )
+        .expect("index run");
+
+        let db_path = temp_dir.path().join(".code-index.db");
+        let index = SqliteIndex::new(&db_path).expect("open db");
+        let file_path = source_path.to_string_lossy().to_string();
+
+        assert!(
+            index.get_file_meta(&file_path).expect("read file_meta").is_none(),
+            "file without sidecar and without exported API should not create inferred file_meta row"
+        );
+    }
+
+    #[test]
+    fn index_directory_keeps_sidecar_meta_for_private_only_files() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let source_path = temp_dir.path().join("private_only.rs");
+        fs::write(&source_path, "fn helper() {}\n").expect("write source");
+        fs::write(
+            temp_dir.path().join(SIDECAR_FILENAME),
+            "files:\n  private_only.rs:\n    doc1: \"Private helper\"\n",
+        )
+        .expect("write sidecar");
+
+        index_directory(
+            temp_dir.path(),
+            Path::new(".code-index.db"),
+            false,
+            IndexDurability::Safe,
+            IndexPowerProfile::Balanced,
+            None,
+            0,
+        )
+        .expect("index run");
+
+        let db_path = temp_dir.path().join(".code-index.db");
+        let index = SqliteIndex::new(&db_path).expect("open db");
+        let file_path = source_path.to_string_lossy().to_string();
+        let meta = index
+            .get_file_meta(&file_path)
+            .expect("read file_meta")
+            .expect("sidecar meta should exist");
+
+        assert_eq!(meta.source, MetaSource::Sidecar);
+        assert!(
+            meta.exported_hash.is_some(),
+            "sidecar-managed file should preserve exported hash even without public symbols"
         );
     }
 
