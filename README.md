@@ -87,6 +87,23 @@ Release assets:
 
 Примечание: в `v0.1.0` опубликованы только macOS артефакты.
 
+### Docker
+
+```bash
+# Pull готового образа
+docker pull lonmstalkerd/code-indexer:latest
+
+# Или собрать локально из Dockerfile
+docker build -t code-indexer:local .
+
+# Использование CLI через контейнер (рекомендуется фиксировать --db в /workspace)
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  lonmstalkerd/code-indexer:latest --db /workspace/.code-index.db index
+
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  lonmstalkerd/code-indexer:latest --db /workspace/.code-index.db stats
+```
+
 ### Индексация проекта
 
 CLI показывает реалтайм progress bar с ETA:
@@ -399,6 +416,31 @@ UserService:cls@src/UserService.java:10
       "command": "/path/to/code-indexer",
       "args": ["serve"],
       "cwd": "/path/to/your/project"
+    }
+  }
+}
+```
+
+Вариант через Docker image:
+
+```json
+{
+  "mcpServers": {
+    "code-indexer-docker": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-v",
+        "/path/to/your/project:/workspace",
+        "-w",
+        "/workspace",
+        "lonmstalkerd/code-indexer:latest",
+        "--db",
+        "/workspace/.code-index.db",
+        "serve"
+      ]
     }
   }
 }
